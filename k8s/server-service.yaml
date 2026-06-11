@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: usage-dashboard-server
+  namespace: usage-dashboard
+spec:
+  selector:
+    app: usage-dashboard-server
+  ports:
+    - port: 8080
+      targetPort: 8080
+  type: ClusterIP

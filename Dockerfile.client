@@ -1,0 +1,24 @@
+# For Pi Zero: build with --platform linux/arm/v6 or linux/arm64
+# When running on hardware with SPI display, add:
+#   --device /dev/spidev0.0 --device /dev/spidev0.1
+#   --group-add spi
+
+FROM python:3.12-slim AS builder
+
+WORKDIR /build
+
+COPY pyproject.toml ./
+COPY src/ src/
+
+RUN pip install --no-cache-dir --prefix=/install .
+
+FROM python:3.12-slim
+
+WORKDIR /app
+
+COPY --from=builder /install /usr/local
+
+ENV SERVER_URL="" \
+    API_KEY=""
+
+CMD ["python", "-m", "usage_dashboard.client.main"]

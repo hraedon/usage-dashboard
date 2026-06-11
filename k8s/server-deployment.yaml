@@ -1,0 +1,80 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: usage-dashboard-server
+  namespace: usage-dashboard
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: usage-dashboard-server
+  template:
+    metadata:
+      labels:
+        app: usage-dashboard-server
+    spec:
+      containers:
+        - name: server
+          image: usage-dashboard-server:latest
+          ports:
+            - containerPort: 8080
+          env:
+            - name: API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: server-secrets
+                  key: api-key
+            - name: DB_PATH
+              value: "/data/readings.db"
+            - name: CLAUDE_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: server-secrets
+                  key: claude-token
+                  optional: true
+            - name: CLAUDE_REFRESH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: server-secrets
+                  key: claude-refresh-token
+                  optional: true
+            - name: CLAUDE_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: server-secrets
+                  key: claude-client-id
+                  optional: true
+            - name: ZAI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: server-secrets
+                  key: zai-api-key
+                  optional: true
+            - name: OLLAMA_EMAIL
+              valueFrom:
+                secretKeyRef:
+                  name: server-secrets
+                  key: ollama-email
+                  optional: true
+            - name: OLLAMA_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: server-secrets
+                  key: ollama-password
+                  optional: true
+            - name: FETCH_INTERVAL
+              value: "300"
+            - name: PORT
+              value: "8080"
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 30
+      volumes:
+        - name: data
+          emptyDir: {}

@@ -4,7 +4,17 @@ Conventions and quick reference for agents (and humans) working on usage-dashboa
 
 ## What this is
 
-<!-- TODO: describe the project -->
+A two-component system for monitoring AI usage across Claude, z.ai, and Ollama providers:
+
+- **Server** (k8s Deployment): Fetches usage data from all three providers, normalizes into unified readings, stores in SQLite, serves via authenticated FastAPI endpoint
+- **Client** (Pi Zero): Polls the server API, renders usage as color-coded progress bars on a 240x320 ST7789 LCD display
+
+Key modules:
+- `src/usage_dashboard/shared/models.py` — Normalized reading schema (Provider enum, Reading dataclass)
+- `src/usage_dashboard/server/` — Fetchers (Claude, z.ai, Ollama), SQLite DB, API, scheduler
+- `src/usage_dashboard/client/` — HTTP fetcher with adaptive refresh, Pillow-based display renderer
+- `k8s/` — Kubernetes manifests for deployment
+- `docs/spec.md` — Full specification with acceptance criteria (AC-01 through AC-16)
 
 ## Build / test / lint
 
