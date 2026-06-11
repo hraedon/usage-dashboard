@@ -15,7 +15,8 @@ spec:
     spec:
       containers:
         - name: server
-          image: usage-dashboard-server:latest
+          image: ghcr.io/hraedon/usage-dashboard-server:main
+          imagePullPolicy: Always
           ports:
             - containerPort: 8080
           env:
@@ -77,4 +78,5 @@ spec:
             periodSeconds: 30
       volumes:
         - name: data
-          emptyDir: {}
+          persistentVolumeClaim:
+            claimName: server-data
