@@ -1,0 +1,411 @@
+meta:
+  name: "usage-dashboard"
+  spec_level: 2
+  desired_level: 3
+  date: "2026-06-11"
+  extensions: []
+
+glossary:
+  - term: "Session window"
+    definition: "A rolling time window (typically 5 hours) after which short-term usage resets. Maps to five_hour (Claude), TIME_LIMIT unit=5 (z.ai), and session_percent (Ollama)."
+  - term: "Weekly window"
+    definition: "A 7-day rolling window after which usage resets. Maps to seven_day (Claude), TOKENS_LIMIT unit=6 (z.ai), and weekly_percent (Ollama)."
+  - term: "Stale reading"
+    definition: "A reading from a previous fetch cycle that could not be updated because the provider fetch failed. Displayed with a visual indicator."
+  - term: "Adaptive refresh"
+    definition: "Client behavior: polls at 60-second intervals when usage values are changing between consecutive readings; returns to the default 5-minute interval after 5 consecutive unchanged readings."
+  - term: "Provider"
+    definition: "One of the three AI services: Claude, z.ai, or Ollama."
+  - term: "Reading"
+    definition: "A normalized snapshot of usage data for a single provider at a point in time."
+  - term: "Offline"
+    definition: "A provider state displayed when the last 24 consecutive fetch attempts have failed."
+
+scope:
+  in_scope:
+    - "Fetching usage data from Claude (OAuth API), z.ai (REST API), and Ollama (scraped from web)"
+    - "Normalizing all provider data into a unified schema"
+    - "Serving readings via an authenticated API"
+    - "Rendering readings on a small display with horizontal progress bars, color thresholds, and reset timers"
+    - "Adaptive refresh behavior on the display client"
+    - "Graceful degradation when providers are unreachable"
+  out_of_scope:
+    - "Historical usage graphs or trend analysis (nice-to-have, deferred)"
+    - "Multi-user support or multi-tenancy"
+    - "Mobile app or responsive web dashboard"
+    - "Push notifications or alerts"
+    - "Organization-level spend tracking (Claude Admin API)"
+    - "Management of the Kubernetes cluster itself"
+
+mvp:
+  description: "A small display showing current session and weekly usage percentages with reset times for all three AI providers, updating every 5 minutes, with color-coded thresholds."
+  fr_ids:
+    - "FR-01"
+    - "FR-02"
+    - "FR-03"
+    - "FR-04"
+    - "FR-05"
+    - "FR-06"
+    - "FR-07"
+    - "FR-08"
+    - "FR-09"
+    - "FR-10"
+    - "FR-11"
+    - "FR-12"
+    - "FR-13"
+    - "FR-14"
+  rationale: "The snapshot view with color thresholds is the core value — it answers 'how much usage do I have left?' at a glance. Historical trends and analysis add value but are not required for the dashboard to be useful."
+  architectural_prerequisites:
+    - fr_id: "FR-01"
+      requires: "Claude OAuth credentials stored as k8s secret"
+      resolution: "invisible_infrastructure"
+    - fr_id: "FR-02"
+      requires: "z.ai API key stored as k8s secret"
+      resolution: "invisible_infrastructure"
+    - fr_id: "FR-03"
+      requires: "Ollama credentials stored as k8s secret; possibly headless browser in server container"
+      resolution: "invisible_infrastructure"
+    - fr_id: "FR-05"
+      requires: "SQLite database with mounted volume for persistence"
+      resolution: "invisible_infrastructure"
+    - fr_id: "FR-06"
+      requires: "HTTP server framework and auth middleware"
+      resolution: "invisible_infrastructure"
+    - fr_id: "FR-08"
+      requires: "SPI display driver (ST7789) and rendering library on Pi Zero"
+      resolution: "invisible_infrastructure"
+
+functional_requirements:
+  - id: "FR-01"
+    mvp: true
+    text: "Given a configured Claude OAuth access token, when the server fetches Claude usage, the system calls GET https://api.anthropic.com/api/oauth/usage with Authorization: Bearer <token> and anthropic-beta: oauth-2025-04-20 header, and extracts five_hour and seven_day utilization percentages and reset times."
+  - id: "FR-02"
+    mvp: true
+    text: "Given a configured z.ai API key, when the server fetches z.ai usage, the system calls GET https://api.z.ai/api/monitor/usage/quota/limit with Authorization: Bearer <key> and Accept: application/json, and extracts session and weekly window percentages and reset times from the limits array."
+  - id: "FR-03"
+    mvp: true
+    text: "Given configured Ollama credentials, when the server fetches Ollama usage, the system authenticates to ollama.com, fetches the settings page, parses session and weekly usage percentages and reset times from the HTML."
+  - id: "FR-04"
+    mvp: true
+    text: "Given a successful fetch from any provider, when the server normalizes the data, the system produces a unified reading containing: provider name, session percentage, session reset time, weekly percentage, weekly reset time, and fetch timestamp."
+  - id: "FR-05"
+    mvp: true
+    text: "Given a normalized reading, when the server persists it, the system stores it in a local database (SQLite) with the provider name, all reading fields, and the fetch timestamp."
+  - id: "FR-06"
+    mvp: true
+    text: "Given a valid API key in the request, when a client calls the server's readings endpoint, the system returns the most recent reading for each provider as JSON."
+  - id: "FR-07"
+    mvp: true
+    text: "Given a configured server URL and API key, when the client starts, the system begins periodically fetching readings from the server API."
+  - id: "FR-08"
+    mvp: true
+    text: "Given current readings from the server, when the client renders the display, the system shows a horizontal tile per provider containing: provider name, session usage as a horizontal progress bar with percentage, session reset countdown, weekly usage as a horizontal progress bar with percentage, and weekly reset countdown."
+  - id: "FR-09"
+    mvp: true
+    text: "Given a reading where session or weekly usage is between 75% and 85%, when rendered, the system displays that bar in a visually distinct warning color (orange). Given usage at or above 85%, the system displays that bar in a critical color (red)."
+  - id: "FR-10"
+    mvp: true
+    text: "Given a reading where a provider's weekly window resets within the next 3 days, when rendered, the system visually highlights the reset countdown for that provider."
+  - id: "FR-11"
+    mvp: true
+    text: "Given consecutive readings from the client's fetch cycle, when the usage value for any provider has changed compared to the previous reading, the system switches to a 60-second refresh interval. When 5 consecutive readings show no usage change across all providers, the system returns to the default 5-minute refresh interval."
+  - id: "FR-12"
+    mvp: true
+    text: "Given a provider fetch that fails after the server has at least one previous reading for that provider, when the server serves readings, the system includes the last known reading with a stale: true flag and the original fetch timestamp."
+  - id: "FR-13"
+    mvp: true
+    text: "Given 24 consecutive failed fetch attempts for a provider, when the server serves readings, the system marks that provider's status as offline instead of returning a stale reading."
+  - id: "FR-14"
+    mvp: true
+    text: "Given a configured API key on the server, when any request arrives without a matching Authorization: Bearer <key> header, the system responds with HTTP 401 and no usage data."
+
+data:
+  inputs:
+    - name: "Claude OAuth token"
+      format: "JSON from ~/.claude/.credentials.json"
+      source: "Kubernetes secret"
+      validation: "Must contain accessToken; must not be expired"
+    - name: "z.ai API key"
+      format: "String"
+      source: "Kubernetes secret"
+      validation: "Must be non-empty"
+    - name: "Ollama credentials"
+      format: "Email + password"
+      source: "Kubernetes secret"
+      validation: "Must be non-empty; used to authenticate to ollama.com"
+    - name: "Client-server auth key"
+      format: "String"
+      source: "Environment variable / k8s secret"
+      validation: "Must be non-empty; shared between server and client"
+  outputs:
+    - name: "Readings API response"
+      format: "JSON array of normalized readings"
+      destination: "HTTP response to display client"
+    - name: "Display rendering"
+      format: "Pixel buffer to LCD/e-ink via SPI"
+      destination: "Physical display (ST7789 or similar)"
+  persisted_state:
+    - description: "Provider readings (session/weekly percentages, reset times, timestamps, status)"
+      location: "SQLite file in server container with mounted volume"
+      retention: "Latest reading per provider retained indefinitely; configurable retention assumed 7 days"
+    - description: "Ollama session cookie"
+      location: "In-memory or SQLite"
+      retention: "Refreshed on expiry; not persisted across server restarts"
+
+business_rules:
+  - id: "BR-01"
+    text: "Provider credentials must never appear in logs, error messages, or API responses."
+  - id: "BR-02"
+    text: "All credentials must be sourced from environment variables or Kubernetes secrets — never hardcoded."
+  - id: "BR-03"
+    text: "No usage data leaves the cluster except the client's authenticated API request over the network to the server."
+  - id: "BR-04"
+    text: "The server must not expose any endpoint that reveals credential values."
+  - id: "BR-05"
+    text: "When a provider fetch returns an error, the server must continue serving readings for other providers without degradation."
+
+failure_modes:
+  - failure: "Provider fetch fails (network error, timeout, 429, 5xx)"
+    trigger: "HTTP error during fetch cycle"
+    response: "Serve last known reading with stale: true"
+    notification: "Log warning server-side"
+  - failure: "Provider auth fails (expired token, invalid credentials)"
+    trigger: "401/403 from provider"
+    response: "Same as fetch failure; do not retry until next cycle"
+    notification: "Log error server-side"
+  - failure: "Ollama session cookie expires during fetch"
+    trigger: "Redirect to login page or auth error"
+    response: "Re-authenticate with stored credentials; retry fetch once"
+    notification: "Log info server-side"
+  - failure: "24 consecutive failures for a provider"
+    trigger: "Failure counter reaches 24"
+    response: "Mark provider offline; continue attempting fetches"
+    notification: "Log warning server-side"
+  - failure: "Client cannot reach server"
+    trigger: "Network error on client fetch"
+    response: "Display last rendered screen; retry on next cycle"
+    notification: null
+  - failure: "Server starts with no prior readings"
+    trigger: "Empty database on first boot"
+    response: "Attempt all provider fetches immediately; return partial data if some succeed"
+    notification: null
+
+nfr:
+  performance: "Display renders new data within 2 seconds of receiving API response  # derived from: 'I want to glance at it' — display should reflect current state without perceptible delay"
+  reliability: "Server continues operating and serving cached data if one or more providers are down  # derived from: 'it just needs to show me where I stand' — partial dashboard is better than no dashboard"
+  operability: "Both components deployed as container images; all configuration via environment variables  # derived from: 'live in kubernetes' and 'no dependencies outside this application'"
+  readability: "Text and bars readable from 3-4 feet away on a 240x320 or similar small display  # derived from: 'hang in my cubicle' — viewed at desk distance"
+  self_sufficiency: "No external agents, cron jobs on personal machines, or manual cookie extraction required after initial deployment  # derived from: 'I ideally want no dependencies outside this application'"
+
+high_coupling_decisions:
+  - decision: "Unified reading data model"
+    status: "decided"
+    notes: "Normalized schema with provider name, session/weekly percentages, reset times, status, stale flag. Shared between server and client."
+  - decision: "Auth model"
+    status: "decided"
+    notes: "Single shared API key (Bearer token). Server validates on every request. Client sends on every fetch. Stored as env var / k8s secret."
+  - decision: "State persistence (server)"
+    status: "decided"
+    notes: "SQLite with a mounted volume. Survives container restarts. Simple, single-file, no external database dependency."
+  - decision: "Ollama scraping approach"
+    status: "deferred_flexible"
+    notes: "Attempt HTTP-based login first. If ollama.com requires JavaScript rendering, fall back to headless browser (Playwright) in the server container."
+  - decision: "Display rendering approach"
+    status: "deferred_flexible"
+    notes: "Python with Pillow to compose frames, pushed to display via SPI (luma.lcd or equivalent ST7789 driver). Driver choice is swappable with ~1 file change."
+  - decision: "Repo structure"
+    status: "decided"
+    notes: "Single monorepo producing two container images: server and client. Shared data model module."
+
+acceptance_criteria:
+  - id: "AC-01"
+    fr_ids: ["FR-01"]
+    condition: "Given a valid Claude OAuth token, when the server fetches Claude usage, then the response contains session_percent (mapped from five_hour) and weekly_percent (mapped from seven_day) as numeric values, and both session_resets_at and weekly_resets_at as ISO 8601 timestamps."
+  - id: "AC-02"
+    fr_ids: ["FR-02"]
+    condition: "Given a valid z.ai API key, when the server fetches z.ai usage, then the response contains session and weekly percentages and a session reset timestamp extracted from nextResetTime."
+  - id: "AC-03"
+    fr_ids: ["FR-03"]
+    condition: "Given valid Ollama credentials, when the server fetches Ollama usage, then the response contains session_percent and weekly_percent as numeric values and reset timestamps."
+  - id: "AC-04"
+    fr_ids: ["FR-04"]
+    condition: "Given raw data from any provider, when normalized, the output matches the unified reading schema (provider, session_percent, session_resets_at, weekly_percent, weekly_resets_at, fetched_at, stale, status)."
+  - id: "AC-05"
+    fr_ids: ["FR-05"]
+    condition: "Given a normalized reading, when persisted, then querying the database by provider name returns the most recent reading with all fields intact."
+  - id: "AC-06"
+    fr_ids: ["FR-06"]
+    condition: "Given a request with a valid API key, when the readings endpoint is called, then the response is JSON containing the most recent reading for each configured provider with HTTP 200."
+  - id: "AC-07"
+    fr_ids: ["FR-14"]
+    condition: "Given a request with no Authorization header or an incorrect API key, when the readings endpoint is called, then the response is HTTP 401 with no usage data in the body."
+  - id: "AC-08"
+    fr_ids: ["FR-07"]
+    condition: "Given a configured server URL and API key, when the client starts, then it fetches readings from the server within the first refresh interval."
+  - id: "AC-09"
+    fr_ids: ["FR-08"]
+    condition: "Given readings from the server, when rendered, the display shows one tile per provider with provider name, session bar + percentage, session reset countdown, weekly bar + percentage, and weekly reset countdown, laid out horizontally."
+  - id: "AC-10"
+    fr_ids: ["FR-09"]
+    condition: "Given a reading with usage at 80%, when rendered, the bar color is orange (warning). Given a reading with usage at 90%, when rendered, the bar color is red (critical)."
+  - id: "AC-11"
+    fr_ids: ["FR-10"]
+    condition: "Given a reading where weekly_resets_at is within 3 days, when rendered, the reset countdown is visually highlighted."
+  - id: "AC-12"
+    fr_ids: ["FR-11"]
+    condition: "Given that usage changed between two consecutive readings, when the client schedules the next fetch, then the interval is 60 seconds. Given 5 consecutive readings with no usage change, when the client schedules the next fetch, then the interval is 5 minutes."
+  - id: "AC-13"
+    fr_ids: ["FR-12"]
+    condition: "Given a provider fetch failure where a previous reading exists, when the server responds, the reading includes stale: true and the original fetched_at timestamp."
+  - id: "AC-14"
+    fr_ids: ["FR-13"]
+    condition: "Given 24 consecutive failures for a provider, when the server responds, the reading has status: offline and no percentage values."
+  - id: "AC-15"
+    fr_ids: ["FR-01", "FR-02", "FR-03", "FR-05", "FR-06"]
+    condition: "Given the server container starts, when startup completes, then the server begins fetching from all configured providers within the first minute."
+  - id: "AC-16"
+    fr_ids: ["FR-07", "FR-08"]
+    condition: "Given the client container starts, when startup completes, then the client begins fetching from the server within the first refresh interval."
+
+untestable_items:
+  - item: "Readability from 3-4 feet"
+    reason: "requires_human_judgment"
+  - item: "Ollama scraping correctness across site redesigns"
+    reason: "external_dependency"
+  - item: "e-ink display ghosting behavior"
+    reason: "external_dependency"
+
+work_decomposition:
+  value_phases:
+    - phase: 1
+      label: "MVP"
+      fr_ids:
+        - "FR-01"
+        - "FR-02"
+        - "FR-03"
+        - "FR-04"
+        - "FR-05"
+        - "FR-06"
+        - "FR-07"
+        - "FR-08"
+        - "FR-09"
+        - "FR-10"
+        - "FR-11"
+        - "FR-12"
+        - "FR-13"
+        - "FR-14"
+      rationale: "Snapshot display with color thresholds and adaptive refresh for all three providers. The minimum useful version."
+    - phase: 2
+      label: "History & Trends"
+      fr_ids: []
+      rationale: "Historical usage storage, trend graphs, sparklines. Adds temporal context to the snapshot view."
+  dependency_hints:
+    - fr_id: "FR-01"
+      requires: []
+      parallel_with: ["FR-02", "FR-03"]
+    - fr_id: "FR-02"
+      requires: []
+      parallel_with: ["FR-01", "FR-03"]
+    - fr_id: "FR-03"
+      requires: []
+      parallel_with: ["FR-01", "FR-02"]
+    - fr_id: "FR-04"
+      requires: ["FR-01", "FR-02", "FR-03"]
+      parallel_with: []
+    - fr_id: "FR-05"
+      requires: ["FR-04"]
+      parallel_with: []
+    - fr_id: "FR-06"
+      requires: ["FR-04", "FR-05"]
+      parallel_with: []
+    - fr_id: "FR-07"
+      requires: ["FR-04", "FR-05"]
+      parallel_with: []
+    - fr_id: "FR-08"
+      requires: ["FR-04", "FR-05"]
+      parallel_with: []
+    - fr_id: "FR-09"
+      requires: ["FR-04", "FR-05"]
+      parallel_with: ["FR-10"]
+    - fr_id: "FR-10"
+      requires: ["FR-04", "FR-05"]
+      parallel_with: ["FR-09"]
+    - fr_id: "FR-11"
+      requires: ["FR-04", "FR-05", "FR-07", "FR-08"]
+      parallel_with: []
+    - fr_id: "FR-12"
+      requires: ["FR-04", "FR-05", "FR-06"]
+      parallel_with: ["FR-13"]
+    - fr_id: "FR-13"
+      requires: ["FR-04", "FR-05", "FR-06"]
+      parallel_with: ["FR-12"]
+    - fr_id: "FR-14"
+      requires: []
+      parallel_with: ["FR-01", "FR-02", "FR-03"]
+
+open_questions:
+  - question: "Can ollama.com be logged into via HTTP POST (no JS rendering), or does it require a headless browser?"
+    category: "needs_research"
+    owner: "Implementing agent"
+  - question: "What are the exact mappings for z.ai unit values (3, 5, 6) to session/weekly windows?"
+    category: "needs_research"
+    owner: "Implementing agent"
+  - question: "Does the Claude OAuth API return seven_day reset timestamps, or only percentages?"
+    category: "needs_research"
+    owner: "Implementing agent"
+
+assumptions:
+  - assumption: "Ollama login is HTTP-based"
+    rationale: "Assumed that ollama.com accepts standard form-based authentication performable with HTTP requests. If not, headless browser fallback will be used."
+  - assumption: "z.ai session window maps to TIME_LIMIT unit=5"
+    rationale: "The TIME_LIMIT entry with unit: 5 and a nextResetTime field is assumed to represent the session (5-hour) window. TOKENS_LIMIT entries represent token caps within their windows."
+  - assumption: "Claude OAuth token can be long-lived enough for server use"
+    rationale: "Assumed that the OAuth token from ~/.claude/.credentials.json can be used server-side with reasonable longevity. If it expires frequently, a refresh mechanism or Web API fallback will be needed."
+  - assumption: "Pi Zero 2 W is the target display device"
+    rationale: "Assumed based on hardware research. ST7789 LCD driver at 240x320 resolution is the baseline. Rendering should be adaptable to other SPI-driven displays."
+  - assumption: "Single API key is sufficient"
+    rationale: "One shared Bearer token between server and client is enough. No per-user or per-device differentiation needed."
+  - assumption: "SQLite retention of 7 days"
+    rationale: "Keeping readings for 7 days is sufficient for current needs and supports future Phase 2 (history/trends) without excessive storage."
+
+handoff:
+  decisions_made:
+    - decision: "Two-component architecture (server + client)"
+      rationale: "Server runs in k8s as Deployment, scrapes providers, serves API. Client runs on Pi Zero, polls server, renders display. Separation of concerns; scraping complexity belongs server-side."
+    - decision: "Single monorepo"
+      rationale: "One codebase producing two container images with shared data model. Simpler than two repos for a small project."
+    - decision: "SQLite for persistence"
+      rationale: "File-based, no external database dependency, survives container restarts with volume mount. Adequate for the read/write pattern."
+    - decision: "Bearer token auth"
+      rationale: "Simplest auth model meeting the requirement of preventing casual snooping. One key, shared between client and server, stored as k8s secret."
+  pending:
+    - item: "Ollama scraping method (HTTP vs headless browser)"
+      why_deferred: "Requires testing against live site"
+      impact_if_wrong: "Adding Playwright increases server image by ~400MB and adds complexity"
+    - item: "z.ai field mappings (unit values)"
+      why_deferred: "Requires empirical testing against the API"
+      impact_if_wrong: "Wrong data displayed; easily fixable by adjusting the mapping"
+    - item: "Claude OAuth token longevity"
+      why_deferred: "Depends on user's Claude account and token lifecycle"
+      impact_if_wrong: "Server needs token refresh flow or Web API fallback"
+  intent_signals:
+    - signal: "hang in my cubicle"
+      relevance: "Display is semi-public. Auth prevents snooping but display itself does not need to hide which providers are used."
+    - signal: "no dependencies outside this application"
+      relevance: "Zero-touch operation after deployment. No cron jobs on personal machines, no manual cookie extraction, no external agents."
+    - signal: "I'd prefer to be able to power via USB-C"
+      relevance: "Hardware should be USB-C powered. Pi Zero 2 W supports this. Deployment preference, not architectural constraint."
+    - signal: "every five minutes would be fine"
+      relevance: "Timeliness is valued but not urgency. The dashboard is ambient information, not an alerting system."
+    - signal: "historical usage and trend analysis would be nice to have"
+      relevance: "Phase 2 interest. Data model and storage should not preclude historical analysis but must not complicate the MVP build."
+
+delta_to_next_level:
+  - gap: "Ollama scraping method unknown"
+    what_would_close_it: "Test ollama.com auth flow to confirm HTTP-based login works or identify headless browser requirement"
+  - gap: "z.ai field mappings uncertain"
+    what_would_close_it: "Test the z.ai API response to confirm unit value meanings and map to session/weekly windows"
+  - gap: "Claude OAuth response schema uncertain"
+    what_would_close_it: "Test the Claude usage API to confirm exact fields returned (reset timestamps, model-specific windows)"
+  - gap: "Display pixel layout undefined"
+    what_would_close_it: "Define exact pixel positions, font sizes, and bar dimensions for target resolution (240x320)"
