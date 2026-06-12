@@ -39,7 +39,12 @@ class Database:
                 for row in self._conn.execute("PRAGMA table_info(readings)").fetchall()
             }
             if "detail" not in columns:
-                self._conn.execute("ALTER TABLE readings ADD COLUMN detail TEXT")
+                try:
+                    self._conn.execute("ALTER TABLE readings ADD COLUMN detail TEXT")
+                except sqlite3.OperationalError as exc:
+                    # Concurrent instance won the migration race (deploy overlap)
+                    if "duplicate column" not in str(exc):
+                        raise
             self._conn.commit()
 
     def store_reading(self, reading: Reading, consecutive_failures: int = 0) -> None:
