@@ -4,17 +4,25 @@ from datetime import datetime, timezone
 
 import httpx
 
-from usage_dashboard.server.fetch_types import FetchError
+from usage_dashboard.server.fetch_types import FetchAuthError, FetchError
 from usage_dashboard.shared.models import Provider, Reading, ReadingStatus
 
 _ZAI_USAGE_URL = "https://api.z.ai/api/monitor/usage/quota/limit"
 _TIMEOUT = 30.0
 
+# Observed live response (2026-06-12): the payload is wrapped in a
+# {"code", "msg", "data"} envelope, nextResetTime is epoch milliseconds, and
+# the relevant entries are TOKENS_LIMIT unit 3 (resets every 5h -> session)
+# and TOKENS_LIMIT unit 6 (resets weekly). TIME_LIMIT unit 5 is the monthly
+# API-tools quota, not coding usage.
+_SESSION_UNIT = 3
+_WEEKLY_UNIT = 6
 
-def _to_naive_utc(dt: datetime) -> datetime:
-    if dt.tzinfo is not None:
-        dt = dt.astimezone(timezone.utc)
-    return dt.replace(tzinfo=None)
+
+def _from_epoch_ms(value: object) -> datetime | None:
+    if value is None:
+        return None
+    return datetime.fromtimestamp(int(str(value)) / 1000, tz=timezone.utc).replace(tzinfo=None)
 
 
 def fetch_zai_usage(api_key: str) -> Reading:
@@ -27,38 +35,34 @@ def fetch_zai_usage(api_key: str) -> Reading:
             response = client.get(_ZAI_USAGE_URL, headers=headers)
         response.raise_for_status()
         data = response.json()
+    except httpx.HTTPStatusError as exc:
+        status = exc.response.status_code
+        if status in (401, 403):
+            raise FetchAuthError(f"ZAI usage request rejected: HTTP {status}") from exc
+        raise FetchError(f"ZAI usage request failed: HTTP {status}") from exc
     except httpx.HTTPError as exc:
         raise FetchError(f"ZAI usage request failed: {type(exc).__name__}") from exc
 
     try:
-        limits: list[dict[str, object]] = data["limits"]
+        payload = data["data"] if isinstance(data.get("data"), dict) else data
+        limits: list[dict[str, object]] = payload["limits"]
         session_entry: dict[str, object] | None = None
         weekly_entry: dict[str, object] | None = None
         for entry in limits:
-            entry_type = entry.get("type")
-            unit = entry.get("unit")
-            if entry_type == "TIME_LIMIT" and unit == 5:
+            if entry.get("type") != "TOKENS_LIMIT":
+                continue
+            if entry.get("unit") == _SESSION_UNIT:
                 session_entry = entry
-            elif entry_type == "TOKENS_LIMIT" and unit == 6:
+            elif entry.get("unit") == _WEEKLY_UNIT:
                 weekly_entry = entry
         if session_entry is None:
             raise FetchError("ZAI usage response missing session limit entry")
         if weekly_entry is None:
             raise FetchError("ZAI usage response missing weekly limit entry")
         session_percent: float | None = float(str(session_entry["percentage"]))
-        session_resets_raw = session_entry.get("nextResetTime")
-        session_resets_at: datetime | None = (
-            _to_naive_utc(datetime.fromisoformat(str(session_resets_raw)).replace(tzinfo=timezone.utc))
-            if session_resets_raw is not None
-            else None
-        )
+        session_resets_at = _from_epoch_ms(session_entry.get("nextResetTime"))
         weekly_percent: float | None = float(str(weekly_entry["percentage"]))
-        weekly_resets_raw = weekly_entry.get("nextResetTime")
-        weekly_resets_at: datetime | None = (
-            _to_naive_utc(datetime.fromisoformat(str(weekly_resets_raw)).replace(tzinfo=timezone.utc))
-            if weekly_resets_raw is not None
-            else None
-        )
+        weekly_resets_at = _from_epoch_ms(weekly_entry.get("nextResetTime"))
     except (KeyError, ValueError, TypeError) as exc:
         raise FetchError(f"ZAI usage response parse error: {type(exc).__name__}") from exc
 

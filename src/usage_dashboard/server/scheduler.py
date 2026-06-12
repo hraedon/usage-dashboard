@@ -9,7 +9,7 @@ from typing import Callable
 from usage_dashboard.server.db import Database
 from usage_dashboard.server.fetch_claude import fetch_claude_usage, refresh_claude_token
 from usage_dashboard.server.fetch_ollama import fetch_ollama_usage
-from usage_dashboard.server.fetch_types import FetchError
+from usage_dashboard.server.fetch_types import FetchAuthError, FetchError
 from usage_dashboard.server.fetch_umans import fetch_umans_usage
 from usage_dashboard.server.fetch_zai import fetch_zai_usage
 from usage_dashboard.shared.models import (
@@ -102,7 +102,14 @@ class FetchScheduler:
             self._db.store_reading(reading, consecutive_failures=0)
             self._db.reset_failures(provider)
         except FetchError as exc:
-            if provider == Provider.CLAUDE and self._try_refresh_claude():
+            # Refresh only on credential rejection; refreshing on transient
+            # failures (429s, timeouts) spams the OAuth endpoint and risks
+            # rotating a refresh token shared with an interactive session.
+            if (
+                provider == Provider.CLAUDE
+                and isinstance(exc, FetchAuthError)
+                and self._try_refresh_claude()
+            ):
                 try:
                     reading = fetch_claude_usage(self._claude_token or "")
                     self._db.store_reading(reading, consecutive_failures=0)

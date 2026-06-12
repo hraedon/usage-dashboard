@@ -8,7 +8,7 @@ import pytest
 
 from usage_dashboard.server.fetch_claude import fetch_claude_usage, refresh_claude_token
 from usage_dashboard.server.fetch_ollama import fetch_ollama_usage
-from usage_dashboard.server.fetch_types import FetchError
+from usage_dashboard.server.fetch_types import FetchAuthError, FetchError
 from usage_dashboard.server.fetch_umans import _format_tokens, fetch_umans_usage
 from usage_dashboard.server.fetch_zai import fetch_zai_usage
 from usage_dashboard.shared.models import Provider, ReadingStatus
@@ -28,21 +28,37 @@ def _claude_response_data():
 
 
 def _zai_response_data():
+    # Mirrors the live response shape observed 2026-06-12: enveloped payload,
+    # epoch-millisecond reset times, session = TOKENS_LIMIT unit 3.
     return {
-        "limits": [
-            {
-                "type": "TIME_LIMIT",
-                "unit": 5,
-                "percentage": "55.0",
-                "nextResetTime": "2026-01-15T10:00:00Z",
-            },
-            {
-                "type": "TOKENS_LIMIT",
-                "unit": 6,
-                "percentage": "35.0",
-                "nextResetTime": "2026-01-19T00:00:00Z",
-            },
-        ]
+        "code": 200,
+        "msg": "Operation successful",
+        "data": {
+            "limits": [
+                {
+                    "type": "TOKENS_LIMIT",
+                    "unit": 3,
+                    "number": 5,
+                    "percentage": 55,
+                    "nextResetTime": 1781310923670,
+                },
+                {
+                    "type": "TOKENS_LIMIT",
+                    "unit": 6,
+                    "number": 1,
+                    "percentage": 35,
+                    "nextResetTime": 1781663372979,
+                },
+                {
+                    "type": "TIME_LIMIT",
+                    "unit": 5,
+                    "usage": 1000,
+                    "currentValue": 37,
+                    "percentage": 3,
+                    "nextResetTime": 1783477772998,
+                },
+            ]
+        },
     }
 
 
@@ -181,7 +197,9 @@ class TestFetchZai:
     @patch("usage_dashboard.server.fetch_zai.httpx.Client")
     def test_fetch_zai_missing_session_limit_raises(self, mock_client_cls):
         data = _zai_response_data()
-        data["limits"] = [entry for entry in data["limits"] if entry.get("type") != "TIME_LIMIT"]
+        data["data"]["limits"] = [
+            entry for entry in data["data"]["limits"] if entry.get("unit") != 3
+        ]
         mock_response = MagicMock()
         mock_response.json.return_value = data
         mock_response.raise_for_status = MagicMock()
@@ -200,7 +218,9 @@ class TestFetchZai:
     @patch("usage_dashboard.server.fetch_zai.httpx.Client")
     def test_fetch_zai_missing_weekly_limit_raises(self, mock_client_cls):
         data = _zai_response_data()
-        data["limits"] = [entry for entry in data["limits"] if entry.get("type") != "TOKENS_LIMIT"]
+        data["data"]["limits"] = [
+            entry for entry in data["data"]["limits"] if entry.get("unit") != 6
+        ]
         mock_response = MagicMock()
         mock_response.json.return_value = data
         mock_response.raise_for_status = MagicMock()
@@ -466,3 +486,55 @@ class TestFormatTokens:
 
     def test_small(self):
         assert _format_tokens(999) == "999"
+
+
+class TestFetchErrorClassification:
+    @staticmethod
+    def _mock_status_client(mock_client_cls, status_code):
+        mock_response = MagicMock()
+        mock_response.status_code = status_code
+        mock_response.raise_for_status.side_effect = httpx.HTTPStatusError(
+            "err", request=MagicMock(), response=mock_response
+        )
+        mock_client = MagicMock()
+        mock_client.get.return_value = mock_response
+        mock_client.__enter__ = MagicMock(return_value=mock_client)
+        mock_client.__exit__ = MagicMock(return_value=False)
+        mock_client_cls.return_value = mock_client
+
+    @patch("usage_dashboard.server.fetch_claude.httpx.Client")
+    def test_claude_401_raises_auth_error(self, mock_client_cls):
+        self._mock_status_client(mock_client_cls, 401)
+        with pytest.raises(FetchAuthError):
+            fetch_claude_usage("token")
+
+    @patch("usage_dashboard.server.fetch_claude.httpx.Client")
+    def test_claude_429_raises_plain_fetch_error_with_status(self, mock_client_cls):
+        self._mock_status_client(mock_client_cls, 429)
+        with pytest.raises(FetchError, match="HTTP 429") as excinfo:
+            fetch_claude_usage("token")
+        assert not isinstance(excinfo.value, FetchAuthError)
+
+    @patch("usage_dashboard.server.fetch_zai.httpx.Client")
+    def test_zai_401_raises_auth_error(self, mock_client_cls):
+        self._mock_status_client(mock_client_cls, 401)
+        with pytest.raises(FetchAuthError):
+            fetch_zai_usage("key")
+
+
+class TestZaiResetTimes:
+    @patch("usage_dashboard.server.fetch_zai.httpx.Client")
+    def test_epoch_millis_parsed_to_utc(self, mock_client_cls):
+        mock_response = MagicMock()
+        mock_response.json.return_value = _zai_response_data()
+        mock_response.raise_for_status = MagicMock()
+        mock_client = MagicMock()
+        mock_client.get.return_value = mock_response
+        mock_client.__enter__ = MagicMock(return_value=mock_client)
+        mock_client.__exit__ = MagicMock(return_value=False)
+        mock_client_cls.return_value = mock_client
+
+        reading = fetch_zai_usage("key")
+
+        assert reading.session_resets_at == datetime(2026, 6, 13, 0, 35, 23, 670000)
+        assert reading.weekly_resets_at == datetime(2026, 6, 17, 2, 29, 32, 979000)

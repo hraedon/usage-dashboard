@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 
 import httpx
 
-from usage_dashboard.server.fetch_types import FetchError
+from usage_dashboard.server.fetch_types import FetchAuthError, FetchError
 from usage_dashboard.shared.models import Provider, Reading, ReadingStatus
 
 _CLAUDE_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
@@ -62,6 +62,11 @@ def fetch_claude_usage(access_token: str) -> Reading:
             response = client.get(_CLAUDE_USAGE_URL, headers=headers)
         response.raise_for_status()
         data = response.json()
+    except httpx.HTTPStatusError as exc:
+        status = exc.response.status_code
+        if status in (401, 403):
+            raise FetchAuthError(f"Claude usage request rejected: HTTP {status}") from exc
+        raise FetchError(f"Claude usage request failed: HTTP {status}") from exc
     except httpx.HTTPError as exc:
         raise FetchError(f"Claude usage request failed: {type(exc).__name__}") from exc
 

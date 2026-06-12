@@ -169,3 +169,37 @@ class TestFetchSchedulerNoProviders:
         scheduler = FetchScheduler(db, ollama_email="e@e.com", ollama_password="pw")
         tasks = scheduler._get_fetch_tasks()
         assert any(p is Provider.OLLAMA for p, _ in tasks)
+
+
+class TestClaudeRefreshGating:
+    def test_no_refresh_attempt_on_transient_failure(self, tmp_path):
+        db = Database(str(tmp_path / "sched.db"))
+        db.initialize()
+        scheduler = FetchScheduler(
+            db, claude_token="token", claude_refresh_token="refresh"
+        )
+        scheduler._try_refresh_claude = MagicMock(return_value=True)  # type: ignore[method-assign]
+        fetch_fn = MagicMock(side_effect=FetchError("HTTP 429"))
+        scheduler._fetch_one(Provider.CLAUDE, fetch_fn)
+        scheduler._try_refresh_claude.assert_not_called()
+
+    def test_refresh_attempted_on_auth_failure(self, tmp_path):
+        from unittest.mock import patch
+
+        from usage_dashboard.server.fetch_types import FetchAuthError
+
+        db = Database(str(tmp_path / "sched.db"))
+        db.initialize()
+        scheduler = FetchScheduler(
+            db, claude_token="token", claude_refresh_token="refresh"
+        )
+        scheduler._try_refresh_claude = MagicMock(return_value=True)  # type: ignore[method-assign]
+        fetch_fn = MagicMock(side_effect=FetchAuthError("HTTP 401"))
+        retry_reading = _make_reading(provider=Provider.CLAUDE)
+        with patch(
+            "usage_dashboard.server.scheduler.fetch_claude_usage",
+            return_value=retry_reading,
+        ):
+            scheduler._fetch_one(Provider.CLAUDE, fetch_fn)
+        scheduler._try_refresh_claude.assert_called_once()
+        assert db.get_latest_readings()[Provider.CLAUDE].status is ReadingStatus.CURRENT
