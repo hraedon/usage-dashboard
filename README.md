@@ -85,9 +85,23 @@ Images are built and pushed to `ghcr.io/hraedon/usage-dashboard-server` and `ghc
 | `claude-refresh-token` | No | Claude OAuth refresh token |
 | `claude-client-id` | No | Claude OAuth client ID |
 | `zai-api-key` | No | z.ai API key |
-| `ollama-email` | No | Ollama account email |
-| `ollama-password` | No | Ollama account password |
+| `ollama-cookie` | No | ollama.com browser session cookie (`name=value`; see below) |
 | `umans-api-key` | No | umans API key |
+
+ollama.com has no usage API and no plain-HTTP login (the signin form is
+JS-driven), so the fetcher scrapes `ollama.com/settings` with a session cookie
+copied from a logged-in browser — the same approach as
+[CodexBar](https://github.com/steipete/CodexBar) and
+[ollama-usage](https://git.sr.ht/~hrbrmstr/ollama-usage). In browser devtools
+(Application → Cookies → ollama.com), copy the session cookie (typically named
+`session`, `__Secure-session`, or a `next-auth.session-token` variant) and
+store it as `name=value`. When the cookie expires the tile goes stale/offline
+and the log says so; paste a fresh one.
+
+The Claude token should be a dedicated long-lived token minted with
+`claude setup-token`, not credentials shared with an interactive Claude
+session — the scheduler refreshes on credential rejection, and refreshing a
+shared token rotates it out from under the other session.
 
 Only providers with configured credentials are fetched.
 

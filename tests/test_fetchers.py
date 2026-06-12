@@ -62,11 +62,20 @@ def _zai_response_data():
     }
 
 
-def _ollama_html():
-    return """
+def _ollama_html(session_pct="72.5", weekly_pct="42.0"):
+    return f"""
     <html><body>
-    <div><div>Session usage 72.5%</div></div>
-    <div><div>Weekly usage 42.0%</div></div>
+    <span>Cloud Usage</span><span>Pro</span>
+    <div><h3>Session usage</h3>
+      <div><div style="width: {session_pct}%"></div></div>
+      <span>{session_pct}% used</span>
+      <span>Resets in <time data-time="2026-06-13T02:00:00Z">2h</time></span>
+    </div>
+    <div><h3>Weekly usage</h3>
+      <div><div style="width: {weekly_pct}%"></div></div>
+      <span>{weekly_pct}% used</span>
+      <span>Resets in <time data-time="2026-06-17T00:00:00Z">4d</time></span>
+    </div>
     </body></html>
     """
 
@@ -238,100 +247,98 @@ class TestFetchZai:
 
 
 class TestFetchOllama:
-    @patch("usage_dashboard.server.fetch_ollama.httpx.Client")
-    def test_fetch_ollama_usage_returns_reading(self, mock_client_cls):
-        login_response = MagicMock()
-        login_response.raise_for_status = MagicMock()
-        usage_response = MagicMock()
-        usage_response.text = _ollama_html()
-        usage_response.raise_for_status = MagicMock()
+    @staticmethod
+    def _mock_get(mock_client_cls, text="", status_code=200):
+        response = MagicMock()
+        response.text = text
+        response.status_code = status_code
+        response.raise_for_status = MagicMock()
         mock_client = MagicMock()
-        mock_client.post.return_value = login_response
-        mock_client.get.return_value = usage_response
+        mock_client.get.return_value = response
         mock_client.__enter__ = MagicMock(return_value=mock_client)
         mock_client.__exit__ = MagicMock(return_value=False)
         mock_client_cls.return_value = mock_client
+        return mock_client
 
-        reading = fetch_ollama_usage("e@e.com", "pw")
+    @patch("usage_dashboard.server.fetch_ollama.httpx.Client")
+    def test_fetch_ollama_usage_returns_reading(self, mock_client_cls):
+        self._mock_get(mock_client_cls, text=_ollama_html())
+
+        reading = fetch_ollama_usage("session=abc123")
         assert reading.provider is Provider.OLLAMA
         assert reading.status is ReadingStatus.CURRENT
         assert reading.session_percent == 72.5
         assert reading.weekly_percent == 42.0
+        assert reading.session_resets_at == datetime(2026, 6, 13, 2, 0, 0)
+        assert reading.weekly_resets_at == datetime(2026, 6, 17, 0, 0, 0)
         assert reading.stale is False
+
+    @patch("usage_dashboard.server.fetch_ollama.httpx.Client")
+    def test_fetch_ollama_sends_cookie_header(self, mock_client_cls):
+        client = self._mock_get(mock_client_cls, text=_ollama_html())
+
+        fetch_ollama_usage("session=abc123")
+        headers = client.get.call_args[1]["headers"]
+        assert headers["Cookie"] == "session=abc123"
+
+    @patch("usage_dashboard.server.fetch_ollama.httpx.Client")
+    def test_fetch_ollama_hourly_label_also_accepted(self, mock_client_cls):
+        html = _ollama_html().replace("Session usage", "Hourly usage")
+        self._mock_get(mock_client_cls, text=html)
+
+        reading = fetch_ollama_usage("session=abc123")
+        assert reading.session_percent == 72.5
+
+    @patch("usage_dashboard.server.fetch_ollama.httpx.Client")
+    def test_fetch_ollama_bar_width_fallback(self, mock_client_cls):
+        html = _ollama_html().replace("% used", " percent")
+        self._mock_get(mock_client_cls, text=html)
+
+        reading = fetch_ollama_usage("session=abc123")
+        assert reading.session_percent == 72.5
 
     @patch("usage_dashboard.server.fetch_ollama.httpx.Client")
     def test_fetch_ollama_raises_fetch_error_on_http_failure(self, mock_client_cls):
         mock_client = MagicMock()
-        mock_client.post.side_effect = httpx.HTTPError("fail")
+        mock_client.get.side_effect = httpx.HTTPError("fail")
         mock_client.__enter__ = MagicMock(return_value=mock_client)
         mock_client.__exit__ = MagicMock(return_value=False)
         mock_client_cls.return_value = mock_client
 
-        try:
-            fetch_ollama_usage("e@e.com", "pw")
-            assert False, "Should have raised FetchError"
-        except FetchError:
-            pass
+        with pytest.raises(FetchError):
+            fetch_ollama_usage("session=abc123")
 
     @patch("usage_dashboard.server.fetch_ollama.httpx.Client")
-    def test_fetch_ollama_raises_fetch_error_on_missing_session(self, mock_client_cls):
-        html = "<html><body><div><div>Weekly usage 42.0%</div></div></body></html>"
-        login_response = MagicMock()
-        login_response.raise_for_status = MagicMock()
-        usage_response = MagicMock()
-        usage_response.text = html
-        usage_response.raise_for_status = MagicMock()
-        mock_client = MagicMock()
-        mock_client.post.return_value = login_response
-        mock_client.get.return_value = usage_response
-        mock_client.__enter__ = MagicMock(return_value=mock_client)
-        mock_client.__exit__ = MagicMock(return_value=False)
-        mock_client_cls.return_value = mock_client
+    def test_fetch_ollama_401_raises_auth_error(self, mock_client_cls):
+        self._mock_get(mock_client_cls, status_code=401)
 
-        try:
-            fetch_ollama_usage("e@e.com", "pw")
-            assert False, "Should have raised FetchError"
-        except FetchError:
-            pass
+        with pytest.raises(FetchAuthError):
+            fetch_ollama_usage("session=abc123")
 
     @patch("usage_dashboard.server.fetch_ollama.httpx.Client")
-    def test_fetch_ollama_raises_fetch_error_on_missing_weekly(self, mock_client_cls):
-        html = "<html><body><div><div>Session usage 72.5%</div></div></body></html>"
-        login_response = MagicMock()
-        login_response.raise_for_status = MagicMock()
-        usage_response = MagicMock()
-        usage_response.text = html
-        usage_response.raise_for_status = MagicMock()
-        mock_client = MagicMock()
-        mock_client.post.return_value = login_response
-        mock_client.get.return_value = usage_response
-        mock_client.__enter__ = MagicMock(return_value=mock_client)
-        mock_client.__exit__ = MagicMock(return_value=False)
-        mock_client_cls.return_value = mock_client
+    def test_fetch_ollama_signed_out_page_raises_auth_error(self, mock_client_cls):
+        html = '<html><body><h1>Sign in to Ollama</h1><form action="/signin"></form></body></html>'
+        self._mock_get(mock_client_cls, text=html)
 
-        try:
-            fetch_ollama_usage("e@e.com", "pw")
-            assert False, "Should have raised FetchError"
-        except FetchError:
-            pass
+        with pytest.raises(FetchAuthError):
+            fetch_ollama_usage("session=expired")
 
     @patch("usage_dashboard.server.fetch_ollama.httpx.Client")
-    def test_fetch_ollama_session_and_weekly_are_none_resets_at(self, mock_client_cls):
-        login_response = MagicMock()
-        login_response.raise_for_status = MagicMock()
-        usage_response = MagicMock()
-        usage_response.text = _ollama_html()
-        usage_response.raise_for_status = MagicMock()
-        mock_client = MagicMock()
-        mock_client.post.return_value = login_response
-        mock_client.get.return_value = usage_response
-        mock_client.__enter__ = MagicMock(return_value=mock_client)
-        mock_client.__exit__ = MagicMock(return_value=False)
-        mock_client_cls.return_value = mock_client
+    def test_fetch_ollama_missing_usage_raises_fetch_error(self, mock_client_cls):
+        self._mock_get(mock_client_cls, text="<html><body>nothing here</body></html>")
 
-        reading = fetch_ollama_usage("e@e.com", "pw")
-        assert reading.session_resets_at is None
-        assert reading.weekly_resets_at is None
+        with pytest.raises(FetchError):
+            fetch_ollama_usage("session=abc123")
+
+    @patch("usage_dashboard.server.fetch_ollama.httpx.Client")
+    def test_fetch_ollama_session_only_still_returns_reading(self, mock_client_cls):
+        html = _ollama_html()
+        html = html[: html.index("<h3>Weekly usage</h3>")] + "</body></html>"
+        self._mock_get(mock_client_cls, text=html)
+
+        reading = fetch_ollama_usage("session=abc123")
+        assert reading.session_percent == 72.5
+        assert reading.weekly_percent is None
 
 
 class TestRefreshClaudeToken:

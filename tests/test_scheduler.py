@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock
 
 from usage_dashboard.server.db import Database
@@ -156,17 +156,17 @@ class TestFetchSchedulerNoProviders:
         assert len(tasks) == 1
         assert tasks[0][0] is Provider.ZAI
 
-    def test_ollama_requires_both_credentials(self, tmp_path):
+    def test_ollama_not_registered_without_cookie(self, tmp_path):
         db = Database(str(tmp_path / "sched.db"))
         db.initialize()
-        scheduler = FetchScheduler(db, ollama_email="e@e.com")
+        scheduler = FetchScheduler(db)
         tasks = scheduler._get_fetch_tasks()
         assert not any(p is Provider.OLLAMA for p, _ in tasks)
 
-    def test_ollama_with_both_credentials(self, tmp_path):
+    def test_ollama_registered_with_cookie(self, tmp_path):
         db = Database(str(tmp_path / "sched.db"))
         db.initialize()
-        scheduler = FetchScheduler(db, ollama_email="e@e.com", ollama_password="pw")
+        scheduler = FetchScheduler(db, ollama_cookie="session=abc")
         tasks = scheduler._get_fetch_tasks()
         assert any(p is Provider.OLLAMA for p, _ in tasks)
 
@@ -203,3 +203,57 @@ class TestClaudeRefreshGating:
             scheduler._fetch_one(Provider.CLAUDE, fetch_fn)
         scheduler._try_refresh_claude.assert_called_once()
         assert db.get_latest_readings()[Provider.CLAUDE].status is ReadingStatus.CURRENT
+
+
+class TestRateLimitBackoff:
+    def test_rate_limit_blocks_provider_until_retry_after(self, tmp_path):
+        from usage_dashboard.server.fetch_types import FetchRateLimitError
+
+        db = Database(str(tmp_path / "sched.db"))
+        db.initialize()
+        scheduler = FetchScheduler(db, claude_token="token")
+        fetch_fn = MagicMock(
+            side_effect=FetchRateLimitError("HTTP 429", retry_after_seconds=1691.0)
+        )
+        scheduler._fetch_one(Provider.CLAUDE, fetch_fn)
+
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        assert scheduler._is_blocked(Provider.CLAUDE, now)
+        assert not scheduler._is_blocked(Provider.CLAUDE, now + timedelta(seconds=1700))
+        # expiry check above also clears the block
+        assert not scheduler._is_blocked(Provider.CLAUDE, now)
+
+    def test_rate_limit_without_retry_after_uses_default(self, tmp_path):
+        from usage_dashboard.server.fetch_types import FetchRateLimitError
+
+        db = Database(str(tmp_path / "sched.db"))
+        db.initialize()
+        scheduler = FetchScheduler(db, claude_token="token", rate_limit_default_seconds=120)
+        fetch_fn = MagicMock(side_effect=FetchRateLimitError("HTTP 429"))
+        scheduler._fetch_one(Provider.CLAUDE, fetch_fn)
+
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        assert scheduler._is_blocked(Provider.CLAUDE, now)
+        assert not scheduler._is_blocked(Provider.CLAUDE, now + timedelta(seconds=150))
+
+    def test_rate_limit_still_marks_reading_stale(self, tmp_path):
+        from usage_dashboard.server.fetch_types import FetchRateLimitError
+
+        db = Database(str(tmp_path / "sched.db"))
+        db.initialize()
+        db.store_reading(_make_reading(provider=Provider.CLAUDE))
+        scheduler = FetchScheduler(db, claude_token="token")
+        fetch_fn = MagicMock(side_effect=FetchRateLimitError("HTTP 429"))
+        scheduler._fetch_one(Provider.CLAUDE, fetch_fn)
+        assert db.get_latest_readings()[Provider.CLAUDE].stale is True
+
+    def test_other_providers_unaffected_by_block(self, tmp_path):
+        from usage_dashboard.server.fetch_types import FetchRateLimitError
+
+        db = Database(str(tmp_path / "sched.db"))
+        db.initialize()
+        scheduler = FetchScheduler(db, claude_token="token", zai_key="key")
+        fetch_fn = MagicMock(side_effect=FetchRateLimitError("HTTP 429"))
+        scheduler._fetch_one(Provider.CLAUDE, fetch_fn)
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        assert not scheduler._is_blocked(Provider.ZAI, now)

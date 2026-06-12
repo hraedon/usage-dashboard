@@ -2,14 +2,18 @@ from __future__ import annotations
 
 import logging
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from functools import partial
 from typing import Callable
 
 from usage_dashboard.server.db import Database
 from usage_dashboard.server.fetch_claude import fetch_claude_usage, refresh_claude_token
 from usage_dashboard.server.fetch_ollama import fetch_ollama_usage
-from usage_dashboard.server.fetch_types import FetchAuthError, FetchError
+from usage_dashboard.server.fetch_types import (
+    FetchAuthError,
+    FetchError,
+    FetchRateLimitError,
+)
 from usage_dashboard.server.fetch_umans import fetch_umans_usage
 from usage_dashboard.server.fetch_zai import fetch_zai_usage
 from usage_dashboard.shared.models import (
@@ -30,22 +34,23 @@ class FetchScheduler:
         claude_refresh_token: str | None = None,
         claude_client_id: str | None = None,
         zai_key: str | None = None,
-        ollama_email: str | None = None,
-        ollama_password: str | None = None,
+        ollama_cookie: str | None = None,
         umans_key: str | None = None,
         interval_seconds: int = 300,
         offline_threshold: int = 24,
+        rate_limit_default_seconds: int = 300,
     ) -> None:
         self._db = db
         self._claude_token = claude_token
         self._claude_refresh_token = claude_refresh_token
         self._claude_client_id = claude_client_id
         self._zai_key = zai_key
-        self._ollama_email = ollama_email
-        self._ollama_password = ollama_password
+        self._ollama_cookie = ollama_cookie
         self._umans_key = umans_key
         self._interval_seconds = interval_seconds
         self._offline_threshold = offline_threshold
+        self._rate_limit_default_seconds = rate_limit_default_seconds
+        self._blocked_until: dict[Provider, datetime] = {}
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -59,16 +64,9 @@ class FetchScheduler:
             tasks.append(
                 (Provider.ZAI, partial(fetch_zai_usage, self._zai_key))
             )
-        if self._ollama_email is not None and self._ollama_password is not None:
+        if self._ollama_cookie is not None:
             tasks.append(
-                (
-                    Provider.OLLAMA,
-                    partial(
-                        fetch_ollama_usage,
-                        self._ollama_email,
-                        self._ollama_password,
-                    ),
-                )
+                (Provider.OLLAMA, partial(fetch_ollama_usage, self._ollama_cookie))
             )
         if self._umans_key is not None:
             tasks.append(
@@ -91,6 +89,15 @@ class FetchScheduler:
         except FetchError as exc:
             logger.warning("Claude token refresh failed: %s", exc)
             return False
+
+    def _is_blocked(self, provider: Provider, now: datetime) -> bool:
+        blocked_until = self._blocked_until.get(provider)
+        if blocked_until is None:
+            return False
+        if now >= blocked_until:
+            del self._blocked_until[provider]
+            return False
+        return True
 
     def _fetch_one(
         self,
@@ -121,6 +128,12 @@ class FetchScheduler:
             existing = self._db.get_latest_readings().get(provider)
             failures = self._db.increment_failures(provider)
             now = datetime.now(timezone.utc).replace(tzinfo=None)
+            if isinstance(exc, FetchRateLimitError):
+                backoff = exc.retry_after_seconds or float(self._rate_limit_default_seconds)
+                self._blocked_until[provider] = now + timedelta(seconds=backoff)
+                logger.info(
+                    "Backing off %s for %.0fs after rate limit", provider.value, backoff
+                )
             if failures >= self._offline_threshold:
                 self._db.store_reading(
                     make_offline_reading(provider, now),
@@ -148,6 +161,10 @@ class FetchScheduler:
             for provider, fetch_fn in tasks:
                 if self._stop_event.is_set():
                     return
+                if self._is_blocked(
+                    provider, datetime.now(timezone.utc).replace(tzinfo=None)
+                ):
+                    continue
                 self._fetch_one(provider, fetch_fn)
             self._stop_event.wait(timeout=self._interval_seconds)
 

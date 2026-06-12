@@ -29,8 +29,7 @@ def main() -> None:
     claude_refresh_token = os.environ.get("CLAUDE_REFRESH_TOKEN") or None
     claude_client_id = os.environ.get("CLAUDE_CLIENT_ID") or None
     zai_api_key = os.environ.get("ZAI_API_KEY") or None
-    ollama_email = os.environ.get("OLLAMA_EMAIL") or None
-    ollama_password = os.environ.get("OLLAMA_PASSWORD") or None
+    ollama_cookie = os.environ.get("OLLAMA_COOKIE") or None
     umans_api_key = os.environ.get("UMANS_API_KEY") or None
     fetch_interval = int(os.environ.get("FETCH_INTERVAL", "300"))
     port = int(os.environ.get("PORT", "8080"))
@@ -48,8 +47,7 @@ def main() -> None:
         claude_refresh_token=claude_refresh_token,
         claude_client_id=claude_client_id,
         zai_key=zai_api_key,
-        ollama_email=ollama_email,
-        ollama_password=ollama_password,
+        ollama_cookie=ollama_cookie,
         umans_key=umans_api_key,
         interval_seconds=fetch_interval,
     )

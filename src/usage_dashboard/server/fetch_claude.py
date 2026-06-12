@@ -5,7 +5,11 @@ from datetime import datetime, timezone
 
 import httpx
 
-from usage_dashboard.server.fetch_types import FetchAuthError, FetchError
+from usage_dashboard.server.fetch_types import (
+    FetchAuthError,
+    FetchError,
+    FetchRateLimitError,
+)
 from usage_dashboard.shared.models import Provider, Reading, ReadingStatus
 
 _CLAUDE_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
@@ -66,6 +70,15 @@ def fetch_claude_usage(access_token: str) -> Reading:
         status = exc.response.status_code
         if status in (401, 403):
             raise FetchAuthError(f"Claude usage request rejected: HTTP {status}") from exc
+        if status == 429:
+            retry_after: float | None = None
+            header = exc.response.headers.get("retry-after")
+            if header is not None and header.isdigit():
+                retry_after = float(header)
+            raise FetchRateLimitError(
+                f"Claude usage request rate limited: HTTP 429 (retry-after {header})",
+                retry_after_seconds=retry_after,
+            ) from exc
         raise FetchError(f"Claude usage request failed: HTTP {status}") from exc
     except httpx.HTTPError as exc:
         raise FetchError(f"Claude usage request failed: {type(exc).__name__}") from exc

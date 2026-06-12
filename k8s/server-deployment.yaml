@@ -53,17 +53,11 @@ spec:
                   name: server-secrets
                   key: zai-api-key
                   optional: true
-            - name: OLLAMA_EMAIL
+            - name: OLLAMA_COOKIE
               valueFrom:
                 secretKeyRef:
                   name: server-secrets
-                  key: ollama-email
-                  optional: true
-            - name: OLLAMA_PASSWORD
-              valueFrom:
-                secretKeyRef:
-                  name: server-secrets
-                  key: ollama-password
+                  key: ollama-cookie
                   optional: true
             - name: UMANS_API_KEY
               valueFrom:
