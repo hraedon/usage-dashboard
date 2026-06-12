@@ -172,3 +172,83 @@ class TestHealthEndpoint:
             assert response.status_code == 200
 
         asyncio.run(_test())
+
+
+class TestDashboardEndpoint:
+    def test_dashboard_requires_no_auth(self, tmp_path):
+        app, db = _create_app_with_db(tmp_path)
+        db.store_reading(_make_reading())
+
+        async def _test():
+            async with _client(app) as client:
+                response = await client.get("/dashboard")
+            assert response.status_code == 200
+            assert "text/html" in response.headers["content-type"]
+            assert "CLAUDE" in response.text
+
+        asyncio.run(_test())
+
+    def test_dashboard_shows_umans_detail_line(self, tmp_path):
+        app, db = _create_app_with_db(tmp_path)
+        db.store_reading(
+            _make_reading(
+                provider=Provider.UMANS,
+                session_percent=None,
+                weekly_percent=None,
+                weekly_resets_at=None,
+                detail="req 161  tok 63.9M",
+            )
+        )
+
+        async def _test():
+            async with _client(app) as client:
+                response = await client.get("/dashboard")
+            assert "req 161  tok 63.9M" in response.text
+
+        asyncio.run(_test())
+
+    def test_dashboard_escapes_detail_content(self, tmp_path):
+        app, db = _create_app_with_db(tmp_path)
+        db.store_reading(
+            _make_reading(provider=Provider.UMANS, detail="<script>alert(1)</script>")
+        )
+
+        async def _test():
+            async with _client(app) as client:
+                response = await client.get("/dashboard")
+            assert "<script>" not in response.text
+            assert "&lt;script&gt;" in response.text
+
+        asyncio.run(_test())
+
+    def test_dashboard_marks_missing_providers_offline(self, tmp_path):
+        app, _db = _create_app_with_db(tmp_path)
+
+        async def _test():
+            async with _client(app) as client:
+                response = await client.get("/dashboard")
+            assert response.status_code == 200
+            assert response.text.count("offline") >= 4
+
+        asyncio.run(_test())
+
+    def test_readings_still_requires_auth(self, tmp_path):
+        app, _db = _create_app_with_db(tmp_path)
+
+        async def _test():
+            async with _client(app) as client:
+                response = await client.get("/readings")
+            assert response.status_code == 401
+
+        asyncio.run(_test())
+
+    def test_dashboard_never_contains_api_key(self, tmp_path):
+        app, db = _create_app_with_db(tmp_path)
+        db.store_reading(_make_reading())
+
+        async def _test():
+            async with _client(app) as client:
+                response = await client.get("/dashboard")
+            assert API_KEY not in response.text
+
+        asyncio.run(_test())

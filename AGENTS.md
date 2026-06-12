@@ -6,7 +6,7 @@ Conventions and quick reference for agents (and humans) working on usage-dashboa
 
 A two-component system for monitoring AI usage across Claude, z.ai, Ollama, and umans providers:
 
-- **Server** (k8s Deployment): Fetches usage data from all providers, normalizes into unified readings, stores in SQLite, serves via authenticated FastAPI endpoint
+- **Server** (k8s Deployment): Fetches usage data from all providers, normalizes into unified readings, stores in SQLite, serves via authenticated FastAPI endpoint. Also serves `/dashboard`, an unauthenticated mobile-friendly HTML view (private-network use; shows nothing beyond what the display shows — `/readings` keeps bearer auth)
 - **Client** (Pi Zero): Polls the server API, renders usage as color-coded progress bars on a 240x320 ST7789 LCD display. umans renders as a single text line (requests / tokens in the current window) below the three bar tiles, via the generic `Reading.detail` field
 
 Key modules:
