@@ -32,14 +32,6 @@ def main() -> None:
     ollama_email = os.environ.get("OLLAMA_EMAIL") or None
     ollama_password = os.environ.get("OLLAMA_PASSWORD") or None
     umans_api_key = os.environ.get("UMANS_API_KEY") or None
-    if umans_api_key is None:
-        # Interim until the key moves into the k8s Secret
-        umans_key_file = os.path.expanduser(
-            os.environ.get("UMANS_API_KEY_FILE", "~/umans_api.txt")
-        )
-        if os.path.isfile(umans_key_file):
-            with open(umans_key_file, encoding="utf-8") as f:
-                umans_api_key = f.read().strip() or None
     fetch_interval = int(os.environ.get("FETCH_INTERVAL", "300"))
     port = int(os.environ.get("PORT", "8080"))
 
