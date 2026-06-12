@@ -10,6 +10,7 @@ class Provider(Enum):
     CLAUDE = "claude"
     ZAI = "zai"
     OLLAMA = "ollama"
+    UMANS = "umans"
 
 
 class ReadingStatus(Enum):
@@ -45,6 +46,7 @@ class Reading:
     weekly_resets_at: datetime | None
     fetched_at: datetime
     stale: bool
+    detail: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -56,6 +58,7 @@ class Reading:
             "weekly_resets_at": _format_dt(self.weekly_resets_at),
             "fetched_at": _format_dt(self.fetched_at),
             "stale": self.stale,
+            "detail": self.detail,
         }
 
     @classmethod
@@ -69,6 +72,7 @@ class Reading:
             weekly_resets_at=_parse_dt(data["weekly_resets_at"]),
             fetched_at=_parse_required_dt(data["fetched_at"]),
             stale=data["stale"],
+            detail=data.get("detail"),
         )
 
 

@@ -63,6 +63,12 @@ spec:
                   name: server-secrets
                   key: ollama-password
                   optional: true
+            - name: UMANS_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: server-secrets
+                  key: umans-api-key
+                  optional: true
             - name: FETCH_INTERVAL
               value: "300"
             - name: PORT

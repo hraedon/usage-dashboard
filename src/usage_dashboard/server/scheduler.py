@@ -10,6 +10,7 @@ from usage_dashboard.server.db import Database
 from usage_dashboard.server.fetch_claude import fetch_claude_usage, refresh_claude_token
 from usage_dashboard.server.fetch_ollama import fetch_ollama_usage
 from usage_dashboard.server.fetch_types import FetchError
+from usage_dashboard.server.fetch_umans import fetch_umans_usage
 from usage_dashboard.server.fetch_zai import fetch_zai_usage
 from usage_dashboard.shared.models import (
     Provider,
@@ -31,6 +32,7 @@ class FetchScheduler:
         zai_key: str | None = None,
         ollama_email: str | None = None,
         ollama_password: str | None = None,
+        umans_key: str | None = None,
         interval_seconds: int = 300,
         offline_threshold: int = 24,
     ) -> None:
@@ -41,6 +43,7 @@ class FetchScheduler:
         self._zai_key = zai_key
         self._ollama_email = ollama_email
         self._ollama_password = ollama_password
+        self._umans_key = umans_key
         self._interval_seconds = interval_seconds
         self._offline_threshold = offline_threshold
         self._stop_event = threading.Event()
@@ -66,6 +69,10 @@ class FetchScheduler:
                         self._ollama_password,
                     ),
                 )
+            )
+        if self._umans_key is not None:
+            tasks.append(
+                (Provider.UMANS, partial(fetch_umans_usage, self._umans_key))
             )
         return tasks
 

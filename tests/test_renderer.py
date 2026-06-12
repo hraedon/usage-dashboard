@@ -139,3 +139,53 @@ class TestDisplayRenderer:
         reading = _make_reading(session_resets_at=None, weekly_resets_at=None)
         img = renderer.render([reading])
         assert isinstance(img, Image.Image)
+
+
+class TestUmansDetailLine:
+    def _bottom_strip_has_content(self, img: Image.Image) -> bool:
+        strip = img.crop((0, 296, 240, 320))
+        return strip.getbbox() is not None
+
+    def test_umans_detail_line_rendered_below_tiles(self):
+        readings = [
+            _make_reading(provider=Provider.CLAUDE),
+            _make_reading(provider=Provider.ZAI),
+            _make_reading(provider=Provider.OLLAMA),
+            _make_reading(
+                provider=Provider.UMANS,
+                session_percent=None,
+                weekly_percent=None,
+                weekly_resets_at=None,
+                detail="pk 2/4  req 161  tok 63.9M",
+            ),
+        ]
+        img = DisplayRenderer().render(readings)
+        assert self._bottom_strip_has_content(img)
+
+    def test_no_umans_reading_leaves_bottom_strip_empty(self):
+        readings = [
+            _make_reading(provider=Provider.CLAUDE),
+            _make_reading(provider=Provider.ZAI),
+            _make_reading(provider=Provider.OLLAMA),
+        ]
+        img = DisplayRenderer().render(readings)
+        assert not self._bottom_strip_has_content(img)
+
+    def test_offline_umans_renders_title_without_detail(self):
+        readings = [
+            _make_reading(provider=Provider.CLAUDE),
+            _make_reading(provider=Provider.ZAI),
+            _make_reading(provider=Provider.OLLAMA),
+            _make_reading(
+                provider=Provider.UMANS,
+                status=ReadingStatus.OFFLINE,
+                session_percent=None,
+                session_resets_at=None,
+                weekly_percent=None,
+                weekly_resets_at=None,
+                stale=True,
+                detail=None,
+            ),
+        ]
+        img = DisplayRenderer().render(readings)
+        assert self._bottom_strip_has_content(img)

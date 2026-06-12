@@ -29,10 +29,17 @@ class Database:
                     fetched_at TEXT NOT NULL,
                     stale INTEGER NOT NULL DEFAULT 0,
                     consecutive_failures INTEGER NOT NULL DEFAULT 0,
+                    detail TEXT,
                     PRIMARY KEY (provider)
                 )
                 """
             )
+            columns = {
+                row["name"]
+                for row in self._conn.execute("PRAGMA table_info(readings)").fetchall()
+            }
+            if "detail" not in columns:
+                self._conn.execute("ALTER TABLE readings ADD COLUMN detail TEXT")
             self._conn.commit()
 
     def store_reading(self, reading: Reading, consecutive_failures: int = 0) -> None:
@@ -47,8 +54,8 @@ class Database:
                 """
                 INSERT INTO readings (provider, status, session_percent, session_resets_at,
                                       weekly_percent, weekly_resets_at, fetched_at, stale,
-                                      consecutive_failures)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                      consecutive_failures, detail)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(provider) DO UPDATE SET
                     status = excluded.status,
                     session_percent = excluded.session_percent,
@@ -57,7 +64,8 @@ class Database:
                     weekly_resets_at = excluded.weekly_resets_at,
                     fetched_at = excluded.fetched_at,
                     stale = excluded.stale,
-                    consecutive_failures = excluded.consecutive_failures
+                    consecutive_failures = excluded.consecutive_failures,
+                    detail = excluded.detail
                 """,
                 (
                     reading.provider.value,
@@ -69,6 +77,7 @@ class Database:
                     reading.fetched_at.isoformat(),
                     int(reading.stale),
                     consecutive_failures,
+                    reading.detail,
                 ),
             )
             self._conn.commit()
@@ -89,6 +98,7 @@ class Database:
                 "weekly_resets_at": row["weekly_resets_at"],
                 "fetched_at": row["fetched_at"],
                 "stale": bool(row["stale"]),
+                "detail": row["detail"],
             }
             reading = Reading.from_dict(data)
             result[reading.provider] = reading

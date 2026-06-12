@@ -6,7 +6,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 from usage_dashboard.shared.models import Provider, Reading, ReadingStatus
 
-_PROVIDER_ORDER: list[Provider] = [Provider.CLAUDE, Provider.ZAI, Provider.OLLAMA]
+_TILE_PROVIDER_ORDER: list[Provider] = [Provider.CLAUDE, Provider.ZAI, Provider.OLLAMA]
 
 _BG = (0, 0, 0)
 _TEXT = (255, 255, 255)
@@ -63,15 +63,21 @@ class DisplayRenderer:
         draw = ImageDraw.Draw(img)
 
         readings_by_provider = {r.provider: r for r in readings}
-        ordered = [readings_by_provider[p] for p in _PROVIDER_ORDER if p in readings_by_provider]
+        ordered = [
+            readings_by_provider[p] for p in _TILE_PROVIDER_ORDER if p in readings_by_provider
+        ]
 
-        tile_height = 100
-        padding = 8
+        tile_height = 92
+        padding = 6
         y = padding
 
         for reading in ordered:
             self._draw_tile(draw, reading, y, tile_height)
             y += tile_height + padding
+
+        umans = readings_by_provider.get(Provider.UMANS)
+        if umans is not None:
+            self._draw_detail_line(draw, umans, y)
 
         return img
 
@@ -91,6 +97,18 @@ class DisplayRenderer:
         weekly_y = bar_y + 36
         self._draw_progress_row(draw, "Weekly", reading.weekly_percent, x, weekly_y)
         self._draw_reset_countdown(draw, reading.weekly_resets_at, x, weekly_y + 22, True)
+
+    def _draw_detail_line(self, draw: ImageDraw.ImageDraw, reading: Reading, y: int) -> None:
+        x = 10
+        title = reading.provider.value.upper()
+        if reading.status == ReadingStatus.STALE or reading.stale:
+            title += " [stale]"
+        elif reading.status == ReadingStatus.OFFLINE:
+            title += " [offline]"
+        draw.text((x, y), title, fill=_TEXT, font=self._bold_font)
+        if reading.detail:
+            detail_x = x + int(draw.textlength(title, font=self._bold_font)) + 8
+            draw.text((detail_x, y), reading.detail, fill=_GRAY, font=self._font)
 
     def _draw_progress_row(
         self,

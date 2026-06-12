@@ -145,3 +145,22 @@ def test_reading_round_trip_with_all_providers():
         data = reading.to_dict()
         restored = Reading.from_dict(data)
         assert restored == reading
+
+
+def test_reading_detail_defaults_to_none():
+    reading = _make_reading()
+    assert reading.detail is None
+
+
+def test_reading_detail_round_trip():
+    reading = _make_reading(provider=Provider.UMANS, detail="pk 2/4  req 161  tok 63.9M")
+    restored = Reading.from_dict(reading.to_dict())
+    assert restored.detail == "pk 2/4  req 161  tok 63.9M"
+    assert restored == reading
+
+
+def test_reading_from_dict_tolerates_missing_detail_key():
+    data = _make_reading().to_dict()
+    del data["detail"]
+    reading = Reading.from_dict(data)
+    assert reading.detail is None

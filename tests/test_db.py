@@ -129,3 +129,44 @@ class TestDatabase:
         result = db.get_latest_readings()
         assert result[Provider.CLAUDE].session_percent is None
         assert result[Provider.CLAUDE].weekly_percent is None
+
+
+class TestDetailColumn:
+    def test_detail_stored_and_retrieved(self, tmp_path):
+        db = Database(str(tmp_path / "test.db"))
+        db.initialize()
+        reading = _make_reading(provider=Provider.UMANS, detail="pk 2/4  req 161  tok 63.9M")
+        db.store_reading(reading)
+        result = db.get_latest_readings()[Provider.UMANS]
+        assert result.detail == "pk 2/4  req 161  tok 63.9M"
+
+    def test_initialize_migrates_legacy_schema_without_detail(self, tmp_path):
+        import sqlite3
+
+        db_path = str(tmp_path / "legacy.db")
+        conn = sqlite3.connect(db_path)
+        conn.execute(
+            """
+            CREATE TABLE readings (
+                provider TEXT NOT NULL,
+                status TEXT NOT NULL,
+                session_percent REAL,
+                session_resets_at TEXT,
+                weekly_percent REAL,
+                weekly_resets_at TEXT,
+                fetched_at TEXT NOT NULL,
+                stale INTEGER NOT NULL DEFAULT 0,
+                consecutive_failures INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (provider)
+            )
+            """
+        )
+        conn.commit()
+        conn.close()
+
+        db = Database(db_path)
+        db.initialize()
+        reading = _make_reading(detail="some detail")
+        db.store_reading(reading)
+        result = db.get_latest_readings()[reading.provider]
+        assert result.detail == "some detail"
