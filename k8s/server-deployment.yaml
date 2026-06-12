@@ -5,6 +5,8 @@ metadata:
   namespace: usage-dashboard
 spec:
   replicas: 1
+  strategy:
+    type: Recreate  # RWO Longhorn PVC: rolling update deadlocks on multi-attach
   selector:
     matchLabels:
       app: usage-dashboard-server
