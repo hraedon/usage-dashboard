@@ -9,6 +9,7 @@ import uvicorn
 from usage_dashboard.server.api import create_app
 from usage_dashboard.server.db import Database
 from usage_dashboard.server.scheduler import FetchScheduler
+from usage_dashboard.server.token_store import TokenStore
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +42,21 @@ def main() -> None:
     database = Database(db_path)
     database.initialize()
 
+    # Token store lives on the PVC alongside the DB.  Env-var tokens (from
+    # the k8s Secret) seed it on first boot; refreshed tokens persist here
+    # so pod restarts survive a rotation without touching the Secret.
+    token_store = TokenStore(os.path.join(db_dir or "/data", "tokens.json"))
+
+    # Seed the store from env vars if present (first boot or Secret update).
+    if claude_token and claude_refresh_token:
+        token_store.save_claude_tokens(claude_token, claude_refresh_token)
+    # Fall back to persisted tokens when env vars are empty (restart after
+    # the initial login, where the Secret may not have been updated yet).
+    if not claude_token or not claude_refresh_token:
+        persisted_access, persisted_refresh = token_store.load_claude_tokens()
+        claude_token = claude_token or persisted_access
+        claude_refresh_token = claude_refresh_token or persisted_refresh
+
     scheduler = FetchScheduler(
         db=database,
         claude_token=claude_token,
@@ -50,6 +66,7 @@ def main() -> None:
         ollama_cookie=ollama_cookie,
         umans_key=umans_api_key,
         interval_seconds=fetch_interval,
+        token_store=token_store,
     )
 
     app = create_app(api_key=api_key, db=database)

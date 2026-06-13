@@ -465,6 +465,17 @@ class TestFetchUmans:
         assert reading.detail == "req 161  tok 63.9M"
 
     @patch("usage_dashboard.server.fetch_umans.httpx.Client")
+    def test_null_window_does_not_crash(self, mock_client_cls):
+        data = _umans_response_data()
+        data["window"] = None
+        _mock_umans_client(mock_client_cls, data)
+
+        reading = fetch_umans_usage("test-key")
+
+        assert reading.session_resets_at is None
+        assert reading.detail == "req 161  tok 63.9M"
+
+    @patch("usage_dashboard.server.fetch_umans.httpx.Client")
     def test_http_error_raises_fetch_error(self, mock_client_cls):
         mock_client = MagicMock()
         mock_client.get.side_effect = httpx.ConnectError("boom")

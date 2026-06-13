@@ -6,6 +6,7 @@ from unittest.mock import MagicMock
 from usage_dashboard.server.db import Database
 from usage_dashboard.server.fetch_types import FetchError
 from usage_dashboard.server.scheduler import FetchScheduler
+from usage_dashboard.server.token_store import TokenStore
 from usage_dashboard.shared.models import (
     Provider,
     Reading,
@@ -130,6 +131,20 @@ class TestFetchSchedulerFailed:
             scheduler._fetch_one(Provider.CLAUDE, fetch_fn)
         result = db.get_latest_readings()
         assert result[Provider.CLAUDE].status is ReadingStatus.OFFLINE
+
+    def test_unexpected_exception_contained_and_recorded(self, tmp_path):
+        db = Database(str(tmp_path / "sched.db"))
+        db.initialize()
+        db.store_reading(_make_reading(provider=Provider.UMANS))
+        fetch_fn = MagicMock(
+            side_effect=AttributeError("'NoneType' has no attribute 'get'")
+        )
+        scheduler = FetchScheduler(db)
+        # A non-FetchError from one fetcher must not escape: if it does,
+        # _run_loop's thread dies and every provider stops fetching.
+        scheduler._fetch_one(Provider.UMANS, fetch_fn)
+        assert db.get_consecutive_failures(Provider.UMANS) == 1
+        assert db.get_latest_readings()[Provider.UMANS].stale is True
 
 
 class TestFetchSchedulerNoProviders:
@@ -257,3 +272,80 @@ class TestRateLimitBackoff:
         scheduler._fetch_one(Provider.CLAUDE, fetch_fn)
         now = datetime.now(timezone.utc).replace(tzinfo=None)
         assert not scheduler._is_blocked(Provider.ZAI, now)
+
+
+class TestClaudeTokenPersistence:
+    def test_refresh_persists_to_token_store(self, tmp_path):
+        from unittest.mock import patch
+
+        db = Database(str(tmp_path / "sched.db"))
+        db.initialize()
+        token_store = TokenStore(str(tmp_path / "tokens.json"))
+        scheduler = FetchScheduler(
+            db,
+            claude_token="old-access",
+            claude_refresh_token="old-refresh",
+            token_store=token_store,
+        )
+        with patch(
+            "usage_dashboard.server.scheduler.refresh_claude_token",
+            return_value=("new-access", "new-refresh"),
+        ):
+            result = scheduler._try_refresh_claude()
+        assert result is True
+        assert token_store.load_claude_tokens() == ("new-access", "new-refresh")
+        assert scheduler._claude_token == "new-access"
+        assert scheduler._claude_refresh_token == "new-refresh"
+
+    def test_refresh_without_store_only_updates_memory(self, tmp_path):
+        from unittest.mock import patch
+
+        db = Database(str(tmp_path / "sched.db"))
+        db.initialize()
+        scheduler = FetchScheduler(
+            db,
+            claude_token="old-access",
+            claude_refresh_token="old-refresh",
+        )
+        with patch(
+            "usage_dashboard.server.scheduler.refresh_claude_token",
+            return_value=("new-access", "new-refresh"),
+        ):
+            result = scheduler._try_refresh_claude()
+        assert result is True
+        assert scheduler._claude_token == "new-access"
+        assert scheduler._claude_refresh_token == "new-refresh"
+
+    def test_no_refresh_token_returns_false(self, tmp_path):
+        db = Database(str(tmp_path / "sched.db"))
+        db.initialize()
+        token_store = TokenStore(str(tmp_path / "tokens.json"))
+        scheduler = FetchScheduler(
+            db, claude_token="access", token_store=token_store,
+        )
+        assert scheduler._try_refresh_claude() is False
+
+    def test_refresh_failure_does_not_persist(self, tmp_path):
+        from unittest.mock import patch
+
+        from usage_dashboard.server.fetch_types import FetchAuthError
+
+        db = Database(str(tmp_path / "sched.db"))
+        db.initialize()
+        token_store = TokenStore(str(tmp_path / "tokens.json"))
+        token_store.save_claude_tokens("saved-access", "saved-refresh")
+        scheduler = FetchScheduler(
+            db,
+            claude_token="old-access",
+            claude_refresh_token="old-refresh",
+            token_store=token_store,
+        )
+        scheduler._try_refresh_claude = MagicMock(return_value=False)  # type: ignore[method-assign]
+        fetch_fn = MagicMock(side_effect=FetchAuthError("HTTP 401"))
+        with patch(
+            "usage_dashboard.server.scheduler.fetch_claude_usage",
+            side_effect=FetchError("still broken"),
+        ):
+            scheduler._fetch_one(Provider.CLAUDE, fetch_fn)
+        # Store should still have the original saved tokens.
+        assert token_store.load_claude_tokens() == ("saved-access", "saved-refresh")

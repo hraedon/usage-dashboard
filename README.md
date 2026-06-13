@@ -103,6 +103,33 @@ The Claude token should be a dedicated long-lived token minted with
 session — the scheduler refreshes on credential rejection, and refreshing a
 shared token rotates it out from under the other session.
 
+### Claude login
+
+The `login claude` command runs a one-time PKCE OAuth flow to mint a
+dedicated token pair that belongs to the dashboard alone.  This avoids
+sharing credentials with an interactive Claude session (which would break
+that session when the dashboard rotates the refresh token).
+
+```bash
+# Option A: auto-opens browser, listens on a local port
+usage-dashboard login claude --port 8282
+
+# Option B: prints a URL, you paste the redirect URL manually
+usage-dashboard login claude
+```
+
+The command prints the access token, refresh token, and client ID.
+Load them into the Secret and restart:
+
+```bash
+kubectl apply -f k8s/server-secret.yaml
+kubectl rollout restart deployment/server -n usage-dashboard
+```
+
+After the first login, the server persists refreshed tokens to the PVC
+(`/data/tokens.json`), so pod restarts survive token rotation without
+re-login.  The k8s Secret values are used only for the initial seed.
+
 Only providers with configured credentials are fetched.
 
 ## Development

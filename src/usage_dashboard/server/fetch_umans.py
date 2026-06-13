@@ -41,8 +41,8 @@ def fetch_umans_usage(api_key: str) -> Reading:
         raise FetchError(f"umans usage request failed: {type(exc).__name__}") from exc
 
     try:
-        usage: dict[str, object] = data["usage"]
-        window: dict[str, object] = data["window"]
+        usage: dict[str, object] = data.get("usage") or {}
+        window: dict[str, object] = data.get("window") or {}
 
         requests_in_window = int(str(usage["requests_in_window"]))
         tokens_total = int(str(usage["tokens_in"])) + int(str(usage["tokens_out"]))
@@ -53,7 +53,7 @@ def fetch_umans_usage(api_key: str) -> Reading:
             if resets_raw is not None
             else None
         )
-    except (KeyError, ValueError, TypeError) as exc:
+    except (KeyError, ValueError, TypeError, AttributeError) as exc:
         raise FetchError(f"umans usage response parse error: {type(exc).__name__}") from exc
 
     detail = f"req {requests_in_window}  tok {_format_tokens(tokens_total)}"

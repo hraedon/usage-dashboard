@@ -16,6 +16,7 @@ from usage_dashboard.server.fetch_types import (
 )
 from usage_dashboard.server.fetch_umans import fetch_umans_usage
 from usage_dashboard.server.fetch_zai import fetch_zai_usage
+from usage_dashboard.server.token_store import TokenStore
 from usage_dashboard.shared.models import (
     Provider,
     Reading,
@@ -39,11 +40,13 @@ class FetchScheduler:
         interval_seconds: int = 300,
         offline_threshold: int = 24,
         rate_limit_default_seconds: int = 300,
+        token_store: TokenStore | None = None,
     ) -> None:
         self._db = db
         self._claude_token = claude_token
         self._claude_refresh_token = claude_refresh_token
         self._claude_client_id = claude_client_id
+        self._token_store = token_store
         self._zai_key = zai_key
         self._ollama_cookie = ollama_cookie
         self._umans_key = umans_key
@@ -84,7 +87,11 @@ class FetchScheduler:
             )
             self._claude_token = new_access
             self._claude_refresh_token = new_refresh
-            logger.info("Claude token refreshed successfully")
+            if self._token_store is not None:
+                self._token_store.save_claude_tokens(new_access, new_refresh)
+                logger.info("Claude tokens refreshed and persisted")
+            else:
+                logger.info("Claude token refreshed successfully (not persisted)")
             return True
         except FetchError as exc:
             logger.warning("Claude token refresh failed: %s", exc)
@@ -124,36 +131,43 @@ class FetchScheduler:
                     return
                 except FetchError:
                     pass
+            self._record_failure(provider, exc)
+        except Exception as exc:
+            # A non-FetchError (e.g. AttributeError parsing an unexpected API
+            # payload) must be contained; if it escapes, _run_loop's thread
+            # dies and every provider stops fetching for the life of the pod.
+            self._record_failure(provider, exc)
 
-            existing = self._db.get_latest_readings().get(provider)
-            failures = self._db.increment_failures(provider)
-            now = datetime.now(timezone.utc).replace(tzinfo=None)
-            if isinstance(exc, FetchRateLimitError):
-                backoff = exc.retry_after_seconds or float(self._rate_limit_default_seconds)
-                self._blocked_until[provider] = now + timedelta(seconds=backoff)
-                logger.info(
-                    "Backing off %s for %.0fs after rate limit", provider.value, backoff
-                )
-            if failures >= self._offline_threshold:
-                self._db.store_reading(
-                    make_offline_reading(provider, now),
-                    consecutive_failures=failures,
-                )
-            elif existing is not None:
-                self._db.store_reading(
-                    make_stale_reading(existing),
-                    consecutive_failures=failures,
-                )
-            else:
-                self._db.store_reading(
-                    make_offline_reading(provider, now),
-                    consecutive_failures=failures,
-                )
-            logger.warning(
-                "Fetch failed for %s: %s",
-                provider.value,
-                exc,
+    def _record_failure(self, provider: Provider, exc: Exception) -> None:
+        existing = self._db.get_latest_readings().get(provider)
+        failures = self._db.increment_failures(provider)
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        if isinstance(exc, FetchRateLimitError):
+            backoff = exc.retry_after_seconds or float(self._rate_limit_default_seconds)
+            self._blocked_until[provider] = now + timedelta(seconds=backoff)
+            logger.info(
+                "Backing off %s for %.0fs after rate limit", provider.value, backoff
             )
+        if failures >= self._offline_threshold:
+            self._db.store_reading(
+                make_offline_reading(provider, now),
+                consecutive_failures=failures,
+            )
+        elif existing is not None:
+            self._db.store_reading(
+                make_stale_reading(existing),
+                consecutive_failures=failures,
+            )
+        else:
+            self._db.store_reading(
+                make_offline_reading(provider, now),
+                consecutive_failures=failures,
+            )
+        logger.warning(
+            "Fetch failed for %s: %s",
+            provider.value,
+            exc,
+        )
 
     def _run_loop(self) -> None:
         while not self._stop_event.is_set():
