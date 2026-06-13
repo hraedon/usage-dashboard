@@ -68,8 +68,17 @@ def fetch_claude_usage(access_token: str) -> Reading:
         data = response.json()
     except httpx.HTTPStatusError as exc:
         status = exc.response.status_code
-        if status in (401, 403):
-            raise FetchAuthError(f"Claude usage request rejected: HTTP {status}") from exc
+        if status == 401:
+            # Expired/invalid token — refreshable.
+            raise FetchAuthError("Claude usage request rejected: HTTP 401") from exc
+        if status == 403:
+            # Authenticated but wrong scope/permission (e.g. a setup-token
+            # lacks user:profile). Permanent — refreshing cannot fix it, so
+            # this is a plain FetchError and must NOT trigger a token refresh.
+            raise FetchError(
+                "Claude usage request forbidden: HTTP 403 "
+                "(token lacks the user:profile scope the usage endpoint needs)"
+            ) from exc
         if status == 429:
             retry_after: float | None = None
             header = exc.response.headers.get("retry-after")

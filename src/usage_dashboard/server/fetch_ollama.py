@@ -95,10 +95,8 @@ def fetch_ollama_usage(cookie: str) -> Reading:
     try:
         with httpx.Client(timeout=_TIMEOUT, follow_redirects=True) as client:
             response = client.get(_OLLAMA_SETTINGS_URL, headers=headers)
-        if response.status_code in (401, 403):
-            raise FetchAuthError(
-                f"Ollama session cookie rejected: HTTP {response.status_code}"
-            )
+        if response.status_code == 401:
+            raise FetchAuthError("Ollama session cookie rejected: HTTP 401")
         response.raise_for_status()
         html = response.text
     except httpx.HTTPStatusError as exc:

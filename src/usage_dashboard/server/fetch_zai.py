@@ -37,8 +37,8 @@ def fetch_zai_usage(api_key: str) -> Reading:
         data = response.json()
     except httpx.HTTPStatusError as exc:
         status = exc.response.status_code
-        if status in (401, 403):
-            raise FetchAuthError(f"ZAI usage request rejected: HTTP {status}") from exc
+        if status == 401:
+            raise FetchAuthError("ZAI usage request rejected: HTTP 401") from exc
         raise FetchError(f"ZAI usage request failed: HTTP {status}") from exc
     except httpx.HTTPError as exc:
         raise FetchError(f"ZAI usage request failed: {type(exc).__name__}") from exc

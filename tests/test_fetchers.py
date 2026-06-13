@@ -497,9 +497,10 @@ class TestFormatTokens:
 
 class TestFetchErrorClassification:
     @staticmethod
-    def _mock_status_client(mock_client_cls, status_code):
+    def _mock_status_client(mock_client_cls, status_code, headers=None):
         mock_response = MagicMock()
         mock_response.status_code = status_code
+        mock_response.headers = headers or {}
         mock_response.raise_for_status.side_effect = httpx.HTTPStatusError(
             "err", request=MagicMock(), response=mock_response
         )
@@ -516,10 +517,23 @@ class TestFetchErrorClassification:
             fetch_claude_usage("token")
 
     @patch("usage_dashboard.server.fetch_claude.httpx.Client")
-    def test_claude_429_raises_plain_fetch_error_with_status(self, mock_client_cls):
-        self._mock_status_client(mock_client_cls, 429)
-        with pytest.raises(FetchError, match="HTTP 429") as excinfo:
+    def test_claude_403_raises_plain_fetch_error_not_auth(self, mock_client_cls):
+        # A scope/permission 403 is permanent; it must NOT be a FetchAuthError,
+        # so the scheduler never tries to refresh (and rotate) on it.
+        self._mock_status_client(mock_client_cls, 403)
+        with pytest.raises(FetchError) as excinfo:
             fetch_claude_usage("token")
+        assert not isinstance(excinfo.value, FetchAuthError)
+        assert "scope" in str(excinfo.value)
+
+    @patch("usage_dashboard.server.fetch_claude.httpx.Client")
+    def test_claude_429_raises_rate_limit_error_with_retry_after(self, mock_client_cls):
+        from usage_dashboard.server.fetch_types import FetchRateLimitError
+
+        self._mock_status_client(mock_client_cls, 429, headers={"retry-after": "608"})
+        with pytest.raises(FetchRateLimitError) as excinfo:
+            fetch_claude_usage("token")
+        assert excinfo.value.retry_after_seconds == 608.0
         assert not isinstance(excinfo.value, FetchAuthError)
 
     @patch("usage_dashboard.server.fetch_zai.httpx.Client")
