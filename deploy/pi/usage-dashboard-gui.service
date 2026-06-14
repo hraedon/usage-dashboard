@@ -1,0 +1,23 @@
+[Unit]
+Description=AI Usage Dashboard (touch GUI)
+# Render straight on the panel via KMS/DRM — no desktop session required.
+After=multi-user.target
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=pi
+# Direct framebuffer/DRM output (appliance mode, no X/Wayland needed).
+Environment=SDL_VIDEODRIVER=kmsdrm
+Environment=GUI_FULLSCREEN=1
+# SERVER_URL + API_KEY live here, out of the unit file. See deploy/pi/README.md.
+EnvironmentFile=/etc/usage-dashboard-gui.env
+ExecStart=/home/pi/.local/bin/usage-dashboard-gui
+Restart=always
+RestartSec=5
+# KMS/DRM + touch input access.
+SupplementaryGroups=video render input
+
+[Install]
+WantedBy=multi-user.target
