@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import httpx
 
@@ -25,6 +25,23 @@ _BLOCK_MAX_CHARS = 4000
 _PERCENT_USED_RE = re.compile(r"([0-9]+(?:\.[0-9]+)?)\s*%\s*used", re.IGNORECASE)
 _BAR_WIDTH_RE = re.compile(r"width:\s*([0-9]+(?:\.[0-9]+)?)%", re.IGNORECASE)
 _DATA_TIME_RE = re.compile(r'data-time="([^"]+)"')
+
+# ollama.com renders reset times as a relative countdown ("Resets in 5 hours",
+# "Resets in 2 days"), not an absolute timestamp, so parse that into an absolute
+# time relative to the scrape. Captures the short span after "resets in" and
+# sums any day/hour/minute tokens in it (handles "1 day 3 hours").
+_RESET_IN_RE = re.compile(r"resets?\s+in\s+(.{0,40}?)(?:<|\bago\b|$)", re.IGNORECASE | re.DOTALL)
+_DURATION_TOKEN_RE = re.compile(
+    r"(\d+)\s*(week|day|hour|hr|minute|min)s?\b", re.IGNORECASE
+)
+_DURATION_UNITS = {
+    "week": "weeks",
+    "day": "days",
+    "hour": "hours",
+    "hr": "hours",
+    "minute": "minutes",
+    "min": "minutes",
+}
 
 _SIGNED_OUT_MARKERS = (
     "sign in to ollama",
@@ -61,28 +78,47 @@ def _parse_percent(block: str) -> float | None:
     return None
 
 
-def _parse_resets_at(block: str) -> datetime | None:
+def _parse_relative_reset(block: str, now: datetime) -> datetime | None:
+    phrase = _RESET_IN_RE.search(block)
+    if phrase is None:
+        return None
+    tokens = _DURATION_TOKEN_RE.findall(phrase.group(1))
+    if not tokens:
+        return None
+    delta: dict[str, int] = {}
+    for amount, unit in tokens:
+        key = _DURATION_UNITS[unit.lower()]
+        delta[key] = delta.get(key, 0) + int(amount)
+    return now + timedelta(**delta)
+
+
+def _parse_resets_at(block: str, now: datetime) -> datetime | None:
+    # Prefer an explicit absolute timestamp if the markup ever carries one;
+    # otherwise fall back to the relative "Resets in ..." countdown text.
     match = _DATA_TIME_RE.search(block)
-    if match is None:
-        return None
-    raw = match.group(1)
-    try:
-        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    if parsed.tzinfo is not None:
-        parsed = parsed.astimezone(timezone.utc)
-    return parsed.replace(tzinfo=None)
+    if match is not None:
+        raw = match.group(1)
+        try:
+            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            parsed = None
+        if parsed is not None:
+            if parsed.tzinfo is not None:
+                parsed = parsed.astimezone(timezone.utc)
+            return parsed.replace(tzinfo=None)
+    return _parse_relative_reset(block, now)
 
 
-def _parse_usage_block(labels: tuple[str, ...], html: str) -> tuple[float, datetime | None] | None:
+def _parse_usage_block(
+    labels: tuple[str, ...], html: str, now: datetime
+) -> tuple[float, datetime | None] | None:
     for label in labels:
         block = _block_after(label, html)
         if block is None:
             continue
         percent = _parse_percent(block)
         if percent is not None:
-            return percent, _parse_resets_at(block)
+            return percent, _parse_resets_at(block, now)
     return None
 
 
@@ -106,8 +142,9 @@ def fetch_ollama_usage(cookie: str) -> Reading:
     except httpx.HTTPError as exc:
         raise FetchError(f"Ollama usage request failed: {type(exc).__name__}") from exc
 
-    session = _parse_usage_block(_SESSION_LABELS, html)
-    weekly = _parse_usage_block((_WEEKLY_LABEL,), html)
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    session = _parse_usage_block(_SESSION_LABELS, html, now)
+    weekly = _parse_usage_block((_WEEKLY_LABEL,), html, now)
 
     if session is None and weekly is None:
         if _looks_signed_out(html):
@@ -121,6 +158,6 @@ def fetch_ollama_usage(cookie: str) -> Reading:
         session_resets_at=session[1] if session else None,
         weekly_percent=weekly[0] if weekly else None,
         weekly_resets_at=weekly[1] if weekly else None,
-        fetched_at=datetime.now(timezone.utc).replace(tzinfo=None),
+        fetched_at=now,
         stale=False,
     )
