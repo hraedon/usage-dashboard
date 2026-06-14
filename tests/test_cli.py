@@ -6,10 +6,13 @@ import httpx
 import pytest
 
 from usage_dashboard.cli import (
+    _CLAUDE_CLIENT_ID,
+    _CLAUDE_SCOPES,
     _CallbackHandler,
     _exchange_code,
     _generate_challenge,
     _generate_verifier,
+    _parse_pasted_input,
 )
 
 
@@ -91,9 +94,68 @@ class TestExchangeCode:
         assert refresh == ""
 
 
+class TestOAuthConstants:
+    def test_client_id_is_a_uuid_not_a_url(self) -> None:
+        # Regression: an earlier draft set this to a metadata URL, which the
+        # token endpoint rejects. Claude Code's public client is a UUID.
+        assert not _CLAUDE_CLIENT_ID.startswith("http")
+        assert _CLAUDE_CLIENT_ID.count("-") == 4
+
+    def test_scopes_include_user_profile(self) -> None:
+        # The usage endpoint returns 403 without user:profile.
+        assert "user:profile" in _CLAUDE_SCOPES.split()
+
+
+class TestExchangeIncludesClientAndState:
+    @patch("usage_dashboard.cli.httpx.post")
+    def test_exchange_sends_client_id(self, mock_post: MagicMock) -> None:
+        mock_response = MagicMock()
+        mock_response.json.return_value = {"access_token": "a", "refresh_token": "r"}
+        mock_response.raise_for_status = MagicMock()
+        mock_post.return_value = mock_response
+
+        _exchange_code("code", "verifier", "http://localhost:9/callback", state="s1")
+        data = mock_post.call_args[1].get("data") or mock_post.call_args[0][1]
+        assert data["client_id"] == _CLAUDE_CLIENT_ID
+        assert data["state"] == "s1"
+
+    @patch("usage_dashboard.cli.httpx.post")
+    def test_exchange_omits_state_when_none(self, mock_post: MagicMock) -> None:
+        mock_response = MagicMock()
+        mock_response.json.return_value = {"access_token": "a", "refresh_token": "r"}
+        mock_response.raise_for_status = MagicMock()
+        mock_post.return_value = mock_response
+
+        _exchange_code("code", "verifier", "http://localhost:9/callback")
+        data = mock_post.call_args[1].get("data") or mock_post.call_args[0][1]
+        assert "state" not in data
+
+
+class TestParsePastedInput:
+    def test_bare_code(self) -> None:
+        assert _parse_pasted_input("abc123") == ("abc123", None)
+
+    def test_code_hash_state(self) -> None:
+        assert _parse_pasted_input("abc123#xyz") == ("abc123", "xyz")
+
+    def test_full_redirect_url(self) -> None:
+        code, state = _parse_pasted_input(
+            "https://platform.claude.com/oauth/code/callback?code=abc&state=xyz"
+        )
+        assert code == "abc"
+        assert state == "xyz"
+
+    def test_whitespace_trimmed(self) -> None:
+        assert _parse_pasted_input("  abc123#xyz  ") == ("abc123", "xyz")
+
+    def test_empty(self) -> None:
+        assert _parse_pasted_input("") == (None, None)
+
+
 class TestCallbackHandler:
     def setup_method(self) -> None:
         _CallbackHandler.code = None
+        _CallbackHandler.state = None
         _CallbackHandler.error = None
 
     def test_handler_captures_code(self) -> None:

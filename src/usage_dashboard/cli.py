@@ -20,11 +20,18 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
+# Claude Code's public OAuth client. These were confirmed against a current
+# reference (binary analysis of the Claude Code CLI), per Plan 001's warning
+# not to trust them from memory. The usage endpoint requires the user:profile
+# scope; org:create_api_key + user:inference mirror what Claude Code requests.
 _CLAUDE_AUTHORIZE_URL = "https://claude.ai/oauth/authorize"
 _CLAUDE_TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
-_CLAUDE_CLIENT_ID = "https://claude.ai/oauth/claude-code-client-metadata"
-_CLAUDE_SCOPES = "user:profile user:inference"
-_REDIRECT_URI = "http://localhost/callback"
+_CLAUDE_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+_CLAUDE_SCOPES = "org:create_api_key user:profile user:inference"
+# Manual (no-port) flow: Claude's hosted callback renders the code as
+# ``CODE#STATE`` for the operator to copy. Loopback flow uses a localhost
+# redirect and reads the code straight off the query string.
+_MANUAL_REDIRECT_URI = "https://platform.claude.com/oauth/code/callback"
 _TIMEOUT = 30.0
 
 # PKCE verifier: unreserved chars per RFC 7636 (A-Z a-z 0-9 - . _ ~)
@@ -45,14 +52,22 @@ def _exchange_code(
     code: str,
     verifier: str,
     redirect_uri: str,
+    state: str | None = None,
 ) -> tuple[str, str]:
-    """Exchange an authorization code for access + refresh tokens."""
+    """Exchange an authorization code for access + refresh tokens.
+
+    The redirect_uri must match the one sent to the authorize endpoint, and
+    the public client_id must be included for a PKCE public-client exchange.
+    """
     data = {
         "grant_type": "authorization_code",
         "code": code,
         "code_verifier": verifier,
         "redirect_uri": redirect_uri,
+        "client_id": _CLAUDE_CLIENT_ID,
     }
+    if state is not None:
+        data["state"] = state
     response = httpx.post(
         _CLAUDE_TOKEN_URL,
         data=data,
@@ -70,6 +85,7 @@ class _CallbackHandler(http.server.BaseHTTPRequestHandler):
     """Minimal HTTP handler that captures the OAuth callback code."""
 
     code: str | None = None
+    state: str | None = None
     error: str | None = None
 
     def do_GET(self) -> None:
@@ -77,6 +93,7 @@ class _CallbackHandler(http.server.BaseHTTPRequestHandler):
         params = parse_qs(parsed.query)
         if "code" in params:
             _CallbackHandler.code = params["code"][0]
+            _CallbackHandler.state = params.get("state", [None])[0]
             self.send_response(200)
             self.send_header("Content-Type", "text/html")
             self.end_headers()
@@ -101,21 +118,40 @@ class _CallbackHandler(http.server.BaseHTTPRequestHandler):
         pass  # silence request logs
 
 
-def _wait_for_code(port: int) -> tuple[str | None, str | None]:
-    """Start a local HTTP server and wait for the OAuth callback."""
+def _parse_pasted_input(raw: str) -> tuple[str | None, str | None]:
+    """Parse what the operator pastes back into ``(code, state)``.
+
+    Accepts the full redirect URL (``?code=...&state=...``), Claude's hosted
+    ``CODE#STATE`` form, or a bare code.
+    """
+    raw = raw.strip()
+    if raw.startswith("http"):
+        params = parse_qs(urlparse(raw).query)
+        return params.get("code", [None])[0], params.get("state", [None])[0]
+    if "#" in raw:
+        code, _, state = raw.partition("#")
+        return code or None, state or None
+    return (raw or None), None
+
+
+def _wait_for_code(port: int) -> tuple[str | None, str | None, str | None]:
+    """Start a local HTTP server and wait for the OAuth callback.
+
+    Returns ``(code, state, error)``.
+    """
     server = http.server.HTTPServer(("127.0.0.1", port), _CallbackHandler)
     server.timeout = 300  # 5 minutes
     while _CallbackHandler.code is None and _CallbackHandler.error is None:
         server.handle_request()
     server.server_close()
-    return _CallbackHandler.code, _CallbackHandler.error
+    return _CallbackHandler.code, _CallbackHandler.state, _CallbackHandler.error
 
 
 def login_claude(port: int | None = None, no_browser: bool = False) -> None:
     """Run the PKCE OAuth login flow for Claude and print the token pair."""
-    redirect_uri = _REDIRECT_URI
-    if port is not None:
-        redirect_uri = f"http://localhost:{port}/callback"
+    redirect_uri = (
+        f"http://localhost:{port}/callback" if port is not None else _MANUAL_REDIRECT_URI
+    )
 
     verifier = _generate_verifier()
     challenge = _generate_challenge(verifier)
@@ -134,15 +170,17 @@ def login_claude(port: int | None = None, no_browser: bool = False) -> None:
 
     # Reset class state for repeated invocations (testing).
     _CallbackHandler.code = None
+    _CallbackHandler.state = None
     _CallbackHandler.error = None
 
+    returned_state: str | None
     if port is not None:
         print(f"Starting local callback server on port {port}...")
         print(f"Opening browser to:\n  {authorize_url}\n")
         if not no_browser:
             webbrowser.open(authorize_url)
 
-        code, error = _wait_for_code(port)
+        code, returned_state, error = _wait_for_code(port)
         if error:
             print(f"Authorization failed: {error}", file=sys.stderr)
             sys.exit(1)
@@ -152,21 +190,26 @@ def login_claude(port: int | None = None, no_browser: bool = False) -> None:
     else:
         print("Open this URL in a browser to authorize:\n")
         print(f"  {authorize_url}\n")
-        print("After authorizing, paste the full redirect URL (or just the code):")
-        raw = input("> ").strip()
-        # Accept either the full redirect URL or bare code.
-        if raw.startswith("http"):
-            parsed = urlparse(raw)
-            params_dict = parse_qs(parsed.query)
-            code = params_dict.get("code", [None])[0]
-        else:
-            code = raw
+        print(
+            "After authorizing, the page shows a code like CODE#STATE.\n"
+            "Paste it here (the full CODE#STATE, or the redirect URL):"
+        )
+        raw = input("> ")
+        code, returned_state = _parse_pasted_input(raw)
         if not code:
             print("No authorization code provided.", file=sys.stderr)
             sys.exit(1)
 
+    # CSRF: the returned state must match what we sent (when the flow echoes
+    # one back). A mismatch means the response isn't ours — refuse it.
+    if returned_state is not None and returned_state != state:
+        print("State mismatch — aborting (possible CSRF).", file=sys.stderr)
+        sys.exit(1)
+
     try:
-        access_token, refresh_token = _exchange_code(code, verifier, redirect_uri)
+        access_token, refresh_token = _exchange_code(
+            code, verifier, redirect_uri, state=state
+        )
     except httpx.HTTPError as exc:
         print(f"Token exchange failed: {exc}", file=sys.stderr)
         sys.exit(1)
@@ -177,8 +220,14 @@ def login_claude(port: int | None = None, no_browser: bool = False) -> None:
     print(f"  claude-refresh-token: \"{refresh_token}\"")
     print(f"  claude-client-id: \"{_CLAUDE_CLIENT_ID}\"")
     print()
-    print("Then apply:  kubectl apply -f k8s/server-secret.yaml")
-    print("             kubectl rollout restart deployment/server -n usage-dashboard")
+    print("Then update the Secret keys and roll the server, e.g.:")
+    print(
+        "  kubectl -n usage-dashboard patch secret server-secrets --type merge -p \\\n"
+        "    \"{\\\"stringData\\\":{\\\"claude-token\\\":\\\"$ACCESS\\\","
+        "\\\"claude-refresh-token\\\":\\\"$REFRESH\\\","
+        f"\\\"claude-client-id\\\":\\\"{_CLAUDE_CLIENT_ID}\\\"}}}}\""
+    )
+    print("  kubectl -n usage-dashboard rollout restart deploy/usage-dashboard-server")
 
 
 def main() -> None:

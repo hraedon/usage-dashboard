@@ -23,7 +23,14 @@ A two-component system for monitoring AI usage across [Claude](https://claude.ai
 
 ## Server
 
-Fetches usage from all configured providers every 5 minutes and exposes a `/readings` endpoint. Runs as a Kubernetes Deployment with a Longhorn-backed PVC for persistent SQLite storage.
+Fetches usage from all configured providers on an **adaptive per-provider
+schedule** and exposes a `/readings` endpoint. Each provider is polled
+independently: a 5-minute floor that widens through 5 → 10 → 15 → 30 minutes
+while a reading is unchanged (cutting baseline usage when idle) and snaps back
+to 5 minutes the moment it moves. Failures back off exponentially (capped at
+1 hour, `FAILURE_BACKOFF_CAP`); a `429` honours the server's `Retry-After`.
+Runs as a Kubernetes Deployment with a Longhorn-backed PVC for persistent
+SQLite storage.
 
 ### API
 
@@ -98,10 +105,11 @@ copied from a logged-in browser — the same approach as
 store it as `name=value`. When the cookie expires the tile goes stale/offline
 and the log says so; paste a fresh one.
 
-The Claude token should be a dedicated long-lived token minted with
-`claude setup-token`, not credentials shared with an interactive Claude
-session — the scheduler refreshes on credential rejection, and refreshing a
-shared token rotates it out from under the other session.
+The Claude usage endpoint requires the `user:profile` OAuth scope. A
+`claude setup-token` is scoped for inference only and returns `403` here, and
+credentials copied from an interactive Claude session can't be used because the
+dashboard would rotate the refresh token out from under that session. So the
+dashboard mints its **own** dedicated token pair — see *Claude login* below.
 
 ### Claude login
 
@@ -111,19 +119,21 @@ sharing credentials with an interactive Claude session (which would break
 that session when the dashboard rotates the refresh token).
 
 ```bash
-# Option A: auto-opens browser, listens on a local port
+# Option A: auto-opens a browser and catches the redirect on a local port
 usage-dashboard login claude --port 8282
 
-# Option B: prints a URL, you paste the redirect URL manually
+# Option B: prints a URL; after authorizing, Claude's page shows a
+# CODE#STATE value — paste it back at the prompt
 usage-dashboard login claude
 ```
 
-The command prints the access token, refresh token, and client ID.
-Load them into the Secret and restart:
+The command prints the access token, refresh token, and client ID. Put them in
+the Secret (`claude-token`, `claude-refresh-token`, `claude-client-id`) and
+roll the server:
 
 ```bash
 kubectl apply -f k8s/server-secret.yaml
-kubectl rollout restart deployment/server -n usage-dashboard
+kubectl -n usage-dashboard rollout restart deploy/usage-dashboard-server
 ```
 
 After the first login, the server persists refreshed tokens to the PVC
