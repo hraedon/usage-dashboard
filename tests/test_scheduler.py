@@ -484,3 +484,34 @@ class TestPerProviderScheduling:
         assert snap[Provider.ZAI]["interval_seconds"] == 300     # failing, base backoff
         assert snap[Provider.CLAUDE]["last_success"] is not None
         assert snap[Provider.ZAI]["last_success"] is None
+
+
+class TestConfiguredProviders:
+    def test_only_credentialed_providers_are_configured(self, tmp_path):
+        db = Database(str(tmp_path / "sched.db"))
+        db.initialize()
+        scheduler = FetchScheduler(
+            db, claude_token="token", ollama_cookie="cookie"
+        )
+        assert scheduler.configured_providers() == [
+            Provider.CLAUDE,
+            Provider.OLLAMA,
+        ]
+
+    def test_no_credentials_means_no_configured_providers(self, tmp_path):
+        db = Database(str(tmp_path / "sched.db"))
+        db.initialize()
+        scheduler = FetchScheduler(db)
+        assert scheduler.configured_providers() == []
+
+    def test_configured_providers_are_in_enum_order(self, tmp_path):
+        db = Database(str(tmp_path / "sched.db"))
+        db.initialize()
+        scheduler = FetchScheduler(
+            db,
+            umans_key="u",
+            claude_token="c",
+            zai_key="z",
+            ollama_cookie="o",
+        )
+        assert scheduler.configured_providers() == list(Provider)

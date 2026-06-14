@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hmac
 import html
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from datetime import datetime, timezone
 from typing import Any
 
@@ -138,32 +138,44 @@ def _make_auth_dependency(
     return verify_bearer
 
 
-def create_app(api_key: str, db: Database) -> FastAPI:
+def create_app(
+    api_key: str,
+    db: Database,
+    configured_providers: Iterable[Provider] | None = None,
+) -> FastAPI:
     app = FastAPI()
     auth = _make_auth_dependency(api_key)
+
+    # Only report providers that are actually configured. A provider that was
+    # never configured is omitted entirely rather than fabricated as "offline",
+    # so a real outage (configured but not reporting) is distinguishable from
+    # an absent config (WI-003). ``None`` means "assume all providers".
+    providers: list[Provider] = (
+        list(configured_providers)
+        if configured_providers is not None
+        else list(Provider)
+    )
+
+    def _reported_readings() -> list[Reading]:
+        readings: dict[Provider, Reading] = db.get_latest_readings()
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        return [
+            readings.get(provider) or make_offline_reading(provider, now)
+            for provider in providers
+        ]
 
     @app.get("/readings")
     async def get_readings(
         _user: str = Depends(auth),
     ) -> list[dict[str, Any]]:
-        readings: dict[Provider, Reading] = db.get_latest_readings()
-        now = datetime.now(timezone.utc).replace(tzinfo=None)
-        result: list[dict[str, Any]] = []
-        for provider in Provider:
-            reading = readings.get(provider)
-            if reading is None:
-                reading = make_offline_reading(provider, now)
-            result.append(reading.to_dict())
-        return result
+        return [reading.to_dict() for reading in _reported_readings()]
 
     @app.get("/dashboard", response_class=HTMLResponse)
     async def dashboard() -> HTMLResponse:
         # Unauthenticated by design: intended for private networks only, and
         # exposes nothing beyond what the display already shows.
-        readings: dict[Provider, Reading] = db.get_latest_readings()
         now = datetime.now(timezone.utc).replace(tzinfo=None)
-        ordered = [readings.get(p) or make_offline_reading(p, now) for p in Provider]
-        return HTMLResponse(_render_dashboard_html(ordered, now))
+        return HTMLResponse(_render_dashboard_html(_reported_readings(), now))
 
     @app.get("/health")
     async def health() -> dict[str, str]:

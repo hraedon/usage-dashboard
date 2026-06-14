@@ -106,18 +106,19 @@ Images are built and pushed to `ghcr.io/hraedon/usage-dashboard-server` and `ghc
 | `zai-api-key` | No | z.ai API key |
 | `ollama-cookie` | No | ollama.com browser session cookie (`name=value`; see below) |
 | `umans-api-key` | No | umans API key |
-| `ollama-email` | No | Reserved for the planned automated Ollama login (not yet used) |
-| `ollama-password` | No | Reserved for the planned automated Ollama login (not yet used) |
+| `ollama-email` | No | Unused — see *Ollama login* (kept only as a placeholder) |
+| `ollama-password` | No | Unused — see *Ollama login* (kept only as a placeholder) |
 
-ollama.com has no usage API and no plain-HTTP login (the signin form is
-JS-driven), so the fetcher scrapes `ollama.com/settings` with a session cookie
-copied from a logged-in browser — the same approach as
+ollama.com has no usage API and no plain-HTTP login — it authenticates via
+WorkOS AuthKit (a JS-driven form plus an anti-bot device-fingerprint signal),
+so there is nothing to POST credentials to. The fetcher instead scrapes
+`ollama.com/settings` with a browser session cookie — the same approach as
 [CodexBar](https://github.com/steipete/CodexBar) and
-[ollama-usage](https://git.sr.ht/~hrbrmstr/ollama-usage). In browser devtools
-(Application → Cookies → ollama.com), copy the session cookie (typically named
-`session`, `__Secure-session`, or a `next-auth.session-token` variant) and
-store it as `name=value`. When the cookie expires the tile goes stale/offline
-and the log says so; paste a fresh one.
+[ollama-usage](https://git.sr.ht/~hrbrmstr/ollama-usage). The easy way to
+obtain that cookie is `usage-dashboard login ollama` (see below); the manual
+fallback is browser devtools (Application → Cookies → ollama.com), copying the
+session cookie and storing it as `name=value`. When the cookie expires the tile
+goes stale/offline and the log says so; mint a fresh one.
 
 The Claude usage endpoint requires the `user:profile` OAuth scope. A
 `claude setup-token` is scoped for inference only and returns `403` here, and
@@ -153,6 +154,27 @@ kubectl -n usage-dashboard rollout restart deploy/usage-dashboard-server
 After the first login, the server persists refreshed tokens to the PVC
 (`/data/tokens.json`), so pod restarts survive token rotation without
 re-login.  The k8s Secret values are used only for the initial seed.
+
+### Ollama login
+
+`login ollama` opens a real browser, lets you sign in to ollama.com by hand
+(handling any WorkOS prompt), then extracts the session cookie and prints it
+ready for the Secret. It needs the optional browser dependency:
+
+```bash
+pip install 'usage-dashboard[login]'
+playwright install chromium
+usage-dashboard login ollama
+```
+
+A browser window opens on `ollama.com`. Sign in, then press Enter at the
+prompt; the command captures the `ollama.com` cookies, verifies they parse the
+usage page, and prints an `ollama-cookie: "..."` line to load into the Secret.
+
+Because of WorkOS's anti-bot signal, this is a **local, human-in-the-loop**
+flow (run it on a machine with a display) rather than an unattended server-side
+refresh — the cookie still expires, so re-run it when the Ollama tile goes
+offline. `--headless` exists but rarely clears the anti-bot check.
 
 Only providers with configured credentials are fetched.
 

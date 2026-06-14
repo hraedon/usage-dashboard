@@ -23,6 +23,12 @@ dev = [
 gui = [
     "pygame-ce>=2.5",
 ]
+# Browser automation for the interactive `usage-dashboard login ollama` flow.
+# CLI-only: the server image does not install this. After installing, run
+# `playwright install chromium` once to fetch the browser.
+login = [
+    "playwright>=1.40",
+]
 
 [build-system]
 requires = ["hatchling"]
@@ -51,5 +57,6 @@ python_version = "3.12"
 strict = true
 
 [[tool.mypy.overrides]]
-module = ["pygame", "pygame.*"]
+# Optional extras (gui/login) not present in the type-check environment.
+module = ["pygame", "pygame.*", "playwright.*"]
 ignore_missing_imports = true
