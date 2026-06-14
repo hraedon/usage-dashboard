@@ -94,6 +94,8 @@ Images are built and pushed to `ghcr.io/hraedon/usage-dashboard-server` and `ghc
 | `zai-api-key` | No | z.ai API key |
 | `ollama-cookie` | No | ollama.com browser session cookie (`name=value`; see below) |
 | `umans-api-key` | No | umans API key |
+| `ollama-email` | No | Reserved for the planned automated Ollama login (not yet used) |
+| `ollama-password` | No | Reserved for the planned automated Ollama login (not yet used) |
 
 ollama.com has no usage API and no plain-HTTP login (the signin form is
 JS-driven), so the fetcher scrapes `ollama.com/settings` with a session cookie
