@@ -19,6 +19,10 @@ dev = [
     "ruff>=0.7",
     "mypy>=1.13",
 ]
+# Touch GUI client for the Pi 4B + 5" display. Not pulled by the server image.
+gui = [
+    "pygame-ce>=2.5",
+]
 
 [build-system]
 requires = ["hatchling"]
@@ -26,6 +30,7 @@ build-backend = "hatchling.build"
 
 [project.scripts]
 usage-dashboard = "usage_dashboard.cli:main"
+usage-dashboard-gui = "usage_dashboard.client.gui:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/usage_dashboard"]
@@ -44,3 +49,7 @@ select = ["E", "F", "I", "W"]
 [tool.mypy]
 python_version = "3.12"
 strict = true
+
+[[tool.mypy.overrides]]
+module = ["pygame", "pygame.*"]
+ignore_missing_imports = true

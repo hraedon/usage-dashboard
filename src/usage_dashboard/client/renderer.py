@@ -1,54 +1,25 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from typing import TYPE_CHECKING
 
 from PIL import Image, ImageDraw, ImageFont
 
+from usage_dashboard.client import format as _fmt
 from usage_dashboard.shared.models import Provider, Reading, ReadingStatus
 
+if TYPE_CHECKING:
+    from datetime import datetime
+
+# Local aliases — the renderer body and test_renderer import these names.
+_BG = _fmt.BG
+_TEXT = _fmt.TEXT
+_GRAY = _fmt.GRAY
+_BAR_BG = _fmt.BAR_BG
+_YELLOW = _fmt.YELLOW
+_bar_color = _fmt.bar_color
+_format_countdown = _fmt.format_countdown
+
 _TILE_PROVIDER_ORDER: list[Provider] = [Provider.CLAUDE, Provider.ZAI, Provider.OLLAMA]
-
-_BG = (0, 0, 0)
-_TEXT = (255, 255, 255)
-_GRAY = (150, 150, 150)
-_GREEN = (0x22, 0xC5, 0x5E)
-_ORANGE = (0xF9, 0x73, 0x16)
-_RED = (0xEF, 0x44, 0x44)
-_YELLOW = (0xEA, 0xB3, 0x08)
-_BAR_BG = (50, 50, 50)
-
-_THREE_DAYS_SECONDS = 3 * 24 * 3600
-
-
-def _bar_color(percent: float | None) -> tuple[int, int, int]:
-    if percent is None:
-        return _GRAY
-    if percent >= 85:
-        return _RED
-    if percent >= 75:
-        return _ORANGE
-    return _GREEN
-
-
-def _format_countdown(resets_at: datetime | None) -> tuple[str, bool]:
-    if resets_at is None:
-        return ("", False)
-    now = datetime.now(timezone.utc)
-    if resets_at.tzinfo is None:
-        target = resets_at.replace(tzinfo=timezone.utc)
-    else:
-        target = resets_at.astimezone(timezone.utc)
-    delta = target - now
-    total_seconds = int(delta.total_seconds())
-    if total_seconds <= 0:
-        return ("0m", True)
-    within_threshold = total_seconds <= _THREE_DAYS_SECONDS
-    days = total_seconds // 86400
-    hours = (total_seconds % 86400) // 3600
-    minutes = (total_seconds % 3600) // 60
-    if days > 0:
-        return (f"{days}d {hours}h", within_threshold)
-    return (f"{hours}h {minutes}m", within_threshold)
 
 
 class DisplayRenderer:
