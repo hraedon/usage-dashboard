@@ -114,7 +114,7 @@ footer {{ text-align:center; color:#555; font-size:0.7rem; margin-top:8px; }}
 </head>
 <body>
 {"".join(cards)}
-<footer>fetched {fetched.strftime("%Y-%m-%d %H:%M:%S")} UTC &middot; refreshes every 5m</footer>
+<footer>fetched {fetched.strftime("%Y-%m-%d %H:%M:%S")} UTC &middot; refreshes every 5&ndash;30m (adaptive)</footer>
 </body>
 </html>"""
 

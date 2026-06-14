@@ -23,7 +23,14 @@ A two-component system for monitoring AI usage across [Claude](https://claude.ai
 
 ## Server
 
-Fetches usage from all configured providers every 5 minutes and exposes a `/readings` endpoint. Runs as a Kubernetes Deployment with a Longhorn-backed PVC for persistent SQLite storage.
+Fetches usage from all configured providers on an **adaptive per-provider
+schedule** and exposes a `/readings` endpoint. Each provider is polled
+independently: a 5-minute floor that widens through 5 → 10 → 15 → 30 minutes
+while a reading is unchanged (cutting baseline usage when idle) and snaps back
+to 5 minutes the moment it moves. Failures back off exponentially (capped at
+1 hour, `FAILURE_BACKOFF_CAP`); a `429` honours the server's `Retry-After`.
+Runs as a Kubernetes Deployment with a Longhorn-backed PVC for persistent
+SQLite storage.
 
 ### API
 
