@@ -182,6 +182,16 @@ class FetchScheduler:
 
     # -- fetch tasks --------------------------------------------------------
 
+    def configured_providers(self) -> list[Provider]:
+        """Providers that actually have credentials, in ``Provider`` order.
+
+        This is the set the API should report on: a provider absent here was
+        never configured (no credential), which is different from a configured
+        provider that is currently failing/offline. Derived from
+        ``_get_fetch_tasks`` so the two can never drift (WI-003).
+        """
+        return [provider for provider, _ in self._get_fetch_tasks()]
+
     def _get_fetch_tasks(self) -> list[tuple[Provider, Callable[[], Reading]]]:
         tasks: list[tuple[Provider, Callable[[], Reading]]] = []
         if self._claude_token is not None:
