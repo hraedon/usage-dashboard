@@ -71,7 +71,11 @@ def main() -> None:
         token_store=token_store,
     )
 
-    app = create_app(api_key=api_key, db=database)
+    app = create_app(
+        api_key=api_key,
+        db=database,
+        configured_providers=scheduler.configured_providers(),
+    )
 
     scheduler.start()
 
