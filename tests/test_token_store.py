@@ -59,3 +59,28 @@ class TestTokenStore:
             data = json.load(f)
         assert data["claude"]["access_token"] == "acc"
         assert data["claude"]["refresh_token"] == "ref"
+
+
+class TestSeedMarker:
+    def test_marker_defaults_to_none(self, tmp_path: Path) -> None:
+        store = TokenStore(tmp_path / "tokens.json")
+        assert store.get_claude_seed_marker() is None
+
+    def test_set_and_get_marker(self, tmp_path: Path) -> None:
+        store = TokenStore(tmp_path / "tokens.json")
+        store.set_claude_seed_marker("marker-abc")
+        assert store.get_claude_seed_marker() == "marker-abc"
+
+    def test_save_preserves_marker(self, tmp_path: Path) -> None:
+        # A token refresh (save) must not wipe the env-seed marker.
+        store = TokenStore(tmp_path / "tokens.json")
+        store.save_claude_tokens("a0", "r0")
+        store.set_claude_seed_marker("marker-0")
+        store.save_claude_tokens("a1", "r1")  # simulate a refresh
+        assert store.get_claude_seed_marker() == "marker-0"
+        assert store.load_claude_tokens() == ("a1", "r1")
+
+    def test_marker_persists_across_instances(self, tmp_path: Path) -> None:
+        path = tmp_path / "tokens.json"
+        TokenStore(path).set_claude_seed_marker("m")
+        assert TokenStore(path).get_claude_seed_marker() == "m"
