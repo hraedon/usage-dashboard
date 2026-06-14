@@ -235,21 +235,27 @@ class TestRateLimitBackoff:
         now = datetime.now(timezone.utc).replace(tzinfo=None)
         assert scheduler._is_blocked(Provider.CLAUDE, now)
         assert not scheduler._is_blocked(Provider.CLAUDE, now + timedelta(seconds=1700))
-        # expiry check above also clears the block
-        assert not scheduler._is_blocked(Provider.CLAUDE, now)
+        # The server's Retry-After is authoritative — it sets the gap, not the
+        # exponential base (and may exceed the failure cap).
+        snap = scheduler.schedule_snapshot()[Provider.CLAUDE]
+        assert 1680.0 <= snap["interval_seconds"] <= 1700.0
 
-    def test_rate_limit_without_retry_after_uses_default(self, tmp_path):
+    def test_rate_limit_default_is_a_floor_when_above_exponential(self, tmp_path):
         from usage_dashboard.server.fetch_types import FetchRateLimitError
 
         db = Database(str(tmp_path / "sched.db"))
         db.initialize()
-        scheduler = FetchScheduler(db, claude_token="token", rate_limit_default_seconds=120)
+        # A 429 with no Retry-After backs off by max(exponential, default).
+        # With the default above the exponential base it dominates.
+        scheduler = FetchScheduler(
+            db, claude_token="token", rate_limit_default_seconds=1200
+        )
         fetch_fn = MagicMock(side_effect=FetchRateLimitError("HTTP 429"))
         scheduler._fetch_one(Provider.CLAUDE, fetch_fn)
 
         now = datetime.now(timezone.utc).replace(tzinfo=None)
-        assert scheduler._is_blocked(Provider.CLAUDE, now)
-        assert not scheduler._is_blocked(Provider.CLAUDE, now + timedelta(seconds=150))
+        assert scheduler._is_blocked(Provider.CLAUDE, now + timedelta(seconds=600))
+        assert not scheduler._is_blocked(Provider.CLAUDE, now + timedelta(seconds=1300))
 
     def test_rate_limit_still_marks_reading_stale(self, tmp_path):
         from usage_dashboard.server.fetch_types import FetchRateLimitError
@@ -349,3 +355,132 @@ class TestClaudeTokenPersistence:
             scheduler._fetch_one(Provider.CLAUDE, fetch_fn)
         # Store should still have the original saved tokens.
         assert token_store.load_claude_tokens() == ("saved-access", "saved-refresh")
+
+
+def _interval(scheduler: FetchScheduler, provider: Provider) -> float:
+    return scheduler.schedule_snapshot()[provider]["interval_seconds"]
+
+
+class TestIdleLadder:
+    def test_unchanged_reading_steps_interval_out(self, tmp_path):
+        db = Database(str(tmp_path / "sched.db"))
+        db.initialize()
+        reading = _make_reading(provider=Provider.CLAUDE)
+        fetch_fn = MagicMock(return_value=reading)
+        scheduler = FetchScheduler(db, claude_token="token", interval_seconds=300)
+
+        scheduler._fetch_one(Provider.CLAUDE, fetch_fn)
+        assert _interval(scheduler, Provider.CLAUDE) == 300  # floor on first read
+        for expected in (600, 900, 1800, 1800):  # widens, then caps at 30m
+            scheduler._fetch_one(Provider.CLAUDE, fetch_fn)
+            assert _interval(scheduler, Provider.CLAUDE) == expected
+
+    def test_changed_reading_resets_to_floor(self, tmp_path):
+        db = Database(str(tmp_path / "sched.db"))
+        db.initialize()
+        scheduler = FetchScheduler(db, claude_token="token", interval_seconds=300)
+        steady = _make_reading(provider=Provider.CLAUDE, session_percent=50.0)
+        scheduler._fetch_one(Provider.CLAUDE, MagicMock(return_value=steady))
+        scheduler._fetch_one(Provider.CLAUDE, MagicMock(return_value=steady))
+        assert _interval(scheduler, Provider.CLAUDE) == 600
+
+        moved = _make_reading(provider=Provider.CLAUDE, session_percent=80.0)
+        scheduler._fetch_one(Provider.CLAUDE, MagicMock(return_value=moved))
+        assert _interval(scheduler, Provider.CLAUDE) == 300
+
+    def test_subepsilon_jitter_does_not_reset(self, tmp_path):
+        db = Database(str(tmp_path / "sched.db"))
+        db.initialize()
+        scheduler = FetchScheduler(
+            db, claude_token="token", interval_seconds=300, change_epsilon=0.5
+        )
+        base = _make_reading(provider=Provider.CLAUDE, session_percent=50.0)
+        scheduler._fetch_one(Provider.CLAUDE, MagicMock(return_value=base))
+        scheduler._fetch_one(Provider.CLAUDE, MagicMock(return_value=base))
+        assert _interval(scheduler, Provider.CLAUDE) == 600
+
+        jitter = _make_reading(provider=Provider.CLAUDE, session_percent=50.2)
+        scheduler._fetch_one(Provider.CLAUDE, MagicMock(return_value=jitter))
+        assert _interval(scheduler, Provider.CLAUDE) == 900  # treated as unchanged
+
+    def test_detail_change_resets_quotaless_provider(self, tmp_path):
+        # umans carries movement in `detail`, not percentages.
+        db = Database(str(tmp_path / "sched.db"))
+        db.initialize()
+        scheduler = FetchScheduler(db, umans_key="key", interval_seconds=300)
+        r1 = _make_reading(
+            provider=Provider.UMANS, session_percent=None, weekly_percent=None,
+            session_resets_at=None, weekly_resets_at=None, detail="req 10 tok 1M",
+        )
+        scheduler._fetch_one(Provider.UMANS, MagicMock(return_value=r1))
+        scheduler._fetch_one(Provider.UMANS, MagicMock(return_value=r1))
+        assert _interval(scheduler, Provider.UMANS) == 600
+
+        r2 = _make_reading(
+            provider=Provider.UMANS, session_percent=None, weekly_percent=None,
+            session_resets_at=None, weekly_resets_at=None, detail="req 11 tok 1.2M",
+        )
+        scheduler._fetch_one(Provider.UMANS, MagicMock(return_value=r2))
+        assert _interval(scheduler, Provider.UMANS) == 300
+
+
+class TestExponentialFailureBackoff:
+    def test_non_429_failure_backs_off_exponentially(self, tmp_path):
+        db = Database(str(tmp_path / "sched.db"))
+        db.initialize()
+        scheduler = FetchScheduler(
+            db, claude_token="token", interval_seconds=300, failure_cap_seconds=3600
+        )
+        fetch_fn = MagicMock(side_effect=FetchError("boom"))  # no explicit 429
+        for expected in (300, 600, 1200, 2400):
+            scheduler._fetch_one(Provider.CLAUDE, fetch_fn)
+            assert _interval(scheduler, Provider.CLAUDE) == expected
+
+    def test_failure_backoff_is_capped(self, tmp_path):
+        db = Database(str(tmp_path / "sched.db"))
+        db.initialize()
+        scheduler = FetchScheduler(
+            db, claude_token="token", interval_seconds=300, failure_cap_seconds=1000
+        )
+        fetch_fn = MagicMock(side_effect=FetchError("boom"))
+        for _ in range(8):
+            scheduler._fetch_one(Provider.CLAUDE, fetch_fn)
+        assert _interval(scheduler, Provider.CLAUDE) == 1000
+
+    def test_recovery_resets_interval_and_failures(self, tmp_path):
+        db = Database(str(tmp_path / "sched.db"))
+        db.initialize()
+        scheduler = FetchScheduler(db, claude_token="token", interval_seconds=300)
+        fail_fn = MagicMock(side_effect=FetchError("boom"))
+        scheduler._fetch_one(Provider.CLAUDE, fail_fn)
+        scheduler._fetch_one(Provider.CLAUDE, fail_fn)
+        assert _interval(scheduler, Provider.CLAUDE) == 600
+
+        ok = _make_reading(provider=Provider.CLAUDE)
+        scheduler._fetch_one(Provider.CLAUDE, MagicMock(return_value=ok))
+        snap = scheduler.schedule_snapshot()[Provider.CLAUDE]
+        assert snap["interval_seconds"] == 300
+        assert snap["failures"] == 0
+        assert db.get_consecutive_failures(Provider.CLAUDE) == 0
+
+
+class TestPerProviderScheduling:
+    def test_intervals_tracked_independently(self, tmp_path):
+        db = Database(str(tmp_path / "sched.db"))
+        db.initialize()
+        scheduler = FetchScheduler(
+            db, claude_token="token", zai_key="key", interval_seconds=300
+        )
+        steady = _make_reading(provider=Provider.CLAUDE)
+        scheduler._fetch_one(Provider.CLAUDE, MagicMock(return_value=steady))
+        scheduler._fetch_one(Provider.CLAUDE, MagicMock(return_value=steady))
+
+        scheduler._fetch_one(
+            Provider.ZAI, MagicMock(side_effect=FetchError("boom"))
+        )
+
+        snap = scheduler.schedule_snapshot()
+        assert snap[Provider.CLAUDE]["interval_seconds"] == 600  # idle, widened
+        assert snap[Provider.ZAI]["interval_seconds"] == 300     # failing, base backoff
+        assert snap[Provider.CLAUDE]["last_success"] is not None
+        assert snap[Provider.ZAI]["last_success"] is None

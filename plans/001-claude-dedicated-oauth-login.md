@@ -1,7 +1,17 @@
 # Plan 001 — Dedicated Claude OAuth login (don't share the interactive session)
 
-**Status:** proposed 2026-06-13
+**Status:** implemented 2026-06-14 (`usage-dashboard login claude`)
 **Tracking:** WI-009
+
+> **Landed:** PKCE login CLI (loopback + manual `CODE#STATE` paste), with the
+> OAuth params confirmed against a current reference (binary-analysis of the
+> Claude Code CLI): client_id `9d1c250a-…`, authorize `claude.ai/oauth/authorize`,
+> token `platform.claude.com/v1/oauth/token`, scope includes `user:profile`.
+> Scheduler already consumes `claude-client-id` on refresh (WI-2) and persists
+> rotated tokens to the PVC (WI-3, `token_store.py`). Operator must still run the
+> login once and load the three keys into the Secret. The earlier draft hardcoded
+> a *metadata URL* as the client_id (wrong) — that's the trap the warning below
+> was about; corrected to the UUID.
 
 ## Problem
 
