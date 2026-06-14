@@ -87,6 +87,10 @@ def _render_dashboard_html(readings: list[Reading], now: datetime) -> str:
         cards.append(f'<section class="card"><h2>{name}</h2>{body}</section>')
 
     fetched = max((r.fetched_at for r in readings), default=now)
+    footer = (
+        f"fetched {fetched.strftime('%Y-%m-%d %H:%M:%S')} UTC "
+        "&middot; refreshes every 5&ndash;30m (adaptive)"
+    )
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -114,7 +118,7 @@ footer {{ text-align:center; color:#555; font-size:0.7rem; margin-top:8px; }}
 </head>
 <body>
 {"".join(cards)}
-<footer>fetched {fetched.strftime("%Y-%m-%d %H:%M:%S")} UTC &middot; refreshes every 5&ndash;30m (adaptive)</footer>
+<footer>{footer}</footer>
 </body>
 </html>"""
 

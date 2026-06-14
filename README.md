@@ -105,10 +105,11 @@ copied from a logged-in browser — the same approach as
 store it as `name=value`. When the cookie expires the tile goes stale/offline
 and the log says so; paste a fresh one.
 
-The Claude token should be a dedicated long-lived token minted with
-`claude setup-token`, not credentials shared with an interactive Claude
-session — the scheduler refreshes on credential rejection, and refreshing a
-shared token rotates it out from under the other session.
+The Claude usage endpoint requires the `user:profile` OAuth scope. A
+`claude setup-token` is scoped for inference only and returns `403` here, and
+credentials copied from an interactive Claude session can't be used because the
+dashboard would rotate the refresh token out from under that session. So the
+dashboard mints its **own** dedicated token pair — see *Claude login* below.
 
 ### Claude login
 
@@ -118,19 +119,21 @@ sharing credentials with an interactive Claude session (which would break
 that session when the dashboard rotates the refresh token).
 
 ```bash
-# Option A: auto-opens browser, listens on a local port
+# Option A: auto-opens a browser and catches the redirect on a local port
 usage-dashboard login claude --port 8282
 
-# Option B: prints a URL, you paste the redirect URL manually
+# Option B: prints a URL; after authorizing, Claude's page shows a
+# CODE#STATE value — paste it back at the prompt
 usage-dashboard login claude
 ```
 
-The command prints the access token, refresh token, and client ID.
-Load them into the Secret and restart:
+The command prints the access token, refresh token, and client ID. Put them in
+the Secret (`claude-token`, `claude-refresh-token`, `claude-client-id`) and
+roll the server:
 
 ```bash
 kubectl apply -f k8s/server-secret.yaml
-kubectl rollout restart deployment/server -n usage-dashboard
+kubectl -n usage-dashboard rollout restart deploy/usage-dashboard-server
 ```
 
 After the first login, the server persists refreshed tokens to the PVC
