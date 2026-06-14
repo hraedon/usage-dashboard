@@ -42,12 +42,23 @@ class TokenStore:
             return entry.get("access_token"), entry.get("refresh_token")
 
     def save(self, provider: str, access_token: str, refresh_token: str) -> None:
-        """Persist a token pair for *provider*."""
+        """Persist a token pair for *provider* (preserving any seed marker)."""
         with self._lock:
-            self._data[provider] = {
-                "access_token": access_token,
-                "refresh_token": refresh_token,
-            }
+            entry = self._data.setdefault(provider, {})
+            entry["access_token"] = access_token
+            entry["refresh_token"] = refresh_token
+            self._flush()
+
+    def get_seed_marker(self, provider: str) -> str | None:
+        """Return the marker recorded for the credentials last seeded from the
+        environment for *provider* (used to detect a changed Secret)."""
+        with self._lock:
+            return self._data.get(provider, {}).get("seed_marker")
+
+    def set_seed_marker(self, provider: str, marker: str) -> None:
+        """Record the seed marker for *provider* without touching its tokens."""
+        with self._lock:
+            self._data.setdefault(provider, {})["seed_marker"] = marker
             self._flush()
 
     def load_claude_tokens(self) -> tuple[str | None, str | None]:
@@ -57,6 +68,12 @@ class TokenStore:
     def save_claude_tokens(self, access_token: str, refresh_token: str) -> None:
         """Convenience: persist tokens for the 'claude' provider."""
         self.save("claude", access_token, refresh_token)
+
+    def get_claude_seed_marker(self) -> str | None:
+        return self.get_seed_marker("claude")
+
+    def set_claude_seed_marker(self, marker: str) -> None:
+        self.set_seed_marker("claude", marker)
 
     # ------------------------------------------------------------------
     # Internals
