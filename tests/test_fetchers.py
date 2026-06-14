@@ -1,13 +1,13 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
 import httpx
 import pytest
 
 from usage_dashboard.server.fetch_claude import fetch_claude_usage, refresh_claude_token
-from usage_dashboard.server.fetch_ollama import fetch_ollama_usage
+from usage_dashboard.server.fetch_ollama import _parse_relative_reset, fetch_ollama_usage
 from usage_dashboard.server.fetch_types import FetchAuthError, FetchError
 from usage_dashboard.server.fetch_umans import _format_tokens, fetch_umans_usage
 from usage_dashboard.server.fetch_zai import fetch_zai_usage
@@ -272,6 +272,32 @@ class TestFetchOllama:
         assert reading.session_resets_at == datetime(2026, 6, 13, 2, 0, 0)
         assert reading.weekly_resets_at == datetime(2026, 6, 17, 0, 0, 0)
         assert reading.stale is False
+
+    @patch("usage_dashboard.server.fetch_ollama.httpx.Client")
+    def test_fetch_ollama_parses_relative_reset_text(self, mock_client_cls):
+        # The real settings page renders "Resets in N hours/days" text, not a
+        # data-time attribute (WI-005). Reset times should be computed from it.
+        html = """
+        <html><body><span>Cloud Usage</span><span>Pro</span>
+        <div><h3>Session usage</h3><span>10.0% used</span>
+          <span>Resets in 5 hours</span></div>
+        <div><h3>Weekly usage</h3><span>20.0% used</span>
+          <span>Resets in 2 days</span></div>
+        </body></html>
+        """
+        self._mock_get(mock_client_cls, text=html)
+
+        before = datetime.now(timezone.utc).replace(tzinfo=None)
+        reading = fetch_ollama_usage("session=abc123")
+        after = datetime.now(timezone.utc).replace(tzinfo=None)
+
+        assert reading.session_percent == 10.0
+        assert reading.weekly_percent == 20.0
+        sess = reading.session_resets_at
+        wk = reading.weekly_resets_at
+        assert sess is not None and wk is not None
+        assert before + timedelta(hours=5) <= sess <= after + timedelta(hours=5)
+        assert before + timedelta(days=2) <= wk <= after + timedelta(days=2)
 
     @patch("usage_dashboard.server.fetch_ollama.httpx.Client")
     def test_fetch_ollama_sends_cookie_header(self, mock_client_cls):
@@ -570,3 +596,29 @@ class TestZaiResetTimes:
 
         assert reading.session_resets_at == datetime(2026, 6, 13, 0, 35, 23, 670000)
         assert reading.weekly_resets_at == datetime(2026, 6, 17, 2, 29, 32, 979000)
+
+
+class TestParseRelativeReset:
+    _NOW = datetime(2026, 6, 14, 12, 0, 0)
+
+    def test_hours(self):
+        got = _parse_relative_reset("Resets in 5 hours", self._NOW)
+        assert got == self._NOW + timedelta(hours=5)
+
+    def test_days(self):
+        got = _parse_relative_reset("resets in 2 days", self._NOW)
+        assert got == self._NOW + timedelta(days=2)
+
+    def test_combined_day_and_hours(self):
+        got = _parse_relative_reset("Resets in 1 day 3 hours", self._NOW)
+        assert got == self._NOW + timedelta(days=1, hours=3)
+
+    def test_minutes_abbreviated(self):
+        got = _parse_relative_reset("resets in 45 min", self._NOW)
+        assert got == self._NOW + timedelta(minutes=45)
+
+    def test_no_match_returns_none(self):
+        assert _parse_relative_reset("no countdown here", self._NOW) is None
+
+    def test_phrase_without_duration_returns_none(self):
+        assert _parse_relative_reset("resets in a moment", self._NOW) is None

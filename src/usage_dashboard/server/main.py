@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import sys
@@ -12,6 +13,36 @@ from usage_dashboard.server.scheduler import FetchScheduler
 from usage_dashboard.server.token_store import TokenStore
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_claude_tokens(
+    token_store: TokenStore,
+    env_access: str | None,
+    env_refresh: str | None,
+) -> tuple[str | None, str | None]:
+    """Decide which Claude tokens to run with (WI-001).
+
+    The k8s Secret keeps the originally-provisioned tokens forever, so seeding
+    the store from the env on every boot would clobber the refreshed tokens the
+    scheduler persisted — after a restart the stale pair 401s and its
+    already-rotated refresh token can't recover. Instead: only (re)seed from the
+    env when the Secret differs from what we last seeded (first boot or a
+    deliberate re-login); otherwise prefer the persisted, possibly-refreshed
+    tokens. A hash of the env access token is the change marker, so the Secret
+    value isn't duplicated on disk.
+    """
+    persisted_access, persisted_refresh = token_store.load_claude_tokens()
+
+    if env_access and env_refresh:
+        marker = hashlib.sha256(env_access.encode()).hexdigest()
+        if marker != token_store.get_claude_seed_marker():
+            # New credential from the Secret — adopt it and record the marker.
+            token_store.save_claude_tokens(env_access, env_refresh)
+            token_store.set_claude_seed_marker(marker)
+            return env_access, env_refresh
+
+    # Prefer persisted (refreshed) tokens; fall back to whatever the env gave.
+    return persisted_access or env_access, persisted_refresh or env_refresh
 
 
 def main() -> None:
@@ -48,15 +79,9 @@ def main() -> None:
     # so pod restarts survive a rotation without touching the Secret.
     token_store = TokenStore(os.path.join(db_dir or "/data", "tokens.json"))
 
-    # Seed the store from env vars if present (first boot or Secret update).
-    if claude_token and claude_refresh_token:
-        token_store.save_claude_tokens(claude_token, claude_refresh_token)
-    # Fall back to persisted tokens when env vars are empty (restart after
-    # the initial login, where the Secret may not have been updated yet).
-    if not claude_token or not claude_refresh_token:
-        persisted_access, persisted_refresh = token_store.load_claude_tokens()
-        claude_token = claude_token or persisted_access
-        claude_refresh_token = claude_refresh_token or persisted_refresh
+    claude_token, claude_refresh_token = _resolve_claude_tokens(
+        token_store, claude_token, claude_refresh_token
+    )
 
     scheduler = FetchScheduler(
         db=database,
@@ -71,7 +96,11 @@ def main() -> None:
         token_store=token_store,
     )
 
-    app = create_app(api_key=api_key, db=database)
+    app = create_app(
+        api_key=api_key,
+        db=database,
+        configured_providers=scheduler.configured_providers(),
+    )
 
     scheduler.start()
 

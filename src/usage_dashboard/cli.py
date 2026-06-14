@@ -14,6 +14,8 @@ import secrets
 import string
 import sys
 import webbrowser
+from collections.abc import Iterable, Mapping
+from typing import Any
 from urllib.parse import parse_qs, urlencode, urlparse
 
 import httpx
@@ -230,6 +232,108 @@ def login_claude(port: int | None = None, no_browser: bool = False) -> None:
     print("  kubectl -n usage-dashboard rollout restart deploy/usage-dashboard-server")
 
 
+# ---------------------------------------------------------------------------
+# Ollama login
+#
+# ollama.com authenticates via WorkOS AuthKit (hosted at signin.ollama.com): a
+# JS-driven React form plus an anti-bot device-fingerprint signal, so there is
+# no HTTP endpoint to POST credentials to. The fetcher only needs the resulting
+# ollama.com session cookie, so this flow drives a real browser, lets the
+# operator sign in by hand (handling any WorkOS challenge), and extracts the
+# cookie to load into the ``ollama-cookie`` secret. Mirrors the Claude login's
+# "mint then paste" UX; Playwright is a CLI-only optional dependency.
+# ---------------------------------------------------------------------------
+
+_OLLAMA_SETTINGS_URL = "https://ollama.com/settings"
+# Match the User-Agent the server's fetcher sends, so the minted session is
+# consistent with how it will later be used.
+_OLLAMA_USER_AGENT = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/126.0.0.0 Safari/537.36"
+)
+
+
+def _ollama_cookies(cookies: Iterable[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
+    """Keep only cookies scoped to the ollama.com domain."""
+    return [c for c in cookies if "ollama.com" in str(c.get("domain", ""))]
+
+
+def _serialize_cookie_header(cookies: Iterable[Mapping[str, Any]]) -> str:
+    """Render cookie dicts as a ``name=value; ...`` Cookie header value."""
+    return "; ".join(f"{c['name']}={c['value']}" for c in cookies)
+
+
+def login_ollama(headless: bool = False, verify: bool = True) -> None:
+    """Drive a browser through the ollama.com login and print the session cookie."""
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        print(
+            "Playwright is required for ollama login. Install it with:\n"
+            "  pip install 'usage-dashboard[login]'\n"
+            "  playwright install chromium",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    print("Opening a browser to ollama.com ...")
+    print(
+        "Sign in (handling any WorkOS prompt). When you can see your ollama\n"
+        "settings/usage page, return here and press Enter."
+    )
+    try:
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(headless=headless)
+            context = browser.new_context(user_agent=_OLLAMA_USER_AGENT)
+            page = context.new_page()
+            page.goto(_OLLAMA_SETTINGS_URL)
+            input("> Press Enter once you are signed in... ")
+            raw_cookies = context.cookies()
+            browser.close()
+    except Exception as exc:  # noqa: BLE001 - surface any browser/launch failure
+        print(f"Browser automation failed: {exc}", file=sys.stderr)
+        if headless:
+            print(
+                "Headless login rarely clears WorkOS's anti-bot check; "
+                "run without --headless on a machine with a display.",
+                file=sys.stderr,
+            )
+        sys.exit(1)
+
+    cookies = _ollama_cookies(raw_cookies)
+    cookie_header = _serialize_cookie_header(cookies)
+    if not cookie_header:
+        print(
+            "No ollama.com cookies captured — login may not have completed.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    if verify:
+        from usage_dashboard.server.fetch_ollama import fetch_ollama_usage
+
+        try:
+            fetch_ollama_usage(cookie_header)
+            print("\nVerified: ollama.com settings page parsed with this cookie.")
+        except Exception as exc:  # noqa: BLE001 - verification is best-effort
+            print(
+                f"\nWarning: captured a cookie but the usage fetch failed: {exc}\n"
+                "The cookie may still be valid; check the secret after loading it.",
+                file=sys.stderr,
+            )
+
+    print("\nOllama session cookie captured.\n")
+    print("Load it into the k8s Secret (server-secret.yaml):\n")
+    print(f'  ollama-cookie: "{cookie_header}"')
+    print()
+    print("Then update the Secret and roll the server, e.g.:")
+    print(
+        "  kubectl -n usage-dashboard patch secret server-secrets --type merge -p \\\n"
+        '    "{\\"stringData\\":{\\"ollama-cookie\\":\\"$COOKIE\\"}}"'
+    )
+    print("  kubectl -n usage-dashboard rollout restart deploy/usage-dashboard-server")
+
+
 def main() -> None:
     logging.basicConfig(
         level=logging.INFO,
@@ -242,18 +346,30 @@ def main() -> None:
     )
     sub = parser.add_subparsers(dest="command")
 
-    login_parser = sub.add_parser("login", help="OAuth login for a provider")
-    login_parser.add_argument("provider", choices=["claude"], help="Provider to log in to")
+    login_parser = sub.add_parser("login", help="Log in to a provider")
+    login_parser.add_argument(
+        "provider", choices=["claude", "ollama"], help="Provider to log in to"
+    )
     login_parser.add_argument(
         "--port",
         type=int,
         default=None,
-        help="Local port for OAuth callback server (omit for manual code paste)",
+        help="[claude] Local port for OAuth callback server (omit for manual paste)",
     )
     login_parser.add_argument(
         "--no-browser",
         action="store_true",
-        help="Don't auto-open the browser (print URL instead)",
+        help="[claude] Don't auto-open the browser (print URL instead)",
+    )
+    login_parser.add_argument(
+        "--headless",
+        action="store_true",
+        help="[ollama] Run the browser headless (rarely clears WorkOS anti-bot)",
+    )
+    login_parser.add_argument(
+        "--no-verify",
+        action="store_true",
+        help="[ollama] Skip fetching the usage page to validate the cookie",
     )
 
     args = parser.parse_args()
@@ -261,6 +377,8 @@ def main() -> None:
     if args.command == "login":
         if args.provider == "claude":
             login_claude(port=args.port, no_browser=args.no_browser)
+        elif args.provider == "ollama":
+            login_ollama(headless=args.headless, verify=not args.no_verify)
     else:
         parser.print_help()
         sys.exit(1)

@@ -257,7 +257,7 @@ The agent is responsible for determining build sequence based on architectural d
 
 | Question | Category | Owner |
 |----------|----------|-------|
-| Can ollama.com be logged into via HTTP POST (no JS rendering), or does it require a headless browser? | Needs research | Implementing agent |
+| ~~Can ollama.com be logged into via HTTP POST, or does it require a browser?~~ **Resolved 2026-06-14:** No HTTP login — ollama.com uses WorkOS AuthKit (JS-driven form + anti-bot device-fingerprint signal); WorkOS's password API needs ollama's server-side key. Chosen: a local human-in-the-loop Playwright CLI (`usage-dashboard login ollama`) that extracts the session cookie, not unattended server-side refresh. | Resolved | — |
 | What are the exact mappings for z.ai `unit` values (3, 5, 6) to session/weekly windows? | Needs research | Implementing agent |
 | Does the Claude OAuth API return `seven_day` reset timestamps, or only percentages? | Needs research | Implementing agent |
 
