@@ -61,9 +61,21 @@ Status values: `current` | `stale` | `offline`
 `detail` is an optional pre-formatted text line for providers that don't fit
 the percentage model; umans uses it (e.g. `"req 161  tok 63.9M"`).
 
-## Client
+## Clients
 
-Polls the server API with adaptive refresh (60s when values change, 5min when stable) and renders a dashboard image. Designed for the Pi Zero with SPI display but outputs a PNG to `/tmp/dashboard.png` by default for headless use.
+Both clients poll the server API with adaptive refresh (60s when values change,
+5min when stable). They share the colour/threshold and countdown logic
+(`client/format.py`), so they never disagree on what "85% is red" means.
+
+- **PNG renderer** (`usage-dashboard`, `client/main.py`) — the original Pi Zero
+  client. Renders a 240×320 image and writes it to `/tmp/dashboard.png` for an
+  SPI display (or headless use).
+- **Touch GUI** (`usage-dashboard-gui`, `client/gui.py`) — fullscreen pygame app
+  for a **Pi 4B + DSI touch display**. Provider tiles with session/weekly bars
+  and reset countdowns; tap a tile for a detail view. Renders at the panel's
+  native resolution. Install with the `gui` extra
+  (`pip install 'usage-dashboard[gui]'`); see
+  [`deploy/pi/README.md`](deploy/pi/README.md) for the Pi setup + systemd unit.
 
 ## Deploy
 
