@@ -15,9 +15,8 @@ jobs:
         with:
           python-version: "3.12"
 
-      # setup-uv does not create a project venv, so make one explicitly; the
-      # steps below invoke tools via .venv/bin/... .
-      - run: uv venv
+      # setup-uv@v5 provisions the .venv; install into it (VIRTUAL_ENV is set),
+      # then the steps below invoke tools via .venv/bin/... .
       - run: uv pip install -e ".[dev]"
 
       - name: ruff
