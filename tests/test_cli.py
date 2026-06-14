@@ -12,7 +12,9 @@ from usage_dashboard.cli import (
     _exchange_code,
     _generate_challenge,
     _generate_verifier,
+    _ollama_cookies,
     _parse_pasted_input,
+    _serialize_cookie_header,
 )
 
 
@@ -177,3 +179,27 @@ class TestCallbackHandler:
         handler.wfile = MagicMock()
         handler.do_GET()
         assert _CallbackHandler.error == "access_denied"
+
+
+class TestOllamaCookieHelpers:
+    def test_filters_to_ollama_domain(self) -> None:
+        cookies = [
+            {"name": "session", "value": "abc", "domain": "ollama.com"},
+            {"name": "sub", "value": "x", "domain": ".ollama.com"},
+            {"name": "other", "value": "y", "domain": "workos.com"},
+            {"name": "ga", "value": "z", "domain": ".google.com"},
+        ]
+        kept = _ollama_cookies(cookies)
+        names = {c["name"] for c in kept}
+        assert names == {"session", "sub"}
+
+    def test_serialize_cookie_header(self) -> None:
+        cookies = [
+            {"name": "session", "value": "abc", "domain": "ollama.com"},
+            {"name": "sub", "value": "x", "domain": ".ollama.com"},
+        ]
+        assert _serialize_cookie_header(cookies) == "session=abc; sub=x"
+
+    def test_empty_when_no_ollama_cookies(self) -> None:
+        cookies = [{"name": "other", "value": "y", "domain": "workos.com"}]
+        assert _serialize_cookie_header(_ollama_cookies(cookies)) == ""
