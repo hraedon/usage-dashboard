@@ -28,10 +28,10 @@ def _make_reading(**overrides: object) -> Reading:
     return Reading(**defaults)  # type: ignore[arg-type]
 
 
-def _create_app_with_db(tmp_path):
+def _create_app_with_db(tmp_path, configured_providers=None):
     db = Database(str(tmp_path / "api_test.db"))
     db.initialize()
-    app = create_app(API_KEY, db)
+    app = create_app(API_KEY, db, configured_providers=configured_providers)
     return app, db
 
 
@@ -83,8 +83,10 @@ class TestReadingsEndpoint:
 
         asyncio.run(_test())
 
-    def test_get_readings_returns_all_providers(self, tmp_path):
-        app, db = _create_app_with_db(tmp_path)
+    def test_get_readings_returns_all_configured_providers(self, tmp_path):
+        # All four configured; only claude has a reading. The other three are
+        # configured-but-not-reporting, so they legitimately show as offline.
+        app, db = _create_app_with_db(tmp_path, configured_providers=list(Provider))
         claude = _make_reading(provider=Provider.CLAUDE)
         db.store_reading(claude)
 
@@ -100,8 +102,8 @@ class TestReadingsEndpoint:
 
         asyncio.run(_test())
 
-    def test_missing_providers_show_as_offline(self, tmp_path):
-        app, db = _create_app_with_db(tmp_path)
+    def test_configured_but_not_reporting_providers_show_as_offline(self, tmp_path):
+        app, db = _create_app_with_db(tmp_path, configured_providers=list(Provider))
 
         async def _test():
             async with _client(app) as client:
@@ -115,6 +117,26 @@ class TestReadingsEndpoint:
                     assert item["status"] == "offline"
                     assert item["session_percent"] is None
                     assert item["stale"] is True
+
+        asyncio.run(_test())
+
+    def test_unconfigured_providers_are_omitted(self, tmp_path):
+        # WI-003: a provider that was never configured must not appear at all,
+        # so a real outage is distinguishable from an absent config.
+        app, db = _create_app_with_db(
+            tmp_path, configured_providers=[Provider.CLAUDE]
+        )
+        db.store_reading(_make_reading(provider=Provider.CLAUDE))
+
+        async def _test():
+            async with _client(app) as client:
+                response = await client.get(
+                    "/readings",
+                    headers={"Authorization": f"Bearer {API_KEY}"},
+                )
+            data = response.json()
+            providers = {item["provider"] for item in data}
+            assert providers == {"claude"}
 
         asyncio.run(_test())
 
@@ -221,14 +243,34 @@ class TestDashboardEndpoint:
 
         asyncio.run(_test())
 
-    def test_dashboard_marks_missing_providers_offline(self, tmp_path):
-        app, _db = _create_app_with_db(tmp_path)
+    def test_dashboard_marks_configured_providers_offline(self, tmp_path):
+        app, _db = _create_app_with_db(
+            tmp_path, configured_providers=list(Provider)
+        )
 
         async def _test():
             async with _client(app) as client:
                 response = await client.get("/dashboard")
             assert response.status_code == 200
             assert response.text.count("offline") >= 4
+
+        asyncio.run(_test())
+
+    def test_dashboard_omits_unconfigured_providers(self, tmp_path):
+        # WI-003: unconfigured providers must not render at all on /dashboard.
+        app, db = _create_app_with_db(
+            tmp_path, configured_providers=[Provider.CLAUDE]
+        )
+        db.store_reading(_make_reading(provider=Provider.CLAUDE))
+
+        async def _test():
+            async with _client(app) as client:
+                response = await client.get("/dashboard")
+            assert response.status_code == 200
+            assert "CLAUDE" in response.text
+            assert "ZAI" not in response.text
+            assert "OLLAMA" not in response.text
+            assert "UMANS" not in response.text
 
         asyncio.run(_test())
 
