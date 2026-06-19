@@ -1,19 +1,22 @@
 [Unit]
 Description=AI Usage Dashboard (touch GUI)
 # Render straight on the panel via KMS/DRM — no desktop session required.
-After=multi-user.target
+After=multi-user.target network-online.target
 Wants=network-online.target
-After=network-online.target
 
 [Service]
 Type=simple
-User=pi
+# @RUNUSER@/@VENV@ are filled in by deploy/pi/install.sh. Do not `cp` this raw.
+User=@RUNUSER@
 # Direct framebuffer/DRM output (appliance mode, no X/Wayland needed).
 Environment=SDL_VIDEODRIVER=kmsdrm
 Environment=GUI_FULLSCREEN=1
-# SERVER_URL + API_KEY live here, out of the unit file. See deploy/pi/README.md.
+# Rotate touch coords to match the panel rotation in cmdline.txt (rotate=N).
+# If taps land mirrored, swap 90<->270 here. 0 = portrait/no rotation.
+Environment=GUI_TOUCH_ROTATE=@TOUCH_ROTATE@
+# SERVER_URL + API_KEY (+ optional UPDATE_REF) live here, out of the unit file.
 EnvironmentFile=/etc/usage-dashboard-gui.env
-ExecStart=/home/pi/.local/bin/usage-dashboard-gui
+ExecStart=@VENV@/bin/usage-dashboard-gui
 Restart=always
 RestartSec=5
 # KMS/DRM + touch input access.

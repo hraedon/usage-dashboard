@@ -94,3 +94,43 @@ def test_smaller_resolution_renders(gui) -> None:
     layout = build_main_layout(_readings(), (240, 320))
     gui._width, gui._height = 240, 320
     gui._draw_main(layout)
+
+
+def test_finger_tap_routes_through_touch_rotation() -> None:
+    # On a 1280x720 landscape panel rotated 90°, a finger reported in the
+    # panel's portrait frame must resolve to the tile under it.
+    pygame.display.init()
+    pygame.font.init()
+    pygame.display.set_mode((1280, 720))
+    try:
+        size = (1280, 720)
+        gui = DashboardGui(_FakeFetcher(_readings()), size, touch_rotate=90)  # type: ignore[arg-type]
+        layout = build_main_layout(_readings(), size)
+        ollama = next(t for t in layout.tiles if t.provider is Provider.OLLAMA)
+        sx = (ollama.rect.x + ollama.rect.w / 2) / size[0]
+        sy = (ollama.rect.y + ollama.rect.h / 2) / size[1]
+        # Inverse-rotate to the device (portrait) frame the panel would report.
+        from usage_dashboard.client.layout import hit_test, rotate_touch_norm
+        dx, dy = rotate_touch_norm(sx, sy, 270)
+        event = pygame.event.Event(
+            pygame.FINGERDOWN, {"x": dx, "y": dy, "touch_id": 0, "finger_id": 0}
+        )
+        pos = gui._tap_position(event)
+        assert pos is not None
+        assert hit_test(layout, pos) is Provider.OLLAMA
+    finally:
+        pygame.display.quit()
+
+
+def test_mouse_tap_is_not_rotated() -> None:
+    # Dev/windowed mouse events are already in screen pixels; rotation must not
+    # touch them even when touch_rotate is set.
+    pygame.display.init()
+    pygame.font.init()
+    pygame.display.set_mode((1280, 720))
+    try:
+        gui = DashboardGui(_FakeFetcher(_readings()), (1280, 720), touch_rotate=90)  # type: ignore[arg-type]
+        event = pygame.event.Event(pygame.MOUSEBUTTONDOWN, {"pos": (300, 200), "button": 1})
+        assert gui._tap_position(event) == (300, 200)
+    finally:
+        pygame.display.quit()

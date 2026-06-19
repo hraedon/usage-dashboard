@@ -1,0 +1,13 @@
+[Unit]
+Description=Periodic update check for AI Usage Dashboard
+
+[Timer]
+# First check shortly after boot, then every 15 minutes. The randomised delay
+# spreads a fleet out so they don't all hit GitHub (and restart) in lockstep.
+OnBootSec=3min
+OnUnitActiveSec=15min
+RandomizedDelaySec=3min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

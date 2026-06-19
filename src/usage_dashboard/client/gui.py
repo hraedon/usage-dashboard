@@ -27,6 +27,7 @@ from usage_dashboard.client.layout import (
     ViewState,
     build_detail_layout,
     build_main_layout,
+    rotate_touch_norm,
     tap_transition,
 )
 from usage_dashboard.shared.models import Reading
@@ -46,7 +47,13 @@ def _env_int(name: str, default: int) -> int:
 class DashboardGui:
     """Owns the pygame window, fonts, view state, and render loop."""
 
-    def __init__(self, fetcher: ClientFetcher, size: tuple[int, int], fps: int = 10) -> None:
+    def __init__(
+        self,
+        fetcher: ClientFetcher,
+        size: tuple[int, int],
+        fps: int = 10,
+        touch_rotate: int = 0,
+    ) -> None:
         self._fetcher = fetcher
         screen = pygame.display.get_surface()
         if screen is None:
@@ -54,6 +61,9 @@ class DashboardGui:
         self._screen = screen
         self._width, self._height = size
         self._fps = fps
+        # Clockwise display rotation (matches cmdline.txt rotate=N) so touch
+        # coordinates land on the rotated framebuffer. 0 on a dev window.
+        self._touch_rotate = touch_rotate % 360
         self._clock = pygame.time.Clock()
         self._state = ViewState()
         self._running = True
@@ -70,10 +80,13 @@ class DashboardGui:
 
     def _tap_position(self, event: pygame.event.Event) -> tuple[int, int] | None:
         if event.type == pygame.MOUSEBUTTONDOWN:
+            # Real mouse (dev/windowed mode): already in screen pixels.
             return int(event.pos[0]), int(event.pos[1])
         if event.type == pygame.FINGERDOWN:
-            # Touch coords are normalised 0..1.
-            return int(event.x * self._width), int(event.y * self._height)
+            # Touch coords are normalised 0..1 in the panel's native frame;
+            # rotate them onto the (possibly rotated) framebuffer.
+            nx, ny = rotate_touch_norm(event.x, event.y, self._touch_rotate)
+            return int(nx * self._width), int(ny * self._height)
         return None
 
     def _handle_events(self, layout: MainLayout) -> None:
@@ -177,6 +190,10 @@ class DashboardGui:
 
 def _init_display() -> tuple[int, int]:
     fullscreen = os.environ.get("GUI_FULLSCREEN", "1") != "0"
+    # A finger tap otherwise fires BOTH a FINGERDOWN and a synthesized
+    # MOUSEBUTTONDOWN; handling both toggles the view twice and a tap looks
+    # like a no-op. Keep touch and mouse as distinct event sources.
+    os.environ.setdefault("SDL_TOUCH_MOUSE_EVENTS", "0")
     pygame.init()
     pygame.font.init()
     if fullscreen:
@@ -204,7 +221,12 @@ def main() -> None:
 
     size = _init_display()
     fetcher = ClientFetcher(server_url=server_url, api_key=api_key)
-    gui = DashboardGui(fetcher, size, fps=_env_int("GUI_FPS", 10))
+    gui = DashboardGui(
+        fetcher,
+        size,
+        fps=_env_int("GUI_FPS", 10),
+        touch_rotate=_env_int("GUI_TOUCH_ROTATE", 0),
+    )
 
     def _handle_sigterm(signum: int, frame: Any) -> None:
         logger.info("Received SIGTERM, shutting down")

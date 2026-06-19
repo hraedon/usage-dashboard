@@ -1,0 +1,11 @@
+[Unit]
+Description=Update AI Usage Dashboard from git and restart the GUI
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+# Runs the stable copy installed at /usr/local/bin (not the repo copy it may
+# rewrite). @RUNUSER@ is filled in by deploy/pi/install.sh.
+User=@RUNUSER@
+ExecStart=/usr/local/bin/usage-dashboard-update

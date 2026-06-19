@@ -8,6 +8,7 @@ from usage_dashboard.client.layout import (
     build_detail_layout,
     build_main_layout,
     hit_test,
+    rotate_touch_norm,
     tap_transition,
 )
 from usage_dashboard.shared.models import Provider, Reading, ReadingStatus
@@ -155,3 +156,47 @@ class TestDetailLayout:
         detail = build_detail_layout(umans, now=_NOW)
         values = [line.value for line in detail.lines]
         assert "req 9 tok 2M" in values
+
+
+class TestRotateTouchNorm:
+    def test_zero_is_identity(self) -> None:
+        assert rotate_touch_norm(0.25, 0.75, 0) == (0.25, 0.75)
+
+    def test_360_wraps_to_identity(self) -> None:
+        assert rotate_touch_norm(0.25, 0.75, 360) == (0.25, 0.75)
+
+    def test_corners_map_correctly_at_90(self) -> None:
+        # Panel top-left (0,0) rotates to screen bottom-left for a 90° CW turn.
+        assert rotate_touch_norm(0.0, 0.0, 90) == (0.0, 1.0)
+        assert rotate_touch_norm(1.0, 0.0, 90) == (0.0, 0.0)
+        assert rotate_touch_norm(0.0, 1.0, 90) == (1.0, 1.0)
+
+    def test_180_inverts_both_axes(self) -> None:
+        sx, sy = rotate_touch_norm(0.3, 0.8, 180)
+        assert abs(sx - 0.7) < 1e-9
+        assert abs(sy - 0.2) < 1e-9
+
+    def test_90_and_270_are_inverses(self) -> None:
+        nx, ny = 0.2, 0.6
+        sx, sy = rotate_touch_norm(nx, ny, 90)
+        back_x, back_y = rotate_touch_norm(sx, sy, 270)
+        assert abs(back_x - nx) < 1e-9
+        assert abs(back_y - ny) < 1e-9
+
+    def test_tap_lands_on_tile_after_landscape_rotation(self) -> None:
+        # A finger over CLAUDE's tile (top-left in a 1280x720 landscape grid)
+        # must hit-test to CLAUDE once its portrait-frame touch is rotated.
+        size = (1280, 720)
+        readings = [_reading(p) for p in (
+            Provider.CLAUDE, Provider.ZAI, Provider.OLLAMA, Provider.UMANS
+        )]
+        layout = build_main_layout(readings, size)
+        claude = next(t for t in layout.tiles if t.provider is Provider.CLAUDE)
+        # Screen-centre of the CLAUDE tile, normalised to the screen.
+        sx = (claude.rect.x + claude.rect.w / 2) / size[0]
+        sy = (claude.rect.y + claude.rect.h / 2) / size[1]
+        # The panel reports it in portrait frame; inverse of the 90° map.
+        device = rotate_touch_norm(sx, sy, 270)
+        screen = rotate_touch_norm(device[0], device[1], 90)
+        px, py = int(screen[0] * size[0]), int(screen[1] * size[1])
+        assert hit_test(layout, (px, py)) is Provider.CLAUDE
