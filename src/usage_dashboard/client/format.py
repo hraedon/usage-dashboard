@@ -28,6 +28,16 @@ WARN_PERCENT = 75.0
 CRIT_PERCENT = 85.0
 
 
+def mute(color: tuple[int, int, int], amount: float = 0.55) -> tuple[int, int, int]:
+    """Blend *color* toward the bar-track gray so a second account's bars read as
+    a quieter, secondary set while keeping the green/orange/red hue legible.
+    *amount* is how far to blend (0 = unchanged, 1 = fully gray)."""
+    amount = max(0.0, min(1.0, amount))
+    return tuple(  # type: ignore[return-value]
+        round(c + (g - c) * amount) for c, g in zip(color, BAR_BG)
+    )
+
+
 def bar_color(percent: float | None) -> tuple[int, int, int]:
     """Green/orange/red by utilization, gray when unknown."""
     if percent is None:

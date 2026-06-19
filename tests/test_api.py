@@ -98,7 +98,7 @@ class TestReadingsEndpoint:
                 )
             data = response.json()
             providers = {item["provider"] for item in data}
-            assert providers == {"claude", "zai", "ollama", "umans"}
+            assert providers == {"claude", "claude_work", "zai", "ollama", "umans"}
 
         asyncio.run(_test())
 
@@ -226,6 +226,25 @@ class TestDashboardEndpoint:
             async with _client(app) as client:
                 response = await client.get("/dashboard")
             assert "req 161  tok 63.9M" in response.text
+
+        asyncio.run(_test())
+
+    def test_dashboard_folds_work_account_into_claude_card(self, tmp_path):
+        app, db = _create_app_with_db(
+            tmp_path,
+            configured_providers=[Provider.CLAUDE, Provider.CLAUDE_WORK],
+        )
+        db.store_reading(_make_reading(provider=Provider.CLAUDE))
+        db.store_reading(_make_reading(provider=Provider.CLAUDE_WORK))
+
+        async def _test():
+            async with _client(app) as client:
+                response = await client.get("/dashboard")
+            text = response.text
+            # One CLAUDE card with both accounts' rows; no CLAUDE_WORK header.
+            assert text.count("<h2>CLAUDE") == 1
+            assert "CLAUDE_WORK" not in text
+            assert "me Session" in text and "work Session" in text
 
         asyncio.run(_test())
 

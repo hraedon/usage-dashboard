@@ -105,6 +105,9 @@ Images are built and pushed to `ghcr.io/hraedon/usage-dashboard-server` and `ghc
 | `claude-token` | No | Claude OAuth access token |
 | `claude-refresh-token` | No | Claude OAuth refresh token |
 | `claude-client-id` | No | Claude OAuth client ID |
+| `claude-work-token` | No | Second Claude account's OAuth access token (see *Two Claude accounts*) |
+| `claude-work-refresh-token` | No | Second Claude account's OAuth refresh token |
+| `claude-work-client-id` | No | Second Claude account's OAuth client ID |
 | `zai-api-key` | No | z.ai API key |
 | `ollama-cookie` | No | ollama.com browser session cookie (`name=value`; see below) |
 | `umans-api-key` | No | umans API key |
@@ -156,6 +159,27 @@ kubectl -n usage-dashboard rollout restart deploy/usage-dashboard-server
 After the first login, the server persists refreshed tokens to the PVC
 (`/data/tokens.json`), so pod restarts survive token rotation without
 re-login.  The k8s Secret values are used only for the initial seed.
+
+### Two Claude accounts
+
+To watch a second Claude account (e.g. a work login) alongside your personal
+one, mint a **second, independent** token pair and store it under the
+`claude-work-*` Secret keys:
+
+```bash
+usage-dashboard login claude --port 8282   # sign in as the work account
+# put the printed values in claude-work-token / -refresh-token / -client-id
+kubectl apply -f k8s/server-secret.yaml
+kubectl -n usage-dashboard rollout restart deploy/usage-dashboard-server
+```
+
+The work account is fetched and refreshed independently (its own
+`/data/tokens.json` namespace, its own rotation). The dashboard then shows it as
+a **second, muted set of bars in the Claude tile** — `me` and `work` — rather
+than a separate tile. With no `claude-work-*` keys set it stays completely
+hidden, and the Claude tile looks exactly as before. (The legacy ST7789 PNG
+client doesn't render the work account — it's a touch-GUI / web-dashboard
+feature.)
 
 ### Ollama login
 

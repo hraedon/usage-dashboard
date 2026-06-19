@@ -47,6 +47,27 @@ spec:
                   name: server-secrets
                   key: claude-client-id
                   optional: true
+            # Optional second Claude account (e.g. a work login). Leave the
+            # secret keys empty to keep it hidden; set them to show a muted
+            # second set of Claude bars.
+            - name: CLAUDE_WORK_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: server-secrets
+                  key: claude-work-token
+                  optional: true
+            - name: CLAUDE_WORK_REFRESH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: server-secrets
+                  key: claude-work-refresh-token
+                  optional: true
+            - name: CLAUDE_WORK_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: server-secrets
+                  key: claude-work-client-id
+                  optional: true
             - name: ZAI_API_KEY
               valueFrom:
                 secretKeyRef:

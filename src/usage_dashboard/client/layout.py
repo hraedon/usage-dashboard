@@ -15,7 +15,9 @@ from datetime import datetime
 from usage_dashboard.client import format as fmt
 from usage_dashboard.shared.models import Provider, Reading
 
-# Fixed slot order so a provider always lands in the same place frame to frame.
+# Fixed tile order so a provider always lands in the same place frame to frame.
+# CLAUDE_WORK is intentionally absent: it has no tile of its own — it folds into
+# the CLAUDE tile as a second, muted set of bars.
 _PROVIDER_ORDER: list[Provider] = [
     Provider.CLAUDE,
     Provider.ZAI,
@@ -45,6 +47,8 @@ class BarSpec:
     color: Color
     reset_text: str
     reset_highlight: bool
+    account: str = ""   # non-empty (e.g. "work") tags a second account's bars
+    muted: bool = False  # render the fill quieter (the secondary account)
 
 
 @dataclass(frozen=True)
@@ -88,7 +92,12 @@ def _grid_dimensions(n: int) -> tuple[int, int]:
     return cols, rows
 
 
-def _bars_for(reading: Reading, now: datetime | None) -> list[BarSpec]:
+def _bars_for(
+    reading: Reading,
+    now: datetime | None,
+    account: str = "",
+    muted: bool = False,
+) -> list[BarSpec]:
     bars: list[BarSpec] = []
     for label, pct, reset in (
         ("Session", reading.session_percent, reading.session_resets_at),
@@ -100,10 +109,38 @@ def _bars_for(reading: Reading, now: datetime | None) -> list[BarSpec]:
                 label=label,
                 percent_text=fmt.percent_text(pct),
                 fraction=(min(pct, 100.0) / 100.0) if pct is not None else 0.0,
+                # Keep the semantic palette colour (so the accent ranking still
+                # works); the GUI mutes the fill when ``muted`` is set.
                 color=fmt.bar_color(pct),
                 reset_text=reset_text,
                 reset_highlight=highlight,
+                account=account,
+                muted=muted,
             )
+        )
+    return bars
+
+
+def _claude_tile_bars(
+    by_provider: dict[Provider, Reading], now: datetime | None
+) -> list[BarSpec]:
+    """Bars for the Claude tile, merging the personal and (optional) work
+    accounts. With only one account the bars are untagged and unmuted — i.e.
+    identical to a single-provider tile."""
+    accounts = [
+        (Provider.CLAUDE, "me"),
+        (Provider.CLAUDE_WORK, "work"),
+    ]
+    present = [(p, label) for p, label in accounts if p in by_provider]
+    if len(present) <= 1:
+        # Single account: no tag, no muting (unchanged from the original look).
+        provider = present[0][0] if present else Provider.CLAUDE
+        return _bars_for(by_provider[provider], now)
+    bars: list[BarSpec] = []
+    for provider, label in present:
+        bars.extend(
+            _bars_for(by_provider[provider], now, account=label,
+                      muted=(provider is Provider.CLAUDE_WORK))
         )
     return bars
 
@@ -124,18 +161,29 @@ def build_main_layout(
     """Lay out provider tiles in a grid plus a bottom status bar."""
     width, height = size
     by_provider = {r.provider: r for r in readings}
-    ordered = [by_provider[p] for p in _PROVIDER_ORDER if p in by_provider]
+
+    # Which tiles to show, with the reading that drives each tile's title. The
+    # Claude tile appears if either Claude account reported, and its title comes
+    # from the personal account when present (else the work account).
+    tile_plan: list[tuple[Provider, Reading]] = []
+    for provider in _PROVIDER_ORDER:
+        if provider is Provider.CLAUDE:
+            primary = by_provider.get(Provider.CLAUDE) or by_provider.get(Provider.CLAUDE_WORK)
+            if primary is not None:
+                tile_plan.append((Provider.CLAUDE, primary))
+        elif provider in by_provider:
+            tile_plan.append((provider, by_provider[provider]))
 
     margin = max(4, round(width * 0.02))
     status_h = max(18, round(height * 0.08))
     grid_h = height - status_h - margin
 
-    cols, rows = _grid_dimensions(len(ordered)) if ordered else (1, 1)
+    cols, rows = _grid_dimensions(len(tile_plan)) if tile_plan else (1, 1)
     cell_w = (width - margin * (cols + 1)) // cols
     cell_h = (grid_h - margin * (rows + 1)) // max(rows, 1)
 
     tiles: list[TileSpec] = []
-    for idx, reading in enumerate(ordered):
+    for idx, (provider, reading) in enumerate(tile_plan):
         col = idx % cols
         row = idx // cols
         rect = Rect(
@@ -148,12 +196,16 @@ def build_main_layout(
         is_quotaless = (
             reading.session_percent is None and reading.weekly_percent is None
         )
-        bars = [] if is_quotaless else _bars_for(reading, now)
-        detail = reading.detail if is_quotaless else None
+        if provider is Provider.CLAUDE:
+            bars = _claude_tile_bars(by_provider, now)
+            detail = None
+        else:
+            bars = [] if is_quotaless else _bars_for(reading, now)
+            detail = reading.detail if is_quotaless else None
         tiles.append(
             TileSpec(
-                provider=reading.provider,
-                title=reading.provider.value.upper() + fmt.status_suffix(reading),
+                provider=provider,
+                title=provider.value.upper() + fmt.status_suffix(reading),
                 rect=rect,
                 bars=bars,
                 detail=detail,
@@ -232,8 +284,7 @@ def tap_transition(
     return ViewState(detail_provider=provider)
 
 
-def build_detail_layout(reading: Reading, now: datetime | None = None) -> DetailLayout:
-    """Full-screen breakdown for a single provider (the tap-through view)."""
+def _detail_lines(reading: Reading, now: datetime | None) -> list[DetailLine]:
     lines: list[DetailLine] = []
     if reading.session_percent is not None or reading.weekly_percent is not None:
         s_reset, _ = fmt.format_countdown(reading.session_resets_at, now=now)
@@ -256,6 +307,25 @@ def build_detail_layout(reading: Reading, now: datetime | None = None) -> Detail
     lines.append(
         DetailLine("Fetched", reading.fetched_at.strftime("%Y-%m-%d %H:%M:%S"), fmt.GRAY)
     )
+    return lines
+
+
+def build_detail_layout(
+    reading: Reading,
+    now: datetime | None = None,
+    secondary: tuple[str, Reading] | None = None,
+) -> DetailLayout:
+    """Full-screen breakdown for a provider (the tap-through view).
+
+    *secondary* is an optional ``(label, reading)`` for a second account (the
+    work Claude login); its lines are appended under a header so one tap shows
+    both accounts.
+    """
+    lines = _detail_lines(reading, now)
+    if secondary is not None:
+        label, sec_reading = secondary
+        lines.append(DetailLine(f"— {label} —", "", fmt.GRAY))
+        lines.extend(_detail_lines(sec_reading, now))
     return DetailLayout(
         provider=reading.provider,
         title=reading.provider.value.upper() + fmt.status_suffix(reading),
