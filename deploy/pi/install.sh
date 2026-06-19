@@ -11,8 +11,11 @@
 set -euo pipefail
 
 # --- config (override via env) ---------------------------------------------
+HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO_URL="${REPO_URL:-https://github.com/hraedon/usage-dashboard.git}"
-APPDIR="${APPDIR:-$HOME/usage-dashboard}"
+# Default the app dir to wherever this checkout already lives, so it doesn't
+# matter which directory you cloned it into. Falls back to ~/usage-dashboard.
+APPDIR="${APPDIR:-$(git -C "$HERE" rev-parse --show-toplevel 2>/dev/null || echo "$HOME/usage-dashboard")}"
 VENV="${VENV:-$APPDIR/.venv}"
 RUNUSER="${RUNUSER:-$(id -un)}"
 UPDATE_REF="${UPDATE_REF:-main}"
@@ -21,10 +24,11 @@ UPDATE_REF="${UPDATE_REF:-main}"
 DISPLAY_ROTATE="${DISPLAY_ROTATE:-90}"
 GUI_TOUCH_ROTATE="${GUI_TOUCH_ROTATE:-$DISPLAY_ROTATE}"
 
+# Bookworm puts these under /boot/firmware; older images use /boot.
 CMDLINE="/boot/firmware/cmdline.txt"
+[ -f "$CMDLINE" ] || CMDLINE="/boot/cmdline.txt"
 ENV_FILE="/etc/usage-dashboard-gui.env"
 UNIT_DIR="/etc/systemd/system"
-HERE="$(cd "$(dirname "$0")" && pwd)"
 
 if [ "$(id -u)" = 0 ]; then
     echo "Run this as your normal user, not root (it uses sudo as needed)." >&2
@@ -76,25 +80,31 @@ else
 fi
 
 # --- 6. display: rotation + no console blanking -----------------------------
-echo "==> display config ($CMDLINE)"
-add_cmdline_token() {
-    local tok="$1"
-    if grep -qF -- "$tok" "$CMDLINE"; then
-        echo "    already set: $tok"
-    else
-        sudo cp "$CMDLINE" "$CMDLINE.bak.$(date +%s)"
-        # cmdline.txt must stay a single line; append space-separated.
-        sudo sed -i "1 s|\$| $tok|" "$CMDLINE"
-        echo "    added: $tok"
-    fi
-}
-if grep -q "video=DSI-1" "$CMDLINE" && ! grep -qF "rotate=$DISPLAY_ROTATE" "$CMDLINE"; then
-    echo "    NOTE: a different video=DSI-1 line is already present; leaving it."
-    echo "          Edit $CMDLINE by hand if the rotation is wrong."
+if [ ! -f "$CMDLINE" ]; then
+    echo "==> WARNING: no cmdline.txt found (looked in /boot/firmware and /boot)."
+    echo "    Skipping display rotation + blanking config; set it by hand later."
+    echo "    See deploy/pi/README.md section 1."
 else
-    add_cmdline_token "video=DSI-1:720x1280@60,rotate=$DISPLAY_ROTATE"
+    echo "==> display config ($CMDLINE)"
+    add_cmdline_token() {
+        local tok="$1"
+        if grep -qF -- "$tok" "$CMDLINE"; then
+            echo "    already set: $tok"
+        else
+            sudo cp "$CMDLINE" "$CMDLINE.bak.$(date +%s)"
+            # cmdline.txt must stay a single line; append space-separated.
+            sudo sed -i "1 s|\$| $tok|" "$CMDLINE"
+            echo "    added: $tok"
+        fi
+    }
+    if grep -q "video=DSI-1" "$CMDLINE" && ! grep -qF "rotate=$DISPLAY_ROTATE" "$CMDLINE"; then
+        echo "    NOTE: a different video=DSI-1 line is already present; leaving it."
+        echo "          Edit $CMDLINE by hand if the rotation is wrong."
+    else
+        add_cmdline_token "video=DSI-1:720x1280@60,rotate=$DISPLAY_ROTATE"
+    fi
+    add_cmdline_token "consoleblank=0"
 fi
-add_cmdline_token "consoleblank=0"
 
 # --- 7. systemd units (fill placeholders, install, enable) ------------------
 echo "==> systemd units"
@@ -120,13 +130,24 @@ echo "$RUNUSER ALL=(root) NOPASSWD: /usr/bin/systemctl restart usage-dashboard-g
 sudo chmod 440 /etc/sudoers.d/usage-dashboard-update
 
 sudo systemctl daemon-reload
-sudo systemctl enable --now usage-dashboard-gui.service
+# Enable (don't start yet): the GUI needs SERVER_URL/API_KEY first, and the
+# reboot below applies the display rotation and starts it cleanly. The update
+# timer is safe to start now.
+sudo systemctl enable usage-dashboard-gui.service
 sudo systemctl enable --now usage-dashboard-update.timer
 
 echo
-echo "==> done."
-echo "    1. Edit $ENV_FILE  (set SERVER_URL + API_KEY), then:"
-echo "         sudo systemctl restart usage-dashboard-gui"
-echo "    2. Reboot once to apply the display rotation:  sudo reboot"
-echo "    Logs:    journalctl -u usage-dashboard-gui -f"
+echo "============================================================"
+echo " Setup done. Two steps left:"
+echo "------------------------------------------------------------"
+echo " 1. Set the server URL + key:"
+echo "      sudo nano $ENV_FILE"
+echo "    (fill in SERVER_URL and API_KEY, save with Ctrl-O Enter, exit Ctrl-X)"
+echo
+echo " 2. Reboot to apply the display rotation and start the dashboard:"
+echo "      sudo reboot"
+echo "------------------------------------------------------------"
+echo " After reboot, watch it with:"
+echo "      journalctl -u usage-dashboard-gui -f"
+echo "============================================================"
 echo "    Updates: systemctl list-timers usage-dashboard-update.timer"
