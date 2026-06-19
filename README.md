@@ -93,7 +93,17 @@ kubectl apply -f k8s/server-service.yaml
 
 # Populate secrets (edit server-secret.yaml with real values first)
 kubectl apply -f k8s/server-secret.yaml
+
+# Optional: expose the dashboard at an internal hostname (edit the three
+# CHANGE-ME values — ingress class, host, TLS — first; see comments in the file)
+kubectl apply -f k8s/server-ingress.yaml
 ```
+
+The Service is `ClusterIP`, so the dashboard is in-cluster only until you apply
+`server-ingress.yaml`. The view is **responsive** — a fluid card grid that flows
+from one column on a phone to up to four on a desktop — and the bare hostname
+(`/`) redirects to `/dashboard`. It's unauthenticated by design (usage stats
+only), so keep the hostname internal.
 
 Images are built and pushed to `ghcr.io/hraedon/usage-dashboard-server` and `ghcr.io/hraedon/usage-dashboard-client` via GitHub Actions on push to `main`.
 
