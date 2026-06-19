@@ -16,15 +16,19 @@ On a freshly imaged Pi, as your normal login user:
 ```bash
 git clone https://github.com/hraedon/usage-dashboard.git
 cd usage-dashboard
-./deploy/pi/install.sh          # landscape (rotate 90) by default
-sudo nano /etc/usage-dashboard-gui.env   # set SERVER_URL + API_KEY
-sudo systemctl restart usage-dashboard-gui
-sudo reboot                     # applies the display rotation
+./deploy/pi/install.sh                    # landscape (rotate 90) by default
+sudo nano /etc/usage-dashboard-gui.env    # set SERVER_URL + API_KEY, save, exit
+sudo reboot                               # applies rotation AND starts the dashboard
 ```
 
 That installs system deps, a venv, both systemd services + the auto-update
-timer, and the display-rotation/no-blank boot config. Everything below is what
-the script does and how to vary it.
+timer, and the display-rotation/no-blank boot config. The dashboard does **not**
+run until that reboot (it needs the URL/key you set, and the rotation only takes
+effect on reboot) — so don't worry if `systemctl status` shows it inactive
+beforehand. Everything below is what the script does and how to vary it.
+
+You can clone into any directory — the installer points the service at wherever
+this checkout actually lives.
 
 ## 0. Image the SD card
 

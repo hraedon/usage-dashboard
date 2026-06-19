@@ -138,18 +138,32 @@ dedicated token pair that belongs to the dashboard alone.  This avoids
 sharing credentials with an interactive Claude session (which would break
 that session when the dashboard rotates the refresh token).
 
+Run it **on your own computer** (the one with a web browser) — not on the Pi or
+the cluster. It only prints tokens for you to copy into the k8s Secret; it
+doesn't talk to the server. First install the CLI into a throwaway venv:
+
 ```bash
-# Option A: auto-opens a browser and catches the redirect on a local port
+git clone https://github.com/hraedon/usage-dashboard.git
+cd usage-dashboard
+python3 -m venv .venv
+.venv/bin/pip install -e .
+```
+
+Then run the login (use `.venv/bin/usage-dashboard` if it's not on your PATH):
+
+```bash
+# Option A — opens a browser and catches the redirect automatically:
 usage-dashboard login claude --port 8282
 
-# Option B: prints a URL; after authorizing, Claude's page shows a
-# CODE#STATE value — paste it back at the prompt
+# Option B — no local port (works over SSH): prints a URL; after you authorize,
+# Claude's page shows a CODE#STATE value — paste it back at the prompt:
 usage-dashboard login claude
 ```
 
-The command prints the access token, refresh token, and client ID. Put them in
-the Secret (`claude-token`, `claude-refresh-token`, `claude-client-id`) and
-roll the server:
+A browser opens to Claude's sign-in. Sign in as the account you want to track,
+approve, and the command prints three values — `claude-token`,
+`claude-refresh-token`, and `claude-client-id`. Put them in the Secret and roll
+the server:
 
 ```bash
 kubectl apply -f k8s/server-secret.yaml
@@ -163,15 +177,21 @@ re-login.  The k8s Secret values are used only for the initial seed.
 ### Two Claude accounts
 
 To watch a second Claude account (e.g. a work login) alongside your personal
-one, mint a **second, independent** token pair and store it under the
-`claude-work-*` Secret keys:
+one, run the **same `login claude` command again** but sign in as the *other*
+account. (If your browser is already logged into the first account, use a
+private/incognito window or log out first, so you authorize the right one.)
 
 ```bash
-usage-dashboard login claude --port 8282   # sign in as the work account
-# put the printed values in claude-work-token / -refresh-token / -client-id
+usage-dashboard login claude --port 8282   # sign in as the SECOND account
 kubectl apply -f k8s/server-secret.yaml
 kubectl -n usage-dashboard rollout restart deploy/usage-dashboard-server
 ```
+
+> The command always labels its output `claude-token` / `claude-refresh-token` /
+> `claude-client-id` (it can't tell which account you signed in as). For the
+> second account, copy those three values into the **`claude-work-`** keys
+> instead — `claude-work-token`, `claude-work-refresh-token`,
+> `claude-work-client-id` — leaving your first account's `claude-*` keys alone.
 
 The work account is fetched and refreshed independently (its own
 `/data/tokens.json` namespace, its own rotation). The dashboard then shows it as
