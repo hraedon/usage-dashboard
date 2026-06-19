@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from usage_dashboard.server.db import Database
@@ -111,25 +111,37 @@ def _render_dashboard_html(readings: list[Reading], now: datetime) -> str:
 <meta http-equiv="refresh" content="300">
 <title>AI Usage</title>
 <style>
+:root {{ --maxw: 1100px; }}
+* {{ box-sizing: border-box; }}
 body {{ background:#000; color:#fff; font-family:-apple-system,system-ui,sans-serif;
   margin:0; padding:12px; }}
-.card {{ background:#111; border-radius:12px; padding:14px 16px; margin-bottom:12px; }}
+header, footer, .grid {{ max-width:var(--maxw); margin-inline:auto; }}
+header h1 {{ margin:4px 4px 12px; font-size:1.1rem; font-weight:600;
+  letter-spacing:0.06em; color:#ddd; }}
+/* Fluid grid: 1 column on a phone, 2 on a tablet, up to 4 on a desktop,
+   driven by the card min width — no per-device breakpoints needed. */
+.grid {{ display:grid; grid-template-columns:repeat(auto-fit, minmax(280px, 1fr));
+  gap:12px; align-items:start; }}
+.card {{ background:#111; border-radius:12px; padding:14px 16px; }}
 h2 {{ margin:0 0 10px; font-size:1.05rem; letter-spacing:0.04em; }}
 .badge {{ font-size:0.7rem; color:#eab308; border:1px solid #eab308;
   border-radius:6px; padding:1px 6px; vertical-align:middle; }}
 .row {{ display:flex; align-items:center; gap:10px; }}
-.label {{ width:60px; font-size:0.85rem; color:#ccc; }}
+.label {{ width:96px; font-size:0.85rem; color:#ccc; }}
 .track {{ flex:1; height:12px; background:#323232; border-radius:6px; overflow:hidden;
   display:block; }}
 .fill {{ display:block; height:100%; }}
 .pct {{ width:44px; text-align:right; font-variant-numeric:tabular-nums; }}
-.resets {{ margin:2px 0 8px 70px; font-size:0.75rem; color:#969696; }}
+.resets {{ margin:2px 0 8px 106px; font-size:0.75rem; color:#969696; }}
 .detail {{ font-size:1.0rem; color:#ccc; font-variant-numeric:tabular-nums; }}
-footer {{ text-align:center; color:#555; font-size:0.7rem; margin-top:8px; }}
+footer {{ text-align:center; color:#555; font-size:0.7rem; margin-top:12px; }}
 </style>
 </head>
 <body>
+<header><h1>AI Usage</h1></header>
+<main class="grid">
 {"".join(cards)}
+</main>
 <footer>{footer}</footer>
 </body>
 </html>"""
@@ -181,6 +193,11 @@ def create_app(
         _user: str = Depends(auth),
     ) -> list[dict[str, Any]]:
         return [reading.to_dict() for reading in _reported_readings()]
+
+    @app.get("/")
+    async def root() -> RedirectResponse:
+        # Bare hostname → the dashboard, so the presented URL is just the host.
+        return RedirectResponse(url="/dashboard")
 
     @app.get("/dashboard", response_class=HTMLResponse)
     async def dashboard() -> HTMLResponse:

@@ -1,0 +1,39 @@
+# Internal ingress for the usage dashboard.
+#
+# The /dashboard view is unauthenticated by design (it exposes usage stats
+# only, never credentials), so this is intended for an INTERNAL hostname.
+# /readings stays bearer-protected regardless.
+#
+# Before applying, fill in the three CHANGE-ME values to match your cluster
+# (clone the pattern from an existing app's ingress — e.g. cert-watch):
+#   1. ingressClassName  — your controller (nginx / traefik / ...)
+#   2. host              — the internal DNS name you'll create
+#   3. tls               — the cert source (cert-manager annotation + secret,
+#                          or a pre-provisioned TLS secret). Delete the tls
+#                          block and the annotation to serve plain HTTP.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: usage-dashboard
+  namespace: usage-dashboard
+  annotations:
+    # If you use cert-manager, point this at your issuer; otherwise remove it
+    # and reference a pre-made secret in the tls block below.
+    cert-manager.io/cluster-issuer: "CHANGE-ME-issuer"
+spec:
+  ingressClassName: CHANGE-ME-ingress-class
+  tls:
+    - hosts:
+        - CHANGE-ME.internal.example.com
+      secretName: usage-dashboard-tls
+  rules:
+    - host: CHANGE-ME.internal.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: usage-dashboard-server
+                port:
+                  number: 8080

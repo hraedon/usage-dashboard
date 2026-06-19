@@ -229,6 +229,30 @@ class TestDashboardEndpoint:
 
         asyncio.run(_test())
 
+    def test_root_redirects_to_dashboard(self, tmp_path):
+        app, _ = _create_app_with_db(tmp_path)
+
+        async def _test():
+            async with _client(app) as client:
+                response = await client.get("/")  # no auth, no follow
+            assert response.status_code in (307, 308)
+            assert response.headers["location"] == "/dashboard"
+
+        asyncio.run(_test())
+
+    def test_dashboard_is_responsive_grid(self, tmp_path):
+        app, db = _create_app_with_db(tmp_path)
+        db.store_reading(_make_reading(provider=Provider.CLAUDE))
+
+        async def _test():
+            async with _client(app) as client:
+                response = await client.get("/dashboard")
+            text = response.text
+            assert 'name="viewport"' in text
+            assert 'class="grid"' in text and "auto-fit" in text
+
+        asyncio.run(_test())
+
     def test_dashboard_folds_work_account_into_claude_card(self, tmp_path):
         app, db = _create_app_with_db(
             tmp_path,
