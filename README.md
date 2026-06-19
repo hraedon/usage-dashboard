@@ -71,11 +71,13 @@ Both clients poll the server API with adaptive refresh (60s when values change,
   client. Renders a 240×320 image and writes it to `/tmp/dashboard.png` for an
   SPI display (or headless use).
 - **Touch GUI** (`usage-dashboard-gui`, `client/gui.py`) — fullscreen pygame app
-  for a **Pi 4B + DSI touch display**. Provider tiles with session/weekly bars
-  and reset countdowns; tap a tile for a detail view. Renders at the panel's
-  native resolution. Install with the `gui` extra
-  (`pip install 'usage-dashboard[gui]'`); see
-  [`deploy/pi/README.md`](deploy/pi/README.md) for the Pi setup + systemd unit.
+  for a **Raspberry Pi 4B + official Touch Display 2** (5", 720×1280). Renders
+  straight on the panel via KMS/DRM (no desktop); provider tiles with
+  session/weekly bars and reset countdowns; tap a tile for a detail view.
+  Resolution-independent (works portrait or landscape, and in a dev window).
+  Prep a Pi with one command — `./deploy/pi/install.sh` sets up a venv, the
+  systemd service, display rotation, and a git-based auto-update timer; see
+  [`deploy/pi/README.md`](deploy/pi/README.md).
 
 ## Deploy
 

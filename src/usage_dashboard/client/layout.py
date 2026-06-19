@@ -177,6 +177,29 @@ def _status_text(readings: list[Reading], now: datetime | None) -> str:
     return f"Updated {latest.strftime('%H:%M:%S')} UTC · {len(readings)} providers"
 
 
+def rotate_touch_norm(nx: float, ny: float, degrees: int) -> tuple[float, float]:
+    """Map a device-normalised touch point onto the *rotated* framebuffer.
+
+    Under the KMS console / SDL ``kmsdrm`` path there is no compositor to apply
+    a libinput transform matrix, so the touch controller keeps reporting in the
+    panel's native (portrait) frame even after ``video=DSI-1:...,rotate=N`` has
+    rotated what's drawn. This maps the normalised device point ``(nx, ny)`` to
+    the normalised on-screen point so a tap lands on the tile under the finger.
+
+    *degrees* is the clockwise display rotation (0/90/180/270); it should match
+    the ``rotate=`` value in ``cmdline.txt``. If taps come out mirrored, swap
+    90 ↔ 270 (panel handedness varies) — all four cases are reachable here.
+    """
+    d = degrees % 360
+    if d == 90:
+        return ny, 1.0 - nx
+    if d == 180:
+        return 1.0 - nx, 1.0 - ny
+    if d == 270:
+        return 1.0 - ny, nx
+    return nx, ny
+
+
 def hit_test(layout: MainLayout, pos: tuple[int, int]) -> Provider | None:
     """Provider whose tile contains *pos*, or None."""
     px, py = pos
