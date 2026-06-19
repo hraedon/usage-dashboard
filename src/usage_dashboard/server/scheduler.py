@@ -55,6 +55,9 @@ class FetchScheduler:
         claude_token: str | None = None,
         claude_refresh_token: str | None = None,
         claude_client_id: str | None = None,
+        claude_work_token: str | None = None,
+        claude_work_refresh_token: str | None = None,
+        claude_work_client_id: str | None = None,
         zai_key: str | None = None,
         ollama_cookie: str | None = None,
         umans_key: str | None = None,
@@ -70,6 +73,9 @@ class FetchScheduler:
         self._claude_token = claude_token
         self._claude_refresh_token = claude_refresh_token
         self._claude_client_id = claude_client_id
+        self._claude_work_token = claude_work_token
+        self._claude_work_refresh_token = claude_work_refresh_token
+        self._claude_work_client_id = claude_work_client_id
         self._token_store = token_store
         self._zai_key = zai_key
         self._ollama_cookie = ollama_cookie
@@ -198,6 +204,10 @@ class FetchScheduler:
             tasks.append(
                 (Provider.CLAUDE, partial(fetch_claude_usage, self._claude_token))
             )
+        if self._claude_work_token is not None:
+            tasks.append(
+                (Provider.CLAUDE_WORK, partial(fetch_claude_usage, self._claude_work_token))
+            )
         if self._zai_key is not None:
             tasks.append(
                 (Provider.ZAI, partial(fetch_zai_usage, self._zai_key))
@@ -212,25 +222,45 @@ class FetchScheduler:
             )
         return tasks
 
+    def _do_refresh(
+        self, refresh_token: str, client_id: str | None, store_key: str
+    ) -> tuple[str, str] | None:
+        """Refresh one Claude account's tokens and persist them under
+        *store_key*. Returns the new (access, refresh) pair, or None on failure.
+        """
+        try:
+            new_access, new_refresh = refresh_claude_token(
+                refresh_token, client_id=client_id
+            )
+        except FetchError as exc:
+            logger.warning("Claude token refresh failed (%s): %s", store_key, exc)
+            return None
+        if self._token_store is not None:
+            self._token_store.save(store_key, new_access, new_refresh)
+            logger.info("Claude tokens refreshed and persisted (%s)", store_key)
+        else:
+            logger.info("Claude token refreshed, not persisted (%s)", store_key)
+        return new_access, new_refresh
+
     def _try_refresh_claude(self) -> bool:
         if self._claude_refresh_token is None:
             return False
-        try:
-            new_access, new_refresh = refresh_claude_token(
-                self._claude_refresh_token,
-                client_id=self._claude_client_id,
-            )
-            self._claude_token = new_access
-            self._claude_refresh_token = new_refresh
-            if self._token_store is not None:
-                self._token_store.save_claude_tokens(new_access, new_refresh)
-                logger.info("Claude tokens refreshed and persisted")
-            else:
-                logger.info("Claude token refreshed successfully (not persisted)")
-            return True
-        except FetchError as exc:
-            logger.warning("Claude token refresh failed: %s", exc)
+        pair = self._do_refresh(self._claude_refresh_token, self._claude_client_id, "claude")
+        if pair is None:
             return False
+        self._claude_token, self._claude_refresh_token = pair
+        return True
+
+    def _try_refresh_claude_work(self) -> bool:
+        if self._claude_work_refresh_token is None:
+            return False
+        pair = self._do_refresh(
+            self._claude_work_refresh_token, self._claude_work_client_id, "claude_work"
+        )
+        if pair is None:
+            return False
+        self._claude_work_token, self._claude_work_refresh_token = pair
+        return True
 
     def _fetch_one(
         self,
@@ -246,26 +276,36 @@ class FetchScheduler:
         except FetchError as exc:
             # Refresh only on credential rejection; refreshing on transient
             # failures (429s, timeouts) spams the OAuth endpoint and risks
-            # rotating a refresh token shared with an interactive session.
-            if (
-                provider == Provider.CLAUDE
-                and isinstance(exc, FetchAuthError)
-                and self._try_refresh_claude()
-            ):
-                try:
-                    reading = fetch_claude_usage(self._claude_token or "")
-                    self._db.store_reading(reading, consecutive_failures=0)
-                    self._db.reset_failures(provider)
-                    self._schedule_after_success(provider, previous, reading)
-                    return
-                except FetchError:
-                    pass
+            # rotating a refresh token shared with an interactive session. Each
+            # Claude account refreshes and retries with its own tokens.
+            if isinstance(exc, FetchAuthError):
+                if provider == Provider.CLAUDE and self._try_refresh_claude():
+                    if self._retry_claude(provider, previous, self._claude_token):
+                        return
+                elif provider == Provider.CLAUDE_WORK and self._try_refresh_claude_work():
+                    if self._retry_claude(provider, previous, self._claude_work_token):
+                        return
             self._record_failure(provider, exc)
         except Exception as exc:
             # A non-FetchError (e.g. AttributeError parsing an unexpected API
             # payload) must be contained; if it escapes, _run_loop's thread
             # dies and every provider stops fetching for the life of the pod.
             self._record_failure(provider, exc)
+
+    def _retry_claude(
+        self, provider: Provider, previous: Reading | None, token: str | None
+    ) -> bool:
+        """Re-fetch a Claude account after a token refresh. Returns True on
+        success (reading stored, schedule advanced), False to fall through to
+        the normal failure path."""
+        try:
+            reading = fetch_claude_usage(token or "")
+        except FetchError:
+            return False
+        self._db.store_reading(reading, consecutive_failures=0)
+        self._db.reset_failures(provider)
+        self._schedule_after_success(provider, previous, reading)
+        return True
 
     def _failure_backoff(self, provider: Provider, failures: int, exc: Exception) -> float:
         """Seconds to wait before the next attempt after *failures* in a row.

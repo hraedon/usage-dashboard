@@ -73,17 +73,29 @@ def _bar_row(label: str, percent: float | None, resets_at: datetime | None, now:
     )
 
 
+def _account_rows(reading: Reading, now: datetime, label: str = "") -> str:
+    prefix = f"{label} " if label else ""
+    return _bar_row(
+        f"{prefix}Session", reading.session_percent, reading.session_resets_at, now
+    ) + _bar_row(f"{prefix}Weekly", reading.weekly_percent, reading.weekly_resets_at, now)
+
+
 def _render_dashboard_html(readings: list[Reading], now: datetime) -> str:
+    by_provider = {r.provider: r for r in readings}
+    work = by_provider.get(Provider.CLAUDE_WORK)
     cards: list[str] = []
     for reading in readings:
+        # The work Claude account folds into the Claude card, not its own.
+        if reading.provider == Provider.CLAUDE_WORK:
+            continue
         name = html.escape(reading.provider.value.upper()) + _status_badge(reading)
         if reading.provider == Provider.UMANS:
             detail = html.escape(reading.detail) if reading.detail else "&mdash;"
             body = f'<div class="detail">{detail}</div>'
+        elif reading.provider == Provider.CLAUDE and work is not None:
+            body = _account_rows(reading, now, "me") + _account_rows(work, now, "work")
         else:
-            body = _bar_row(
-                "Session", reading.session_percent, reading.session_resets_at, now
-            ) + _bar_row("Weekly", reading.weekly_percent, reading.weekly_resets_at, now)
+            body = _account_rows(reading, now)
         cards.append(f'<section class="card"><h2>{name}</h2>{body}</section>')
 
     fetched = max((r.fetched_at for r in readings), default=now)

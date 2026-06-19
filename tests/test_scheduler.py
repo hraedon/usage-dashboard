@@ -220,6 +220,81 @@ class TestClaudeRefreshGating:
         assert db.get_latest_readings()[Provider.CLAUDE].status is ReadingStatus.CURRENT
 
 
+class TestClaudeWorkAccount:
+    def test_work_account_is_a_separate_fetch_task(self, tmp_path):
+        db = Database(str(tmp_path / "sched.db"))
+        db.initialize()
+        scheduler = FetchScheduler(
+            db, claude_token="personal", claude_work_token="work"
+        )
+        assert scheduler.configured_providers() == [
+            Provider.CLAUDE, Provider.CLAUDE_WORK
+        ]
+
+    def test_no_work_account_when_unconfigured(self, tmp_path):
+        db = Database(str(tmp_path / "sched.db"))
+        db.initialize()
+        scheduler = FetchScheduler(db, claude_token="personal")
+        assert Provider.CLAUDE_WORK not in scheduler.configured_providers()
+
+    def test_work_fetch_stores_under_its_own_provider(self, tmp_path):
+        db = Database(str(tmp_path / "sched.db"))
+        db.initialize()
+        scheduler = FetchScheduler(db, claude_work_token="work")
+        reading = _make_reading(provider=Provider.CLAUDE_WORK, session_percent=12.0)
+        scheduler._fetch_one(Provider.CLAUDE_WORK, MagicMock(return_value=reading))
+        stored = db.get_latest_readings()
+        assert Provider.CLAUDE_WORK in stored
+        assert stored[Provider.CLAUDE_WORK].session_percent == 12.0
+        assert Provider.CLAUDE not in stored  # personal untouched
+
+    def test_work_refresh_persists_under_claude_work_key(self, tmp_path):
+        from unittest.mock import patch
+
+        db = Database(str(tmp_path / "sched.db"))
+        db.initialize()
+        token_store = TokenStore(str(tmp_path / "tokens.json"))
+        scheduler = FetchScheduler(
+            db,
+            claude_token="p-access",
+            claude_refresh_token="p-refresh",
+            claude_work_token="w-access",
+            claude_work_refresh_token="w-refresh",
+            token_store=token_store,
+        )
+        with patch(
+            "usage_dashboard.server.scheduler.refresh_claude_token",
+            return_value=("new-w-access", "new-w-refresh"),
+        ):
+            assert scheduler._try_refresh_claude_work() is True
+        # Work tokens persisted to their own namespace; personal untouched.
+        assert token_store.get("claude_work") == ("new-w-access", "new-w-refresh")
+        assert token_store.get("claude") == (None, None)
+        assert scheduler._claude_work_token == "new-w-access"
+        assert scheduler._claude_token == "p-access"
+
+    def test_auth_failure_refreshes_the_work_account(self, tmp_path):
+        from unittest.mock import patch
+
+        from usage_dashboard.server.fetch_types import FetchAuthError
+
+        db = Database(str(tmp_path / "sched.db"))
+        db.initialize()
+        scheduler = FetchScheduler(db, claude_work_token="work")
+        scheduler._try_refresh_claude_work = MagicMock(return_value=True)  # type: ignore[method-assign]
+        scheduler._try_refresh_claude = MagicMock(return_value=True)  # type: ignore[method-assign]
+        fetch_fn = MagicMock(side_effect=FetchAuthError("HTTP 401"))
+        retry_reading = _make_reading(provider=Provider.CLAUDE_WORK)
+        with patch(
+            "usage_dashboard.server.scheduler.fetch_claude_usage",
+            return_value=retry_reading,
+        ):
+            scheduler._fetch_one(Provider.CLAUDE_WORK, fetch_fn)
+        scheduler._try_refresh_claude_work.assert_called_once()
+        scheduler._try_refresh_claude.assert_not_called()  # only the work account
+        assert db.get_latest_readings()[Provider.CLAUDE_WORK].status is ReadingStatus.CURRENT
+
+
 class TestRateLimitBackoff:
     def test_rate_limit_blocks_provider_until_retry_after(self, tmp_path):
         from usage_dashboard.server.fetch_types import FetchRateLimitError
@@ -511,6 +586,7 @@ class TestConfiguredProviders:
             db,
             umans_key="u",
             claude_token="c",
+            claude_work_token="cw",
             zai_key="z",
             ollama_cookie="o",
         )

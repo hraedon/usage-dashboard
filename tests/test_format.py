@@ -3,12 +3,14 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 
 from usage_dashboard.client.format import (
+    BAR_BG,
     GRAY,
     GREEN,
     ORANGE,
     RED,
     bar_color,
     format_countdown,
+    mute,
     percent_text,
     status_suffix,
 )
@@ -102,3 +104,17 @@ class TestPercentText:
 
     def test_none(self) -> None:
         assert percent_text(None) == "N/A"
+
+
+class TestMute:
+    def test_zero_amount_is_unchanged(self) -> None:
+        assert mute(GREEN, 0.0) == GREEN
+
+    def test_full_amount_is_track_gray(self) -> None:
+        assert mute(GREEN, 1.0) == BAR_BG
+
+    def test_default_blends_toward_gray_but_keeps_hue(self) -> None:
+        muted = mute(GREEN)
+        assert muted != GREEN
+        # Green channel still dominant over red/blue: hue is still legible.
+        assert muted[1] > muted[0] and muted[1] > muted[2]

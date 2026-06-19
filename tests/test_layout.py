@@ -200,3 +200,54 @@ class TestRotateTouchNorm:
         screen = rotate_touch_norm(device[0], device[1], 90)
         px, py = int(screen[0] * size[0]), int(screen[1] * size[1])
         assert hit_test(layout, (px, py)) is Provider.CLAUDE
+
+
+class TestClaudeWorkAccount:
+    def _claude(self, **over: object) -> Reading:
+        return _reading(Provider.CLAUDE, **over)
+
+    def _work(self, **over: object) -> Reading:
+        return _reading(Provider.CLAUDE_WORK, **over)
+
+    def test_single_account_is_unchanged(self) -> None:
+        # No work account: two untagged, unmuted bars (identical to before).
+        layout = build_main_layout([self._claude()], _SIZE, now=_NOW)
+        assert [t.provider for t in layout.tiles] == [Provider.CLAUDE]
+        bars = layout.tiles[0].bars
+        assert len(bars) == 2
+        assert all(b.account == "" and not b.muted for b in bars)
+
+    def test_work_account_folds_into_claude_tile(self) -> None:
+        layout = build_main_layout(
+            [self._claude(), self._work()] , _SIZE, now=_NOW
+        )
+        # No separate CLAUDE_WORK tile.
+        assert [t.provider for t in layout.tiles] == [Provider.CLAUDE]
+        bars = layout.tiles[0].bars
+        assert len(bars) == 4
+        assert [b.account for b in bars] == ["me", "me", "work", "work"]
+        assert [b.muted for b in bars] == [False, False, True, True]
+
+    def test_work_only_still_shows_a_claude_tile(self) -> None:
+        layout = build_main_layout([self._work()], _SIZE, now=_NOW)
+        assert [t.provider for t in layout.tiles] == [Provider.CLAUDE]
+        assert len(layout.tiles[0].bars) == 2
+
+    def test_work_account_does_not_add_a_fifth_tile(self) -> None:
+        readings = [
+            self._claude(), self._work(),
+            _reading(Provider.ZAI), _reading(Provider.OLLAMA),
+        ]
+        layout = build_main_layout(readings, _SIZE, now=_NOW)
+        assert [t.provider for t in layout.tiles] == [
+            Provider.CLAUDE, Provider.ZAI, Provider.OLLAMA,
+        ]
+
+    def test_detail_secondary_appends_work_lines(self) -> None:
+        detail = build_detail_layout(
+            self._claude(), now=_NOW, secondary=("work", self._work())
+        )
+        labels = [line.label for line in detail.lines]
+        assert "— work —" in labels
+        # Session appears twice: once per account.
+        assert labels.count("Session") == 2

@@ -19,6 +19,7 @@ def _resolve_claude_tokens(
     token_store: TokenStore,
     env_access: str | None,
     env_refresh: str | None,
+    store_key: str = "claude",
 ) -> tuple[str | None, str | None]:
     """Decide which Claude tokens to run with (WI-001).
 
@@ -30,15 +31,18 @@ def _resolve_claude_tokens(
     deliberate re-login); otherwise prefer the persisted, possibly-refreshed
     tokens. A hash of the env access token is the change marker, so the Secret
     value isn't duplicated on disk.
+
+    *store_key* namespaces the credentials so a second account ("claude_work")
+    resolves and persists independently of the primary one.
     """
-    persisted_access, persisted_refresh = token_store.load_claude_tokens()
+    persisted_access, persisted_refresh = token_store.get(store_key)
 
     if env_access and env_refresh:
         marker = hashlib.sha256(env_access.encode()).hexdigest()
-        if marker != token_store.get_claude_seed_marker():
+        if marker != token_store.get_seed_marker(store_key):
             # New credential from the Secret — adopt it and record the marker.
-            token_store.save_claude_tokens(env_access, env_refresh)
-            token_store.set_claude_seed_marker(marker)
+            token_store.save(store_key, env_access, env_refresh)
+            token_store.set_seed_marker(store_key, marker)
             return env_access, env_refresh
 
     # Prefer persisted (refreshed) tokens; fall back to whatever the env gave.
@@ -60,6 +64,11 @@ def main() -> None:
     claude_token = os.environ.get("CLAUDE_TOKEN") or None
     claude_refresh_token = os.environ.get("CLAUDE_REFRESH_TOKEN") or None
     claude_client_id = os.environ.get("CLAUDE_CLIENT_ID") or None
+    # Optional second Claude account (e.g. a work login). Absent unless its own
+    # token is set — the dashboard then shows a muted second set of Claude bars.
+    claude_work_token = os.environ.get("CLAUDE_WORK_TOKEN") or None
+    claude_work_refresh_token = os.environ.get("CLAUDE_WORK_REFRESH_TOKEN") or None
+    claude_work_client_id = os.environ.get("CLAUDE_WORK_CLIENT_ID") or None
     zai_api_key = os.environ.get("ZAI_API_KEY") or None
     ollama_cookie = os.environ.get("OLLAMA_COOKIE") or None
     umans_api_key = os.environ.get("UMANS_API_KEY") or None
@@ -82,12 +91,19 @@ def main() -> None:
     claude_token, claude_refresh_token = _resolve_claude_tokens(
         token_store, claude_token, claude_refresh_token
     )
+    claude_work_token, claude_work_refresh_token = _resolve_claude_tokens(
+        token_store, claude_work_token, claude_work_refresh_token,
+        store_key="claude_work",
+    )
 
     scheduler = FetchScheduler(
         db=database,
         claude_token=claude_token,
         claude_refresh_token=claude_refresh_token,
         claude_client_id=claude_client_id,
+        claude_work_token=claude_work_token,
+        claude_work_refresh_token=claude_work_refresh_token,
+        claude_work_client_id=claude_work_client_id,
         zai_key=zai_api_key,
         ollama_cookie=ollama_cookie,
         umans_key=umans_api_key,

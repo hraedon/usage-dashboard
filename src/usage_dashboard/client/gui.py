@@ -30,7 +30,7 @@ from usage_dashboard.client.layout import (
     rotate_touch_norm,
     tap_transition,
 )
-from usage_dashboard.shared.models import Reading
+from usage_dashboard.shared.models import Provider, Reading
 
 logger = logging.getLogger(__name__)
 
@@ -148,8 +148,11 @@ class DashboardGui:
         bar_h = max(6, row_h // 4)
         for i, bar in enumerate(tile.bars):
             row_y = bar_top + i * row_h
+            # Tag a second account's bars (e.g. "work · Session"); single
+            # account leaves account empty, so the label is unchanged.
+            label_text = f"{bar.account} · {bar.label}" if bar.account else bar.label
             label = self._font_small.render(
-                f"{bar.label} {bar.percent_text}", True, fmt.TEXT
+                f"{label_text} {bar.percent_text}", True, fmt.TEXT
             )
             self._screen.blit(label, (track_x, row_y))
             track_y = row_y + label.get_height() + 2
@@ -159,8 +162,9 @@ class DashboardGui:
             )
             fill_w = max(0, int(track_w * bar.fraction))
             if fill_w > 0:
+                fill_color = fmt.mute(bar.color) if bar.muted else bar.color
                 pygame.draw.rect(
-                    self._screen, bar.color,
+                    self._screen, fill_color,
                     pygame.Rect(track_x, track_y, fill_w, bar_h), border_radius=3,
                 )
             if bar.reset_text:
@@ -174,7 +178,13 @@ class DashboardGui:
         if reading is None:
             self._state = ViewState()
             return
-        detail: DetailLayout = build_detail_layout(reading)
+        # Fold the work Claude account into the Claude detail view, if present.
+        secondary = None
+        if reading.provider is Provider.CLAUDE:
+            work = by_provider.get(Provider.CLAUDE_WORK)
+            if work is not None:
+                secondary = ("work", work)
+        detail: DetailLayout = build_detail_layout(reading, secondary=secondary)
         pad = max(10, self._width // 30)
         self._screen.blit(
             self._font_title.render(detail.title, True, fmt.TEXT), (pad, pad)

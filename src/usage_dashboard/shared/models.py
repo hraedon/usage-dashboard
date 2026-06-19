@@ -8,9 +8,22 @@ from typing import Any
 
 class Provider(Enum):
     CLAUDE = "claude"
+    # A second, optional Claude account (e.g. a work login) with its own OAuth
+    # pair. It reuses the whole Claude fetch/refresh/storage path; the clients
+    # merge it into the Claude tile as a second, muted set of bars. Absent
+    # unless its own tokens are configured.
+    CLAUDE_WORK = "claude_work"
     ZAI = "zai"
     OLLAMA = "ollama"
     UMANS = "umans"
+
+
+# Claude-family providers that share the OAuth fetch/refresh machinery, mapped
+# to their token-store namespace. The client renders them as one "Claude" tile.
+CLAUDE_PROVIDERS: dict[Provider, str] = {
+    Provider.CLAUDE: "claude",
+    Provider.CLAUDE_WORK: "claude_work",
+}
 
 
 class ReadingStatus(Enum):
