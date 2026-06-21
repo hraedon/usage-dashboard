@@ -10,9 +10,11 @@ from usage_dashboard.client.format import (
     RED,
     bar_color,
     format_countdown,
+    format_interval,
     mute,
     percent_text,
     status_suffix,
+    to_local,
 )
 from usage_dashboard.shared.models import Provider, Reading, ReadingStatus
 
@@ -118,3 +120,33 @@ class TestMute:
         assert muted != GREEN
         # Green channel still dominant over red/blue: hue is still legible.
         assert muted[1] > muted[0] and muted[1] > muted[2]
+
+
+class TestToLocal:
+    def test_converts_utc_to_system_tz(self) -> None:
+        utc_naive = datetime(2026, 6, 21, 12, 0, 0)
+        local = to_local(utc_naive)
+        aware_utc = utc_naive.replace(tzinfo=timezone.utc)
+        system_offset = datetime.now().astimezone().utcoffset()
+        if system_offset is not None:
+            expected = aware_utc + system_offset
+            assert local.replace(tzinfo=None) == expected.replace(tzinfo=None)
+
+    def test_preserves_wall_clock_when_utc(self) -> None:
+        # If the system tz IS utc, the time should be unchanged.
+        utc_naive = datetime(2026, 6, 21, 12, 0, 0)
+        local = to_local(utc_naive)
+        system_offset = datetime.now().astimezone().utcoffset()
+        if system_offset == timedelta(0):
+            assert local.hour == 12
+
+
+class TestFormatInterval:
+    def test_seconds(self) -> None:
+        assert format_interval(30) == "30s"
+
+    def test_one_minute(self) -> None:
+        assert format_interval(60) == "1m"
+
+    def test_five_minutes(self) -> None:
+        assert format_interval(300) == "5m"

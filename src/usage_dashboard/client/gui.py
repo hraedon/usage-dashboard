@@ -110,7 +110,10 @@ class DashboardGui:
     def run(self) -> None:
         while self._running:
             readings = self._fetcher.get_latest_readings()
-            layout = build_main_layout(readings, (self._width, self._height))
+            layout = build_main_layout(
+                readings, (self._width, self._height),
+                refresh_interval=self._fetcher.current_interval,
+            )
             self._handle_events(layout)
             self._screen.fill(fmt.BG)
             if self._state.detail_provider is None:

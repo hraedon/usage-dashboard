@@ -90,3 +90,16 @@ def status_suffix(reading: Reading) -> str:
 
 def percent_text(percent: float | None) -> str:
     return f"{percent:.0f}%" if percent is not None else "N/A"
+
+
+def to_local(utc_naive: datetime) -> datetime:
+    """Convert a naive-UTC datetime to the system's local timezone."""
+    local_tz = datetime.now().astimezone().tzinfo or timezone.utc
+    return utc_naive.replace(tzinfo=timezone.utc).astimezone(local_tz)
+
+
+def format_interval(seconds: int) -> str:
+    """Compact interval label: 60 -> '1m', 300 -> '5m', 30 -> '30s'."""
+    if seconds >= 60:
+        return f"{seconds // 60}m"
+    return f"{seconds}s"

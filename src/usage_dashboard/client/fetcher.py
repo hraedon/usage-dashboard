@@ -50,6 +50,11 @@ class ClientFetcher:
         with self._lock:
             return list(self._readings)
 
+    @property
+    def current_interval(self) -> int:
+        with self._lock:
+            return self._interval
+
     def _poll_loop(self) -> None:
         self._fetch_once()
         while not self._stop_event.wait(timeout=self._interval):
