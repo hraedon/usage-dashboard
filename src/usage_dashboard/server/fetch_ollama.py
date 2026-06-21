@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 
 import httpx
 
-from usage_dashboard.server.fetch_types import FetchAuthError, FetchError
+from usage_dashboard.server.fetch_types import FetchAuthError, FetchError, debug_dump
 from usage_dashboard.shared.models import Provider, Reading, ReadingStatus
 
 _OLLAMA_SETTINGS_URL = "https://ollama.com/settings"
@@ -147,6 +147,8 @@ def fetch_ollama_usage(cookie: str) -> Reading:
         ) from exc
     except httpx.HTTPError as exc:
         raise FetchError(f"Ollama usage request failed: {type(exc).__name__}") from exc
+
+    debug_dump("ollama_raw.html", html)
 
     now = datetime.now(timezone.utc).replace(tzinfo=None)
     session = _parse_usage_block(_SESSION_LABELS, html, now)
