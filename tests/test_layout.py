@@ -46,10 +46,20 @@ def _all_four() -> list[Reading]:
 
 class TestMainLayout:
     def test_tile_per_provider_in_fixed_order(self) -> None:
+        # umans is quota-less: it goes to the footer, not a tile.
         layout = build_main_layout(_all_four(), _SIZE, now=_NOW)
         assert [t.provider for t in layout.tiles] == [
-            Provider.CLAUDE, Provider.ZAI, Provider.OLLAMA, Provider.UMANS,
+            Provider.CLAUDE, Provider.ZAI, Provider.OLLAMA,
         ]
+
+    def test_single_column_stack(self) -> None:
+        layout = build_main_layout(_all_four(), _SIZE, now=_NOW)
+        # All tiles share the same x/width (one column) and stack downward.
+        xs = {t.rect.x for t in layout.tiles}
+        ws = {t.rect.w for t in layout.tiles}
+        assert len(xs) == 1 and len(ws) == 1
+        ys = [t.rect.y for t in layout.tiles]
+        assert ys == sorted(ys)
 
     def test_tiles_within_bounds_and_nonoverlapping(self) -> None:
         layout = build_main_layout(_all_four(), _SIZE, now=_NOW)
@@ -74,11 +84,10 @@ class TestMainLayout:
         assert weekly.fraction == 0.9
         assert weekly.color == fmt.RED     # 90%
 
-    def test_quotaless_provider_shows_detail_not_bars(self) -> None:
+    def test_quotaless_provider_in_footer_not_a_tile(self) -> None:
         layout = build_main_layout(_all_four(), _SIZE, now=_NOW)
-        umans = layout.tiles[3]
-        assert umans.bars == []
-        assert umans.detail == "req 5 tok 1M"
+        assert Provider.UMANS not in [t.provider for t in layout.tiles]
+        assert layout.footer_note == "UMANS req 5 tok 1M"
 
     def test_accent_is_worst_bar_color(self) -> None:
         layout = build_main_layout(_all_four(), _SIZE, now=_NOW)
