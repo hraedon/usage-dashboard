@@ -32,12 +32,26 @@ this checkout actually lives.
 
 ## 0. Image the SD card
 
-Use **Raspberry Pi Imager** → Raspberry Pi OS (64-bit), **Lite** is enough.
-In the gear/⚙ "OS customisation": set the **hostname** (give each unit a unique
-one — e.g. `usage-dash-01`), **username/password**, **Wi-Fi** (or use
-Ethernet), and **enable SSH**. First boot then needs no monitor.
+Use **Raspberry Pi OS (64-bit), Lite** — Lite is enough, and you *want* Lite,
+not Desktop: the GUI runs on bare KMS/DRM, and a Desktop image's Wayland
+compositor fights it for the display.
 
-The Touch Display 2 is auto-detected on Bookworm — no driver install.
+Easiest is **Raspberry Pi Imager** → in the gear/⚙ "OS customisation" set the
+**hostname** (unique per unit, e.g. `usage-dash-01`), **username/password**,
+**Wi-Fi** (or Ethernet), and **enable SSH**. Imager writes the right first-boot
+files for whichever OS version you pick, so first boot needs no monitor.
+
+**Imaging headlessly (e.g. `dd` from another box)?** The first-boot mechanism
+changed by OS release — put the files at the boot-partition (FAT) root:
+
+- **Trixie (Debian 13) and newer → cloud-init.** Three files: `user-data`
+  (cloud-config; first line must be `#cloud-config`), `network-config`
+  (netplan v2 `wifis:` — multiple SSIDs supported), and an empty `meta-data`.
+  `custom.toml` is **ignored** on Trixie. Validate the YAML before unmounting;
+  debug with `cloud-init status --long` + `/var/log/cloud-init.log`.
+- **Bookworm → `custom.toml`** (the `raspberrypi-sys-mods` firstboot format).
+
+The Touch Display 2 is auto-detected on Bookworm/Trixie — no driver install.
 
 ## 1. Orientation (display **and** touch)
 
