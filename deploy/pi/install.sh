@@ -47,7 +47,11 @@ sudo -n true 2>/dev/null || sudo -v
 # --- 1. system packages -----------------------------------------------------
 echo "==> apt packages"
 sudo apt-get update -qq
-sudo apt-get install -y git python3-venv python3-pip libgbm1 libdrm2
+# libgbm1/libdrm2 + the mesa EGL/GLES stack: SDL's kmsdrm backend creates its
+# scanout surface via GBM+EGL even for 2D, so without libegl1/libegl-mesa0/
+# libgles2 pygame dies with "EGL not initialized" on a bare-KMS (Lite) image.
+sudo apt-get install -y git python3-venv python3-pip \
+    libgbm1 libdrm2 libegl1 libegl-mesa0 libgles2
 
 # --- 2. groups for DRM + touch ---------------------------------------------
 echo "==> groups (video render input)"
