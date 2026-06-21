@@ -1,0 +1,33 @@
+#!/bin/bash
+# X session for the usage-dashboard touch GUI. Launched by xinit, so the X
+# server is already up and $DISPLAY is set.
+#
+# Why X and not bare kmsdrm: SDL 2.32.10's kmsdrm backend cannot present to the
+# Touch Display 2 (ILI9881C panel on vc4) — a full-screen fill stays black on
+# both Bookworm and Trixie, even though the DRM pipeline reports the framebuffer
+# bound and active. Under a minimal X server the same pygame app paints
+# correctly, and xrandr gives real landscape rotation.
+#
+# install.sh renders @VENV@. SERVER_URL/API_KEY/GUI_*/XRANDR_ROTATE come from
+# the service environment (EnvironmentFile + Environment=).
+
+# Rotate the panel to landscape. The panel is portrait-native (720x1280).
+OUT=$(xrandr -q | awk '/ connected/{print $1; exit}')
+ROT="${XRANDR_ROTATE:-right}"
+[ -n "$OUT" ] && xrandr --output "$OUT" --rotate "$ROT" || true
+
+# The Goodix touch controller reports in the panel's native portrait frame and
+# libinput does NOT auto-apply the display rotation to it under bare modesetting,
+# so taps land 90 degrees off. Apply a coordinate-transform matrix that matches
+# the xrandr rotation above.
+case "$ROT" in
+  right)    CTM="0 1 0 -1 0 1 0 0 1";;
+  left)     CTM="0 -1 1 1 0 0 0 0 1";;
+  inverted) CTM="-1 0 1 0 -1 1 0 0 1";;
+  *)        CTM="1 0 0 0 1 0 0 0 1";;
+esac
+# "pointer:" disambiguates — the Goodix exposes both a pointer and keyboard node.
+xinput set-prop "pointer:Goodix Capacitive TouchScreen" \
+  "Coordinate Transformation Matrix" $CTM 2>/dev/null || true
+
+exec "@VENV@/bin/usage-dashboard-gui"
