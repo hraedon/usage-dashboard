@@ -1,0 +1,15 @@
+[Unit]
+Description=Rebind Goodix touch after DSI panel powers (Touch Display 2 probe-race workaround)
+# Must finish before the GUI starts, so the touchscreen is enumerated by the
+# time X grabs input devices. Do NOT add After=multi-user.target — combined with
+# WantedBy below that makes systemd schedule (and drop) the job after the system
+# is already up. The retry loop in the script handles panel-power timing.
+Before=usage-dashboard-gui.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/goodix-touch-rebind.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -1,25 +1,30 @@
 [Unit]
 Description=AI Usage Dashboard (touch GUI)
-# Render straight on the panel via KMS/DRM — no desktop session required.
-After=multi-user.target network-online.target
-Wants=network-online.target
+# This panel (Touch Display 2 / ILI9881C / vc4) cannot be driven by SDL's bare
+# kmsdrm backend — it presents black on both Bookworm and Trixie — so the GUI
+# runs under a minimal X server via xinit. xrandr handles landscape rotation and
+# xinput the matching touch transform (see usage-dashboard-xsession).
+After=multi-user.target network-online.target getty@tty1.service goodix-touch-rebind.service
+Wants=network-online.target goodix-touch-rebind.service
+# Take vt1 from the console getty so X owns the panel.
+Conflicts=getty@tty1.service
 
 [Service]
 Type=simple
 # @RUNUSER@/@VENV@ are filled in by deploy/pi/install.sh. Do not `cp` this raw.
 User=@RUNUSER@
-# Direct framebuffer/DRM output (appliance mode, no X/Wayland needed).
-Environment=SDL_VIDEODRIVER=kmsdrm
 Environment=GUI_FULLSCREEN=1
-# Rotate touch coords to match the panel rotation in cmdline.txt (rotate=N).
-# If taps land mirrored, swap 90<->270 here. 0 = portrait/no rotation.
-Environment=GUI_TOUCH_ROTATE=@TOUCH_ROTATE@
+# Display + touch rotation are applied under X by usage-dashboard-xsession
+# (xrandr + xinput). One knob: normal|left|right|inverted. The old kmsdrm-era
+# GUI_TOUCH_ROTATE is unused on the X path.
+Environment=XRANDR_ROTATE=@XRANDR_ROTATE@
 # SERVER_URL + API_KEY (+ optional UPDATE_REF) live here, out of the unit file.
 EnvironmentFile=/etc/usage-dashboard-gui.env
-ExecStart=@VENV@/bin/usage-dashboard-gui
+# xinit starts X on vt1 and runs the session script, which execs the GUI.
+ExecStart=/usr/bin/xinit /usr/local/bin/usage-dashboard-xsession -- :0 vt1 -nolisten tcp
 Restart=always
 RestartSec=5
-# KMS/DRM + touch input access.
+# DRM + touch device access.
 SupplementaryGroups=video render input
 
 [Install]
