@@ -20,7 +20,13 @@ _USER_AGENT = (
 # steipete/CodexBar's OllamaUsageParser, the maintained prior art.
 _SESSION_LABELS = ("Session usage", "Hourly usage")
 _WEEKLY_LABEL = "Weekly usage"
-_BLOCK_MAX_CHARS = 4000
+# The reset countdown can sit far after its label — the weekly bar renders a row
+# of segment <button>s between "Weekly usage" and its "Resets in …" text (~4.6k
+# chars observed), and it's the last section so there's no following label to
+# bound the block. Keep this comfortably above that gap or the weekly reset is
+# silently dropped. (Earlier-section blocks are bounded by the next label, not
+# this cap, so a generous value is safe.)
+_BLOCK_MAX_CHARS = 8000
 
 _PERCENT_USED_RE = re.compile(r"([0-9]+(?:\.[0-9]+)?)\s*%\s*used", re.IGNORECASE)
 _BAR_WIDTH_RE = re.compile(r"width:\s*([0-9]+(?:\.[0-9]+)?)%", re.IGNORECASE)
