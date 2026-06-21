@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 
 from usage_dashboard.shared.models import (
+    ModelUsage,
     Provider,
     Reading,
     ReadingStatus,
@@ -164,3 +165,46 @@ def test_reading_from_dict_tolerates_missing_detail_key():
     del data["detail"]
     reading = Reading.from_dict(data)
     assert reading.detail is None
+
+
+def test_model_usage_round_trip():
+    mu = ModelUsage(name="minimax-m3", requests=1841, share_percent=68.0)
+    data = mu.to_dict()
+    restored = ModelUsage.from_dict(data)
+    assert restored == mu
+
+
+def test_reading_models_default_none():
+    reading = _make_reading()
+    assert reading.models is None
+
+
+def test_reading_models_round_trip():
+    reading = _make_reading(
+        provider=Provider.OLLAMA,
+        models=[
+            ModelUsage(name="minimax-m3", requests=1841, share_percent=68.0),
+            ModelUsage(name="nemotron-3-ultra", requests=588, share_percent=27.5),
+        ],
+    )
+    restored = Reading.from_dict(reading.to_dict())
+    assert restored.models is not None
+    assert len(restored.models) == 2
+    assert restored.models[0].name == "minimax-m3"
+    assert restored.models[0].requests == 1841
+    assert restored.models[0].share_percent == 68.0
+    assert restored == reading
+
+
+def test_reading_from_dict_tolerates_missing_models_key():
+    data = _make_reading().to_dict()
+    del data["models"]
+    reading = Reading.from_dict(data)
+    assert reading.models is None
+
+
+def test_reading_from_dict_tolerates_null_models():
+    data = _make_reading().to_dict()
+    data["models"] = None
+    reading = Reading.from_dict(data)
+    assert reading.models is None

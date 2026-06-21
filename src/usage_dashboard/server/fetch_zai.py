@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 import httpx
 
 from usage_dashboard.server.fetch_types import FetchAuthError, FetchError, dump_json
-from usage_dashboard.shared.models import Provider, Reading, ReadingStatus
+from usage_dashboard.shared.models import ModelUsage, Provider, Reading, ReadingStatus
 
 _ZAI_USAGE_URL = "https://api.z.ai/api/monitor/usage/quota/limit"
 _TIMEOUT = 30.0
@@ -17,6 +17,7 @@ _TIMEOUT = 30.0
 # API-tools quota, not coding usage.
 _SESSION_UNIT = 3
 _WEEKLY_UNIT = 6
+_TOOLS_UNIT = 5  # TIME_LIMIT: monthly API-tools quota (search-prime, web-reader, etc.)
 
 
 def _from_epoch_ms(value: object) -> datetime | None:
@@ -50,13 +51,15 @@ def fetch_zai_usage(api_key: str) -> Reading:
         limits: list[dict[str, object]] = payload["limits"]
         session_entry: dict[str, object] | None = None
         weekly_entry: dict[str, object] | None = None
+        tools_entry: dict[str, object] | None = None
         for entry in limits:
-            if entry.get("type") != "TOKENS_LIMIT":
-                continue
-            if entry.get("unit") == _SESSION_UNIT:
-                session_entry = entry
-            elif entry.get("unit") == _WEEKLY_UNIT:
-                weekly_entry = entry
+            if entry.get("type") == "TOKENS_LIMIT":
+                if entry.get("unit") == _SESSION_UNIT:
+                    session_entry = entry
+                elif entry.get("unit") == _WEEKLY_UNIT:
+                    weekly_entry = entry
+            elif entry.get("type") == "TIME_LIMIT" and entry.get("unit") == _TOOLS_UNIT:
+                tools_entry = entry
         if session_entry is None:
             raise FetchError("ZAI usage response missing session limit entry")
         if weekly_entry is None:
@@ -65,6 +68,30 @@ def fetch_zai_usage(api_key: str) -> Reading:
         session_resets_at = _from_epoch_ms(session_entry.get("nextResetTime"))
         weekly_percent: float | None = float(str(weekly_entry["percentage"]))
         weekly_resets_at = _from_epoch_ms(weekly_entry.get("nextResetTime"))
+
+        # Parse the monthly API-tools quota's per-model breakdown, if present.
+        models: list[ModelUsage] | None = None
+        if tools_entry is not None:
+            details_raw = tools_entry.get("usageDetails")
+            details: list[dict[str, object]] = (
+                details_raw if isinstance(details_raw, list) else []
+            )
+            total_used = int(str(tools_entry.get("currentValue", 0)))
+            model_list = [
+                ModelUsage(
+                    name=str(d.get("modelCode", "")),
+                    requests=int(str(d.get("usage", 0))),
+                    share_percent=(
+                        int(str(d.get("usage", 0))) / total_used * 100
+                        if total_used > 0
+                        else 0.0
+                    ),
+                )
+                for d in details
+                if d.get("modelCode")
+            ]
+            model_list.sort(key=lambda m: m.share_percent, reverse=True)
+            models = model_list if model_list else None
     except (KeyError, ValueError, TypeError) as exc:
         raise FetchError(f"ZAI usage response parse error: {type(exc).__name__}") from exc
 
@@ -77,4 +104,5 @@ def fetch_zai_usage(api_key: str) -> Reading:
         weekly_resets_at=weekly_resets_at,
         fetched_at=datetime.now(timezone.utc).replace(tzinfo=None),
         stale=False,
+        models=models,
     )

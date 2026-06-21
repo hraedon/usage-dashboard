@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 
 from usage_dashboard.server.db import Database
-from usage_dashboard.shared.models import Provider, Reading, ReadingStatus
+from usage_dashboard.shared.models import ModelUsage, Provider, Reading, ReadingStatus
 
 
 def _make_reading(**overrides: object) -> Reading:
@@ -170,3 +170,66 @@ class TestDetailColumn:
         db.store_reading(reading)
         result = db.get_latest_readings()[reading.provider]
         assert result.detail == "some detail"
+
+
+class TestModelsColumn:
+    def test_models_stored_and_retrieved(self, tmp_path):
+        db = Database(str(tmp_path / "test.db"))
+        db.initialize()
+        reading = _make_reading(
+            provider=Provider.OLLAMA,
+            models=[
+                ModelUsage(name="minimax-m3", requests=100, share_percent=80.0),
+                ModelUsage(name="glm-5.2", requests=20, share_percent=20.0),
+            ],
+        )
+        db.store_reading(reading)
+        result = db.get_latest_readings()[Provider.OLLAMA]
+        assert result.models is not None
+        assert len(result.models) == 2
+        assert result.models[0].name == "minimax-m3"
+        assert result.models[0].requests == 100
+        assert result.models[1].name == "glm-5.2"
+
+    def test_none_models_stored_and_retrieved(self, tmp_path):
+        db = Database(str(tmp_path / "test.db"))
+        db.initialize()
+        reading = _make_reading(provider=Provider.CLAUDE)
+        db.store_reading(reading)
+        result = db.get_latest_readings()[Provider.CLAUDE]
+        assert result.models is None
+
+    def test_initialize_migrates_legacy_schema_without_models(self, tmp_path):
+        import sqlite3
+
+        db_path = str(tmp_path / "legacy.db")
+        conn = sqlite3.connect(db_path)
+        conn.execute(
+            """
+            CREATE TABLE readings (
+                provider TEXT NOT NULL,
+                status TEXT NOT NULL,
+                session_percent REAL,
+                session_resets_at TEXT,
+                weekly_percent REAL,
+                weekly_resets_at TEXT,
+                fetched_at TEXT NOT NULL,
+                stale INTEGER NOT NULL DEFAULT 0,
+                consecutive_failures INTEGER NOT NULL DEFAULT 0,
+                detail TEXT,
+                PRIMARY KEY (provider)
+            )
+            """
+        )
+        conn.commit()
+        conn.close()
+
+        db = Database(db_path)
+        db.initialize()
+        reading = _make_reading(
+            models=[ModelUsage(name="test-model", requests=5, share_percent=50.0)]
+        )
+        db.store_reading(reading)
+        result = db.get_latest_readings()[reading.provider]
+        assert result.models is not None
+        assert result.models[0].name == "test-model"

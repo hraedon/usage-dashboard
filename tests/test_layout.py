@@ -11,7 +11,7 @@ from usage_dashboard.client.layout import (
     rotate_touch_norm,
     tap_transition,
 )
-from usage_dashboard.shared.models import Provider, Reading, ReadingStatus
+from usage_dashboard.shared.models import ModelUsage, Provider, Reading, ReadingStatus
 
 _NOW = datetime(2026, 1, 10, 12, 0, 0, tzinfo=timezone.utc)
 _SIZE = (800, 480)
@@ -165,6 +165,60 @@ class TestDetailLayout:
         detail = build_detail_layout(umans, now=_NOW)
         values = [line.value for line in detail.lines]
         assert "req 9 tok 2M" in values
+
+
+class TestModelBreakdown:
+    _MODELS = [
+        ModelUsage(name="minimax-m3", requests=1841, share_percent=68.0),
+        ModelUsage(name="nemotron-3-ultra", requests=588, share_percent=27.5),
+        ModelUsage(name="glm-5.2", requests=49, share_percent=2.4),
+    ]
+
+    def test_ollama_title_includes_top_models(self) -> None:
+        reading = _reading(Provider.OLLAMA, models=self._MODELS)
+        layout = build_main_layout([reading], _SIZE, now=_NOW)
+        title = layout.tiles[0].title
+        assert "minimax-m3 68%" in title
+        assert "nemotron-3-ultra 28%" in title
+        assert "glm-5.2" not in title
+
+    def test_ollama_title_plain_without_models(self) -> None:
+        reading = _reading(Provider.OLLAMA)
+        layout = build_main_layout([reading], _SIZE, now=_NOW)
+        assert layout.tiles[0].title == "OLLAMA"
+
+    def test_zai_title_has_no_model_subtitle(self) -> None:
+        reading = _reading(Provider.ZAI, models=[
+            ModelUsage(name="search-prime", requests=64, share_percent=64.0),
+        ])
+        layout = build_main_layout([reading], _SIZE, now=_NOW)
+        assert layout.tiles[0].title == "ZAI"
+
+    def test_detail_shows_ollama_model_lines(self) -> None:
+        reading = _reading(Provider.OLLAMA, models=self._MODELS)
+        detail = build_detail_layout(reading, now=_NOW)
+        labels = [line.label for line in detail.lines]
+        assert "Models" in labels
+        assert "  minimax-m3" in labels
+        assert "  nemotron-3-ultra" in labels
+        # All three models appear in the detail (not just top 2).
+        assert "  glm-5.2" in labels
+
+    def test_detail_shows_zai_tool_lines(self) -> None:
+        reading = _reading(Provider.ZAI, models=[
+            ModelUsage(name="search-prime", requests=64, share_percent=64.0),
+            ModelUsage(name="web-reader", requests=31, share_percent=31.0),
+        ])
+        detail = build_detail_layout(reading, now=_NOW)
+        labels = [line.label for line in detail.lines]
+        assert "API tools" in labels
+        assert "  search-prime" in labels
+
+    def test_detail_no_model_lines_when_none(self) -> None:
+        reading = _reading(Provider.OLLAMA)
+        detail = build_detail_layout(reading, now=_NOW)
+        labels = [line.label for line in detail.lines]
+        assert "Models" not in labels
 
 
 class TestRotateTouchNorm:

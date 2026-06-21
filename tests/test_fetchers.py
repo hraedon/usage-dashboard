@@ -62,6 +62,11 @@ def _zai_response_data():
                     "currentValue": 37,
                     "percentage": 3,
                     "nextResetTime": 1783477772998,
+                    "usageDetails": [
+                        {"modelCode": "search-prime", "usage": 24},
+                        {"modelCode": "web-reader", "usage": 10},
+                        {"modelCode": "zread", "usage": 3},
+                    ],
                 },
             ]
         },
@@ -78,7 +83,14 @@ def _ollama_html(session_pct="72.5", weekly_pct="42.0"):
       <span>Resets in <time data-time="2026-06-13T02:00:00Z">2h</time></span>
     </div>
     <div><h3>Weekly usage</h3>
-      <div><div style="width: {weekly_pct}%"></div></div>
+      <div><div style="width: {weekly_pct}%">
+        <button type="button" style="width: 60%; background: #76b900"
+          data-usage-segment data-model="nemotron-3-ultra" data-requests="588"
+          aria-label="nemotron-3-ultra: 588 requests"></button>
+        <button type="button" style="width: 30%; background: #ef4461"
+          data-usage-segment data-model="minimax-m3" data-requests="1841"
+          aria-label="minimax-m3: 1841 requests"></button>
+      </div></div>
       <span>{weekly_pct}% used</span>
       <span>Resets in <time data-time="2026-06-17T00:00:00Z">4d</time></span>
     </div>
@@ -177,6 +189,11 @@ class TestFetchZai:
         assert reading.session_percent == 55.0
         assert reading.weekly_percent == 35.0
         assert reading.stale is False
+        assert reading.models is not None
+        assert len(reading.models) == 3
+        assert reading.models[0].name == "search-prime"
+        assert reading.models[0].requests == 24
+        assert reading.models[0].share_percent == pytest.approx(64.864, abs=0.1)
 
     @patch("usage_dashboard.server.fetch_zai.httpx.Client")
     def test_fetch_zai_raises_fetch_error_on_http_failure(self, mock_client_cls):
@@ -251,6 +268,42 @@ class TestFetchZai:
         except FetchError:
             pass
 
+    @patch("usage_dashboard.server.fetch_zai.httpx.Client")
+    def test_fetch_zai_no_usage_details_yields_none_models(self, mock_client_cls):
+        data = _zai_response_data()
+        for entry in data["data"]["limits"]:
+            if entry.get("unit") == 5:
+                del entry["usageDetails"]
+        mock_response = MagicMock()
+        mock_response.json.return_value = data
+        mock_response.raise_for_status = MagicMock()
+        mock_client = MagicMock()
+        mock_client.get.return_value = mock_response
+        mock_client.__enter__ = MagicMock(return_value=mock_client)
+        mock_client.__exit__ = MagicMock(return_value=False)
+        mock_client_cls.return_value = mock_client
+
+        reading = fetch_zai_usage("test-key")
+        assert reading.models is None
+
+    @patch("usage_dashboard.server.fetch_zai.httpx.Client")
+    def test_fetch_zai_no_tools_entry_yields_none_models(self, mock_client_cls):
+        data = _zai_response_data()
+        data["data"]["limits"] = [
+            entry for entry in data["data"]["limits"] if entry.get("unit") != 5
+        ]
+        mock_response = MagicMock()
+        mock_response.json.return_value = data
+        mock_response.raise_for_status = MagicMock()
+        mock_client = MagicMock()
+        mock_client.get.return_value = mock_response
+        mock_client.__enter__ = MagicMock(return_value=mock_client)
+        mock_client.__exit__ = MagicMock(return_value=False)
+        mock_client_cls.return_value = mock_client
+
+        reading = fetch_zai_usage("test-key")
+        assert reading.models is None
+
 
 class TestFetchOllama:
     @staticmethod
@@ -278,6 +331,13 @@ class TestFetchOllama:
         assert reading.session_resets_at == datetime(2026, 6, 13, 2, 0, 0)
         assert reading.weekly_resets_at == datetime(2026, 6, 17, 0, 0, 0)
         assert reading.stale is False
+        assert reading.models is not None
+        assert len(reading.models) == 2
+        assert reading.models[0].name == "nemotron-3-ultra"
+        assert reading.models[0].share_percent == 60.0
+        assert reading.models[0].requests == 588
+        assert reading.models[1].name == "minimax-m3"
+        assert reading.models[1].share_percent == 30.0
 
     @patch("usage_dashboard.server.fetch_ollama.httpx.Client")
     def test_fetch_ollama_weekly_reset_far_after_label(self, mock_client_cls):
@@ -393,6 +453,7 @@ class TestFetchOllama:
         reading = fetch_ollama_usage("session=abc123")
         assert reading.session_percent == 72.5
         assert reading.weekly_percent is None
+        assert reading.models is None
 
 
 class TestRefreshClaudeToken:
