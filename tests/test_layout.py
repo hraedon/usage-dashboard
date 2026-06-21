@@ -189,15 +189,16 @@ class TestModelBreakdown:
     def test_ollama_title_includes_top_models(self) -> None:
         reading = _reading(Provider.OLLAMA, models=self._MODELS)
         layout = build_main_layout([reading], _SIZE, now=_NOW)
-        title = layout.tiles[0].title
-        assert "minimax-m3 68%" in title
-        assert "nemotron-3-ultra 28%" in title
-        assert "glm-5.2" not in title
+        subtitle = layout.tiles[0].subtitle
+        assert "minimax-m3 68%" in subtitle
+        assert "nemotron-3-ultra 28%" in subtitle
+        assert "glm-5.2" not in subtitle
 
     def test_ollama_title_plain_without_models(self) -> None:
         reading = _reading(Provider.OLLAMA)
         layout = build_main_layout([reading], _SIZE, now=_NOW)
         assert layout.tiles[0].title == "OLLAMA"
+        assert layout.tiles[0].subtitle == ""
 
     def test_zai_title_has_no_model_subtitle(self) -> None:
         reading = _reading(Provider.ZAI, models=[

@@ -59,6 +59,7 @@ class TileSpec:
     bars: list[BarSpec]
     detail: str | None   # quota-less providers (umans) show this instead of bars
     accent: Color        # worst-of bar colours, for a status edge
+    subtitle: str = ""   # right-aligned model breakdown for the tile header
 
 
 @dataclass(frozen=True)
@@ -225,13 +226,12 @@ def build_main_layout(
         else:
             bars = [] if is_quotaless else _bars_for(reading, now)
             detail = reading.detail if is_quotaless else None
-        # Build the title: provider name + optional model subtitle + status.
-        title = provider.value.upper()
+        # Build the title: provider name + status. Model breakdown goes in
+        # subtitle (right-aligned by the GUI), not in the title string.
+        title = provider.value.upper() + fmt.status_suffix(reading)
+        subtitle = ""
         if provider is Provider.OLLAMA:
             subtitle = _model_subtitle(reading.models)
-            if subtitle:
-                title += " · " + subtitle
-        title += fmt.status_suffix(reading)
         tiles.append(
             TileSpec(
                 provider=provider,
@@ -240,6 +240,7 @@ def build_main_layout(
                 bars=bars,
                 detail=detail,
                 accent=_accent(bars, detail),
+                subtitle=subtitle,
             )
         )
 

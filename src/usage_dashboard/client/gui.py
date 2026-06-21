@@ -151,6 +151,13 @@ class DashboardGui:
         pad = max(8, min(r.w, r.h) // 12)
         title_surf = self._font_title.render(tile.title, True, fmt.TEXT)
         self._screen.blit(title_surf, (r.x + pad, r.y + pad))
+        if tile.subtitle:
+            sub_surf = self._font_small.render(tile.subtitle, True, fmt.GRAY)
+            self._screen.blit(
+                sub_surf,
+                (r.x + r.w - pad - sub_surf.get_width(),
+                 r.y + pad + (title_surf.get_height() - sub_surf.get_height()) // 2),
+            )
 
         # One horizontal row per bar: "Session 49%" | track | "resets 3h 38m".
         content_top = r.y + pad + title_surf.get_height() + pad // 2
