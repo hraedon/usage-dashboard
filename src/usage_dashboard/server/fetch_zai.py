@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 
 import httpx
 
-from usage_dashboard.server.fetch_types import FetchAuthError, FetchError
+from usage_dashboard.server.fetch_types import FetchAuthError, FetchError, dump_json
 from usage_dashboard.shared.models import Provider, Reading, ReadingStatus
 
 _ZAI_USAGE_URL = "https://api.z.ai/api/monitor/usage/quota/limit"
@@ -42,6 +42,8 @@ def fetch_zai_usage(api_key: str) -> Reading:
         raise FetchError(f"ZAI usage request failed: HTTP {status}") from exc
     except httpx.HTTPError as exc:
         raise FetchError(f"ZAI usage request failed: {type(exc).__name__}") from exc
+
+    dump_json("zai_raw.json", data)
 
     try:
         payload = data["data"] if isinstance(data.get("data"), dict) else data

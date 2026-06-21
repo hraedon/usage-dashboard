@@ -9,6 +9,7 @@ from usage_dashboard.server.fetch_types import (
     FetchAuthError,
     FetchError,
     FetchRateLimitError,
+    dump_json,
 )
 from usage_dashboard.shared.models import Provider, Reading, ReadingStatus
 
@@ -91,6 +92,8 @@ def fetch_claude_usage(access_token: str) -> Reading:
         raise FetchError(f"Claude usage request failed: HTTP {status}") from exc
     except httpx.HTTPError as exc:
         raise FetchError(f"Claude usage request failed: {type(exc).__name__}") from exc
+
+    dump_json("claude_raw.json", data)
 
     try:
         five_hour = data["five_hour"]
