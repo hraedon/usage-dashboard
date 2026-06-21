@@ -219,8 +219,13 @@ class DashboardGui:
         )
         y = pad + self._font_title.get_height() + pad
         for line in detail.lines:
-            text = self._font.render(f"{line.label}:  {line.value}", True, line.color)
-            self._screen.blit(text, (pad, y))
+            label_surf = self._font.render(f"{line.label}:", True, line.color)
+            self._screen.blit(label_surf, (pad, y))
+            if line.value:
+                val_surf = self._font.render(line.value, True, line.color)
+                self._screen.blit(
+                    val_surf, (self._width - pad - val_surf.get_width(), y)
+                )
             y += self._font.get_height() + 6
         hint = self._font_small.render("tap anywhere to go back", True, fmt.GRAY)
         self._screen.blit(hint, (pad, self._height - hint.get_height() - pad))
