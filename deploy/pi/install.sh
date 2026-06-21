@@ -38,7 +38,11 @@ fi
 echo "==> usage-dashboard Pi setup"
 echo "    user=$RUNUSER  appdir=$APPDIR  ref=$UPDATE_REF"
 echo "    display rotate=$DISPLAY_ROTATE  touch rotate=$GUI_TOUCH_ROTATE"
-sudo -v   # prime sudo up front
+# Prime sudo. Try the passwordless path first: a headless install over SSH (no
+# tty) where the user has NOPASSWD for commands but the %sudo group rule still
+# requires a password would otherwise fail here — `sudo -v` has no command to
+# match, so it falls through to the password-required group rule.
+sudo -n true 2>/dev/null || sudo -v
 
 # --- 1. system packages -----------------------------------------------------
 echo "==> apt packages"
