@@ -32,6 +32,36 @@ class ReadingStatus(Enum):
     OFFLINE = "offline"
 
 
+@dataclass(frozen=True, slots=True)
+class ModelUsage:
+    """A single model/tool's share of a provider's usage.
+
+    For Ollama this is parsed from the per-model segment buttons in the weekly
+    usage bar (share = segment width %, requests = data-requests). For z.ai it
+    comes from the TIME_LIMIT API-tools quota's usageDetails (share = share of
+    used calls, requests = call count).
+    """
+
+    name: str
+    requests: int
+    share_percent: float
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "requests": self.requests,
+            "share_percent": self.share_percent,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> ModelUsage:
+        return cls(
+            name=data["name"],
+            requests=data["requests"],
+            share_percent=data["share_percent"],
+        )
+
+
 def _format_dt(dt: datetime | None) -> str | None:
     if dt is None:
         return None
@@ -60,6 +90,7 @@ class Reading:
     fetched_at: datetime
     stale: bool
     detail: str | None = None
+    models: list[ModelUsage] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -72,6 +103,7 @@ class Reading:
             "fetched_at": _format_dt(self.fetched_at),
             "stale": self.stale,
             "detail": self.detail,
+            "models": [m.to_dict() for m in self.models] if self.models else None,
         }
 
     @classmethod
@@ -86,6 +118,11 @@ class Reading:
             fetched_at=_parse_required_dt(data["fetched_at"]),
             stale=data["stale"],
             detail=data.get("detail"),
+            models=(
+                [ModelUsage.from_dict(m) for m in data["models"]]
+                if data.get("models")
+                else None
+            ),
         )
 
 

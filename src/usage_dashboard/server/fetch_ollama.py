@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 import httpx
 
 from usage_dashboard.server.fetch_types import FetchAuthError, FetchError, debug_dump
-from usage_dashboard.shared.models import Provider, Reading, ReadingStatus
+from usage_dashboard.shared.models import ModelUsage, Provider, Reading, ReadingStatus
 
 _OLLAMA_SETTINGS_URL = "https://ollama.com/settings"
 _TIMEOUT = 30.0
@@ -40,6 +40,11 @@ _RESET_IN_RE = re.compile(r"resets?\s+in\s+(.{0,40}?)(?:<|\bago\b|$)", re.IGNORE
 _DURATION_TOKEN_RE = re.compile(
     r"(\d+)\s*(week|day|hour|hr|minute|min)s?\b", re.IGNORECASE
 )
+
+# Per-model segment buttons in the weekly usage bar. Each <button> carries
+# data-model, data-requests, and a style="width: N%" — the model's share of
+# the bar. We match the full opening tag, then extract the three fields.
+_SEGMENT_TAG_RE = re.compile(r"<button\b[^>]*data-usage-segment[^>]*>", re.DOTALL)
 _DURATION_UNITS = {
     "week": "weeks",
     "day": "days",
@@ -128,6 +133,29 @@ def _parse_usage_block(
     return None
 
 
+def _parse_model_segments(html: str) -> list[ModelUsage]:
+    """Extract per-model usage from the weekly bar's segment buttons.
+
+    Each ``<button data-usage-segment>`` carries the model name, request count,
+    and bar-share width. Returns models sorted by share descending.
+    """
+    models: list[ModelUsage] = []
+    for tag in _SEGMENT_TAG_RE.findall(html):
+        model_m = re.search(r'data-model="([^"]+)"', tag)
+        req_m = re.search(r'data-requests="(\d+)"', tag)
+        width_m = re.search(r"width:\s*([0-9.]+)%", tag)
+        if model_m and req_m and width_m:
+            models.append(
+                ModelUsage(
+                    name=model_m.group(1),
+                    requests=int(req_m.group(1)),
+                    share_percent=float(width_m.group(1)),
+                )
+            )
+    models.sort(key=lambda m: m.share_percent, reverse=True)
+    return models
+
+
 def fetch_ollama_usage(cookie: str) -> Reading:
     headers = {
         "Cookie": cookie,
@@ -154,6 +182,10 @@ def fetch_ollama_usage(cookie: str) -> Reading:
     session = _parse_usage_block(_SESSION_LABELS, html, now)
     weekly = _parse_usage_block((_WEEKLY_LABEL,), html, now)
 
+    # Per-model breakdown lives in the weekly bar's segment buttons.
+    weekly_block = _block_after(_WEEKLY_LABEL, html)
+    models = _parse_model_segments(weekly_block) if weekly_block else []
+
     if session is None and weekly is None:
         if _looks_signed_out(html):
             raise FetchAuthError("Ollama session cookie expired: settings page is signed out")
@@ -168,4 +200,5 @@ def fetch_ollama_usage(cookie: str) -> Reading:
         weekly_resets_at=weekly[1] if weekly else None,
         fetched_at=now,
         stale=False,
+        models=models if models else None,
     )

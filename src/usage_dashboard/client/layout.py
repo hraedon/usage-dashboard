@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 
 from usage_dashboard.client import format as fmt
-from usage_dashboard.shared.models import Provider, Reading
+from usage_dashboard.shared.models import ModelUsage, Provider, Reading
 
 # Fixed tile order so a provider always lands in the same place frame to frame.
 # CLAUDE_WORK is intentionally absent: it has no tile of its own — it folds into
@@ -154,6 +154,17 @@ def _accent(bars: list[BarSpec], detail: str | None) -> Color:
     return max((b.color for b in bars), key=lambda c: rank.get(c, 0))
 
 
+def _model_subtitle(models: list[ModelUsage] | None, top_n: int = 2) -> str:
+    """Compact 'top N models' string for the tile title.
+
+    e.g. ``minimax-m3 68% · nemotron-3-ultra 28%``
+    """
+    if not models:
+        return ""
+    top = [m for m in models if m.share_percent > 0][:top_n]
+    return " · ".join(f"{m.name} {m.share_percent:.0f}%" for m in top)
+
+
 def build_main_layout(
     readings: list[Reading],
     size: tuple[int, int],
@@ -213,10 +224,17 @@ def build_main_layout(
         else:
             bars = [] if is_quotaless else _bars_for(reading, now)
             detail = reading.detail if is_quotaless else None
+        # Build the title: provider name + optional model subtitle + status.
+        title = provider.value.upper()
+        if provider is Provider.OLLAMA:
+            subtitle = _model_subtitle(reading.models)
+            if subtitle:
+                title += " · " + subtitle
+        title += fmt.status_suffix(reading)
         tiles.append(
             TileSpec(
                 provider=provider,
-                title=provider.value.upper() + fmt.status_suffix(reading),
+                title=title,
                 rect=rect,
                 bars=bars,
                 detail=detail,
@@ -315,6 +333,17 @@ def _detail_lines(reading: Reading, now: datetime | None) -> list[DetailLine]:
             lines.append(DetailLine("  resets in", w_reset, fmt.GRAY))
     if reading.detail:
         lines.append(DetailLine("Detail", reading.detail, fmt.TEXT))
+    if reading.models:
+        label = "API tools" if reading.provider is Provider.ZAI else "Models"
+        lines.append(DetailLine(label, "", fmt.GRAY))
+        for m in reading.models:
+            lines.append(
+                DetailLine(
+                    f"  {m.name}",
+                    f"{m.share_percent:.0f}% · {m.requests} req",
+                    fmt.GRAY,
+                )
+            )
     lines.append(DetailLine("Status", reading.status.value, fmt.TEXT))
     lines.append(
         DetailLine("Fetched", reading.fetched_at.strftime("%Y-%m-%d %H:%M:%S"), fmt.GRAY)

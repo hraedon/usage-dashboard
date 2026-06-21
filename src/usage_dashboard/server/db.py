@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 import threading
 from datetime import datetime, timezone
@@ -30,6 +31,7 @@ class Database:
                     stale INTEGER NOT NULL DEFAULT 0,
                     consecutive_failures INTEGER NOT NULL DEFAULT 0,
                     detail TEXT,
+                    models TEXT,
                     PRIMARY KEY (provider)
                 )
                 """
@@ -45,6 +47,12 @@ class Database:
                     # Concurrent instance won the migration race (deploy overlap)
                     if "duplicate column" not in str(exc):
                         raise
+            if "models" not in columns:
+                try:
+                    self._conn.execute("ALTER TABLE readings ADD COLUMN models TEXT")
+                except sqlite3.OperationalError as exc:
+                    if "duplicate column" not in str(exc):
+                        raise
             self._conn.commit()
 
     def store_reading(self, reading: Reading, consecutive_failures: int = 0) -> None:
@@ -54,13 +62,18 @@ class Database:
         weekly_resets_at = (
             reading.weekly_resets_at.isoformat() if reading.weekly_resets_at is not None else None
         )
+        models_json = (
+            json.dumps([m.to_dict() for m in reading.models])
+            if reading.models
+            else None
+        )
         with self._lock:
             self._conn.execute(
                 """
                 INSERT INTO readings (provider, status, session_percent, session_resets_at,
                                       weekly_percent, weekly_resets_at, fetched_at, stale,
-                                      consecutive_failures, detail)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                      consecutive_failures, detail, models)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(provider) DO UPDATE SET
                     status = excluded.status,
                     session_percent = excluded.session_percent,
@@ -70,7 +83,8 @@ class Database:
                     fetched_at = excluded.fetched_at,
                     stale = excluded.stale,
                     consecutive_failures = excluded.consecutive_failures,
-                    detail = excluded.detail
+                    detail = excluded.detail,
+                    models = excluded.models
                 """,
                 (
                     reading.provider.value,
@@ -83,6 +97,7 @@ class Database:
                     int(reading.stale),
                     consecutive_failures,
                     reading.detail,
+                    models_json,
                 ),
             )
             self._conn.commit()
@@ -104,6 +119,7 @@ class Database:
                 "fetched_at": row["fetched_at"],
                 "stale": bool(row["stale"]),
                 "detail": row["detail"],
+                "models": json.loads(row["models"]) if row["models"] else None,
             }
             reading = Reading.from_dict(data)
             result[reading.provider] = reading
