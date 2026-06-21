@@ -169,6 +169,7 @@ def build_main_layout(
     readings: list[Reading],
     size: tuple[int, int],
     now: datetime | None = None,
+    refresh_interval: int | None = None,
 ) -> MainLayout:
     """Lay out provider tiles in a grid plus a bottom status bar."""
     width, height = size
@@ -246,17 +247,26 @@ def build_main_layout(
     return MainLayout(
         size=size,
         tiles=tiles,
-        status_text=_status_text(readings, now),
+        status_text=_status_text(readings, now, refresh_interval),
         status_rect=status_rect,
         footer_note=footer_note,
     )
 
 
-def _status_text(readings: list[Reading], now: datetime | None) -> str:
+def _status_text(
+    readings: list[Reading],
+    now: datetime | None,
+    refresh_interval: int | None = None,
+) -> str:
     if not readings:
         return "Waiting for data…"
     latest = max(r.fetched_at for r in readings)
-    return f"Updated {latest.strftime('%H:%M:%S')} UTC · {len(readings)} providers"
+    local = fmt.to_local(latest)
+    text = f"Updated {local.strftime('%H:%M:%S')}"
+    if refresh_interval is not None:
+        text += f" · refresh {fmt.format_interval(refresh_interval)}"
+    text += f" · {len(readings)} providers"
+    return text
 
 
 def rotate_touch_norm(nx: float, ny: float, degrees: int) -> tuple[float, float]:
@@ -346,7 +356,11 @@ def _detail_lines(reading: Reading, now: datetime | None) -> list[DetailLine]:
             )
     lines.append(DetailLine("Status", reading.status.value, fmt.TEXT))
     lines.append(
-        DetailLine("Fetched", reading.fetched_at.strftime("%Y-%m-%d %H:%M:%S"), fmt.GRAY)
+        DetailLine(
+            "Fetched",
+            fmt.to_local(reading.fetched_at).strftime("%Y-%m-%d %H:%M:%S"),
+            fmt.GRAY,
+        )
     )
     return lines
 

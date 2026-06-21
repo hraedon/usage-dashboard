@@ -98,6 +98,18 @@ class TestMainLayout:
         layout = build_main_layout(_all_four(), _SIZE, now=_NOW)
         assert "4 providers" in layout.status_text
 
+    def test_status_text_shows_refresh_interval(self) -> None:
+        layout = build_main_layout(_all_four(), _SIZE, now=_NOW, refresh_interval=300)
+        assert "refresh 5m" in layout.status_text
+
+    def test_status_text_omits_refresh_when_none(self) -> None:
+        layout = build_main_layout(_all_four(), _SIZE, now=_NOW)
+        assert "refresh" not in layout.status_text
+
+    def test_status_text_not_utc(self) -> None:
+        layout = build_main_layout(_all_four(), _SIZE, now=_NOW)
+        assert "UTC" not in layout.status_text
+
     def test_empty_readings_safe(self) -> None:
         layout = build_main_layout([], _SIZE, now=_NOW)
         assert layout.tiles == []
