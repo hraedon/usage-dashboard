@@ -228,7 +228,13 @@ class DashboardGui:
             self._font_title.render(detail.title, True, fmt.TEXT), (pad, pad)
         )
         y = pad + self._font_title.get_height() + pad
+        bottom_limit = self._height - self._font_small.get_height() - pad * 2
         for line in detail.lines:
+            if y + self._font.get_height() > bottom_limit:
+                self._screen.blit(
+                    self._font.render("…", True, fmt.GRAY), (pad, y)
+                )
+                break
             label_surf = self._font.render(f"{line.label}:", True, line.color)
             self._screen.blit(label_surf, (pad, y))
             if line.value:
