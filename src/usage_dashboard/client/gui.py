@@ -73,6 +73,10 @@ class DashboardGui:
         self._font = pygame.font.Font(None, unit)
         self._font_small = pygame.font.Font(None, max(14, unit * 4 // 5))
         self._font_title = pygame.font.Font(None, unit * 5 // 4)
+        # Fixed width reserved on the right of every bar row for the reset text,
+        # sized to a worst-case countdown so the bar track always ends at the
+        # same x and never bleeds into "resets …".
+        self._reset_col_w = self._font.size("resets 23d 23h")[0]
 
     # -- event loop ---------------------------------------------------------
 
@@ -151,23 +155,31 @@ class DashboardGui:
         n = max(len(tile.bars), 1)
         row_h = (bottom - content_top) // n
         bar_h = max(8, row_h // 3)
+
+        # Fixed columns so every bar in the tile is the same length and the
+        # resets right-align: label column = widest label in this tile, reset
+        # column = the fixed sentinel width. The track ends before the reset
+        # column, so a 100% bar lands at that edge and never bleeds into it.
+        labels = [
+            self._font.render(
+                f"{(bar.account + ' · ') if bar.account else ''}"
+                f"{bar.label} {bar.percent_text}",
+                True, fmt.TEXT,
+            )
+            for bar in tile.bars
+        ]
+        label_col_w = max((s.get_width() for s in labels), default=0)
+        track_x = r.x + pad + label_col_w + pad
+        # Reserve the reset column (sentinel width) with a gap each side, so the
+        # bar ends before it and every reset starts at the same x, abutting the bar.
+        track_right = r.x + r.w - pad - self._reset_col_w - pad
+        reset_x = track_right + pad
+        track_w = track_right - track_x
+
         for i, bar in enumerate(tile.bars):
             cy = content_top + i * row_h + row_h // 2  # vertical centre of row
+            self._screen.blit(labels[i], (r.x + pad, cy - labels[i].get_height() // 2))
 
-            label_text = f"{bar.account} · {bar.label}" if bar.account else bar.label
-            label = self._font.render(f"{label_text} {bar.percent_text}", True, fmt.TEXT)
-            self._screen.blit(label, (r.x + pad, cy - label.get_height() // 2))
-
-            right_limit = r.x + r.w - pad
-            if bar.reset_text:
-                rc = fmt.YELLOW if bar.reset_highlight else fmt.GRAY
-                reset = self._font.render(f"resets {bar.reset_text}", True, rc)
-                rx = r.x + r.w - pad - reset.get_width()
-                self._screen.blit(reset, (rx, cy - reset.get_height() // 2))
-                right_limit = rx - pad
-
-            track_x = r.x + pad + label.get_width() + pad
-            track_w = right_limit - track_x
             if track_w > 20:
                 track_y = cy - bar_h // 2
                 pygame.draw.rect(
@@ -181,6 +193,12 @@ class DashboardGui:
                         self._screen, fill_color,
                         pygame.Rect(track_x, track_y, fill_w, bar_h), border_radius=4,
                     )
+
+            if bar.reset_text:
+                rc = fmt.YELLOW if bar.reset_highlight else fmt.GRAY
+                reset = self._font.render(f"resets {bar.reset_text}", True, rc)
+                # Left-aligned at a fixed x just past the bar, so resets line up.
+                self._screen.blit(reset, (reset_x, cy - reset.get_height() // 2))
 
     def _draw_detail(self, readings: list[Reading]) -> None:
         by_provider = {r.provider: r for r in readings}
