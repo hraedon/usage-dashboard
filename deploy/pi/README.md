@@ -1,45 +1,56 @@
 # Prepping a Pi — Raspberry Pi 4B + Touch Display 2
 
-The `usage-dashboard-gui` client is a fullscreen pygame app that renders the
-provider tiles straight on the panel via KMS/DRM — **no desktop session
-needed**. It polls the server's `/readings` API; **tap a tile** for a detail
-view, **tap again** to go back.
+The `usage-dashboard-gui` client is a fullscreen pygame app that shows the
+provider tiles on the panel. It polls the server's `/readings` API; **tap a
+tile** for a detail view, **tap again** to go back.
 
 Target hardware: **Raspberry Pi 4B (8 GB)** + the **official Raspberry Pi Touch
-Display 2** (5", 720×1280 portrait-native, DSI), on **Raspberry Pi OS Bookworm
+Display 2** (5", 720×1280 portrait-native, DSI), on **Raspberry Pi OS Trixie
 (Lite is fine)**.
+
+> **Why Trixie, and why an X server?** Two hard-won constraints, both validated
+> on real hardware:
+>
+> - **Python:** this package requires **Python ≥ 3.12**. Trixie ships 3.13;
+>   Bookworm ships 3.11 and the install will refuse. Use Trixie.
+> - **Display:** the GUI runs under a **minimal X server**, *not* bare KMS/DRM.
+>   SDL 2.32.10's `kmsdrm` backend cannot present to this panel — a full-screen
+>   fill stays **black** on both Bookworm and Trixie even though the DRM pipeline
+>   reports the framebuffer bound and active. Under a tiny X server (`xinit` +
+>   the GUI, no desktop) the same app paints correctly, and `xrandr` gives real
+>   landscape rotation. `install.sh` sets all of this up for you.
 
 ## TL;DR — one command
 
 On a freshly imaged Pi, as your normal login user:
 
 ```bash
-git clone https://github.com/hraedon/usage-dashboard.git
+git clone https://github.com/hraedon/usage-dashboard.git    # (git: sudo apt install -y git)
 cd usage-dashboard
-./deploy/pi/install.sh                    # landscape (rotate 90) by default
+./deploy/pi/install.sh                    # landscape (rotate=right) by default
 sudo nano /etc/usage-dashboard-gui.env    # set SERVER_URL + API_KEY, save, exit
-sudo reboot                               # applies rotation AND starts the dashboard
+sudo reboot                               # starts the dashboard
 ```
 
-That installs system deps, a venv, both systemd services + the auto-update
-timer, and the display-rotation/no-blank boot config. The dashboard does **not**
-run until that reboot (it needs the URL/key you set, and the rotation only takes
-effect on reboot) — so don't worry if `systemctl status` shows it inactive
-beforehand. Everything below is what the script does and how to vary it.
+That installs system deps (incl. the minimal X stack), a venv, the X-session
+launcher, the touch-rebind workaround, both systemd services + the auto-update
+timer. The dashboard does **not** run until that reboot (it needs the URL/key
+you set) — so don't worry if `systemctl status` shows it inactive beforehand.
 
-You can clone into any directory — the installer points the service at wherever
-this checkout actually lives.
+You can clone into any directory — the installer points the services at wherever
+this checkout actually lives. **Raspberry Pi OS Lite ships without `git`**; if
+the clone fails, `sudo apt-get install -y git` first (or let the first
+`install.sh` run, which installs it).
 
 ## 0. Image the SD card
 
-Use **Raspberry Pi OS (64-bit), Lite** — Lite is enough, and you *want* Lite,
-not Desktop: the GUI runs on bare KMS/DRM, and a Desktop image's Wayland
-compositor fights it for the display.
+Use **Raspberry Pi OS (64-bit), Lite, Trixie** — Lite is enough; you don't need
+(or want) the Desktop image, since `install.sh` brings up its own minimal X.
 
 Easiest is **Raspberry Pi Imager** → in the gear/⚙ "OS customisation" set the
-**hostname** (unique per unit, e.g. `usage-dash-01`), **username/password**,
-**Wi-Fi** (or Ethernet), and **enable SSH**. Imager writes the right first-boot
-files for whichever OS version you pick, so first boot needs no monitor.
+**hostname** (unique per unit), **username/password**, **Wi-Fi**, and **enable
+SSH**. Imager writes the right first-boot files for whichever OS you pick, so
+first boot needs no monitor.
 
 **Imaging headlessly (e.g. `dd` from another box)?** The first-boot mechanism
 changed by OS release — put the files at the boot-partition (FAT) root:
@@ -50,61 +61,61 @@ changed by OS release — put the files at the boot-partition (FAT) root:
   `custom.toml` is **ignored** on Trixie. Validate the YAML before unmounting;
   debug with `cloud-init status --long` + `/var/log/cloud-init.log`.
 - **Bookworm → `custom.toml`** (the `raspberrypi-sys-mods` firstboot format).
+  But note Bookworm's Python 3.11 won't install this package — prefer Trixie.
 
-The Touch Display 2 is auto-detected on Bookworm/Trixie — no driver install.
+The Touch Display 2 panel is auto-detected — no driver install. (Its **touch**
+controller needs the workaround in §4, which `install.sh` handles.)
 
 ## 1. Orientation (display **and** touch)
 
-The panel is **portrait-native (720×1280)**. We run it **landscape (1280×720)**
-by rotating 90°. Two things must rotate together:
-
-- **The image** — kernel KMS rotation in `/boot/firmware/cmdline.txt`:
-  ```
-  video=DSI-1:720x1280@60,rotate=90
-  ```
-  > The old `display_lcd_rotate=` / `display_rotate=` firmware options are
-  > **ignored** by the default KMS driver (`vc4-kms-v3d`) — don't use them.
-- **The touch** — there's no desktop compositor to apply a transform, so the
-  panel keeps reporting in its portrait frame. The GUI corrects this itself via
-  `GUI_TOUCH_ROTATE` (set in the service to match `rotate=`).
-
-`install.sh` sets both. To run **portrait** instead:
+The panel is **portrait-native (720×1280)**; we run it **landscape (1280×720)**.
+Under the X server this is one knob — `xrandr`'s rotation — and `install.sh`
+bakes it into the GUI service as `XRANDR_ROTATE` (default `right`):
 
 ```bash
-DISPLAY_ROTATE=0 GUI_TOUCH_ROTATE=0 ./deploy/pi/install.sh
+XRANDR_ROTATE=left ./deploy/pi/install.sh     # rotate the other way
 ```
 
-If after rebooting the **image** is rotated the wrong way, change `rotate=90` →
-`270` (or `180`) in `cmdline.txt`. If the image is right but **taps land
-mirrored / on the wrong tile**, change `GUI_TOUCH_ROTATE` in
-`/etc/systemd/system/usage-dashboard-gui.service` to match (try `270`), then
-`sudo systemctl daemon-reload && sudo systemctl restart usage-dashboard-gui`.
+Values: `normal | left | right | inverted`. The **touch** transform follows
+automatically — the session launcher (`usage-dashboard-xsession`) applies a
+matching `xinput` Coordinate Transformation Matrix, because libinput does *not*
+auto-rotate this Goodix device under bare modesetting. If the image is right but
+taps land 90° off, you picked a rotation whose matrix doesn't match; re-run with
+the opposite `XRANDR_ROTATE` (or edit it in
+`/etc/systemd/system/usage-dashboard-gui.service` and
+`daemon-reload && systemctl restart usage-dashboard-gui`).
+
+> The old kmsdrm-era knobs (`video=DSI-1:…rotate=N` in `cmdline.txt`,
+> `GUI_TOUCH_ROTATE`) are **not** used on the X path. The console may show
+> portrait for a second before X takes over — that's cosmetic.
 
 ## 2. What `install.sh` does
 
 Idempotent — safe to re-run. Run as your normal user (it uses `sudo` itself).
 
-1. `apt install git python3-venv python3-pip libgbm1 libdrm2`
+1. `apt install` the app deps **and** a minimal X stack (`xserver-xorg-core`,
+   `xserver-xorg-legacy`, `xserver-xorg-input-libinput`, `xinit`,
+   `x11-xserver-utils`, `xinput`) plus the mesa GBM/EGL/GLES libs
 2. adds you to the `video`, `render`, `input` groups (DRM + touch)
-3. clones/updates the repo to `~/usage-dashboard`
-4. creates a **venv** at `~/usage-dashboard/.venv` and installs `.[gui]`
-   — Bookworm refuses `pip install --user` (PEP 668 "externally-managed"), so a
-   venv is the supported path
+3. writes `/etc/X11/Xwrapper.config` so `xinit` can start X from a systemd
+   service that has no controlling tty
+4. clones/updates the repo and creates a **venv** at `…/.venv` with `.[gui]`
 5. installs `/etc/usage-dashboard-gui.env` (chmod 600; **never overwrites** an
    existing one)
-6. sets `video=DSI-1:…rotate=N` and `consoleblank=0` in `cmdline.txt`
-   (backs it up first; skips if already present)
-7. installs + enables the GUI service and the auto-update timer
+6. adds `consoleblank=0` to `cmdline.txt` (no rotation token — X handles that)
+7. installs the **touch rebind** script + `goodix-touch-rebind.service` (§4)
+8. installs the **X session launcher** to `/usr/local/bin/usage-dashboard-xsession`
+9. installs + enables the GUI service (xinit-wrapped) and the auto-update timer
 
-Config knobs (env vars): `DISPLAY_ROTATE`, `GUI_TOUCH_ROTATE`, `UPDATE_REF`,
-`APPDIR`, `REPO_URL` (use the SSH URL + a deploy key for a private repo).
+Config knobs (env vars): `XRANDR_ROTATE`, `UPDATE_REF`, `APPDIR`, `VENV`,
+`RUNUSER`, `REPO_URL` (use the SSH URL + a deploy key for a private repo).
 
 ## 3. Configure
 
 Edit `/etc/usage-dashboard-gui.env` (root-owned, `chmod 600`):
 
 ```ini
-SERVER_URL=http://<server-host>:8080
+SERVER_URL=https://<server-host>
 API_KEY=<the shared bearer token>     # same api-key the server uses
 # UPDATE_REF=main                     # or pin a tag, e.g. v0.2.0
 # GUI_FPS=10
@@ -112,34 +123,69 @@ API_KEY=<the shared bearer token>     # same api-key the server uses
 
 Then `sudo systemctl restart usage-dashboard-gui`.
 
-## 4. Operate
+## 4. Touch: the Goodix boot probe-race workaround
+
+The Touch Display 2 pairs an **ILI9881C** DSI panel with a **Goodix GT911**
+touch controller, and the touch IC is powered from the panel rail. At boot the
+Goodix I²C driver probes (~5.5 s) right around when the panel finishes binding
+(~6.0 s); when it loses that race it fails with:
+
+```
+Goodix-TS 10-005d: I2C communication failure: -5
+Goodix-TS 10-005d: probe with driver Goodix-TS failed with error -5
+```
+
+…and never retries, so **the touchscreen doesn't enumerate** (`/proc/bus/input/
+devices` shows no Goodix). Once the panel is powered, a manual driver *bind*
+succeeds. `goodix-touch-rebind.service` (oneshot, ordered `Before` the GUI) runs
+`goodix-touch-rebind.sh`, which retries the bind until the input node appears.
+
+Check it after boot:
 
 ```bash
-journalctl -u usage-dashboard-gui -f          # watch the GUI
+systemctl status goodix-touch-rebind.service     # active (exited)
+grep -i goodix /proc/bus/input/devices           # the touchscreen is present
+```
+
+If touch is ever missing on a running unit, `sudo systemctl start
+goodix-touch-rebind.service` rebinds it live.
+
+## 5. Operate
+
+```bash
+journalctl -u usage-dashboard-gui -f          # watch the GUI (+ its X server)
 systemctl status usage-dashboard-gui
 systemctl list-timers usage-dashboard-update.timer
 journalctl -u usage-dashboard-update --since today   # update history
 ```
 
-## 5. Auto-update
+The X server runs on **vt1**; the GUI service `Conflicts=getty@tty1.service` so
+X owns the panel.
+
+## 6. Auto-update
 
 A `usage-dashboard-update.timer` checks `git` every ~15 min (3 min after boot,
 with a randomised jitter so a fleet doesn't sync up). On each tick the updater:
 
 1. `git fetch`es the tracked ref (`UPDATE_REF`, default `main`);
 2. if nothing changed, **does nothing** (no restart);
-3. otherwise `reset --hard`s to it, reinstalls, runs an **import smoke check**,
-   and only then restarts the GUI;
-4. if the install or smoke check fails, it **rolls back** to the previous
-   commit and leaves the running app untouched.
+3. otherwise `reset --hard`s to it, reinstalls `.[gui]`, runs an **import smoke
+   check**, and only then restarts the GUI;
+4. if the install or smoke check fails, it **rolls back** to the previous commit
+   and leaves the running app untouched.
+
+> **Scope:** the updater only swaps the **Python app** and restarts the service.
+> It does **not** re-run `install.sh` or re-render systemd units / the X
+> launcher / the touch workaround. Changes to *those* (anything under
+> `deploy/pi/` except the app code) need a manual `install.sh` re-run on each
+> unit; pushing them to `main` will **not** disturb already-provisioned Pis.
 
 The updater runs from a stable copy at `/usr/local/bin/usage-dashboard-update`
-(so a `git reset` can't rewrite the script mid-run) and is allowed to restart
-just the GUI via a scoped `sudoers.d` drop-in.
+(so a `git reset` can't rewrite the script mid-run) and may restart just the GUI
+via a scoped `sudoers.d` drop-in.
 
 **Pin a fleet to a release:** set `UPDATE_REF=v0.2.0` in each
-`/etc/usage-dashboard-gui.env`. They'll hold there until you bump it — cut your
-release on GitHub, then change the ref (or push to `main` to roll everyone).
+`/etc/usage-dashboard-gui.env`. They'll hold there until you bump it.
 
 Force a check now:
 
@@ -151,7 +197,7 @@ journalctl -u usage-dashboard-update -n 20
 > Updates pull from GitHub over HTTPS, so the Pi needs outbound network and (for
 > a **private** repo) a deploy key — clone with the SSH `REPO_URL` in that case.
 
-## 6. Stop screen blanking
+## 7. Stop screen blanking
 
 `install.sh` adds `consoleblank=0`. If the backlight still dims when idle:
 

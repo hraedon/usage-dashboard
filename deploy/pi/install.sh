@@ -2,11 +2,17 @@
 # One-shot Pi bootstrap for the usage-dashboard touch GUI.
 #
 # Target: Raspberry Pi 4B + official Raspberry Pi Touch Display 2 (720x1280),
-# Raspberry Pi OS Bookworm (Lite is fine — no desktop needed).
+# Raspberry Pi OS *Trixie* (Lite is fine). Trixie ships Python 3.13; the package
+# requires >=3.12, so Bookworm's 3.11 will NOT install it without a newer Python.
+#
+# The GUI runs under a *minimal X server* (xinit), not bare KMS/DRM: SDL's
+# kmsdrm backend cannot present to this panel (black screen on every OS we
+# tried). install.sh sets up that X session, the landscape rotation, and a
+# workaround service for the Goodix touch controller's boot probe race.
 #
 # Idempotent: safe to re-run. Run as the normal login user (NOT root); it calls
 # sudo for the privileged bits. Override any default via env, e.g.:
-#   DISPLAY_ROTATE=270 GUI_TOUCH_ROTATE=270 ./install.sh
+#   XRANDR_ROTATE=left ./install.sh                                   # other way
 #   REPO_URL=git@github.com:hraedon/usage-dashboard.git ./install.sh   # private
 set -euo pipefail
 
@@ -19,12 +25,11 @@ APPDIR="${APPDIR:-$(git -C "$HERE" rev-parse --show-toplevel 2>/dev/null || echo
 VENV="${VENV:-$APPDIR/.venv}"
 RUNUSER="${RUNUSER:-$(id -un)}"
 UPDATE_REF="${UPDATE_REF:-main}"
-# Landscape by default (panel is portrait-native; 90 turns it to 1280x720).
-# Touch rotation must match the display rotation. Use 0 for portrait.
-DISPLAY_ROTATE="${DISPLAY_ROTATE:-90}"
-GUI_TOUCH_ROTATE="${GUI_TOUCH_ROTATE:-$DISPLAY_ROTATE}"
+# Landscape rotation, applied under X by xrandr (the panel is portrait-native).
+# One of: normal | left | right | inverted. Touch follows automatically.
+XRANDR_ROTATE="${XRANDR_ROTATE:-right}"
 
-# Bookworm puts these under /boot/firmware; older images use /boot.
+# Bookworm/Trixie put these under /boot/firmware; older images use /boot.
 CMDLINE="/boot/firmware/cmdline.txt"
 [ -f "$CMDLINE" ] || CMDLINE="/boot/cmdline.txt"
 ENV_FILE="/etc/usage-dashboard-gui.env"
@@ -36,8 +41,7 @@ if [ "$(id -u)" = 0 ]; then
 fi
 
 echo "==> usage-dashboard Pi setup"
-echo "    user=$RUNUSER  appdir=$APPDIR  ref=$UPDATE_REF"
-echo "    display rotate=$DISPLAY_ROTATE  touch rotate=$GUI_TOUCH_ROTATE"
+echo "    user=$RUNUSER  appdir=$APPDIR  ref=$UPDATE_REF  rotate=$XRANDR_ROTATE"
 # Prime sudo. Try the passwordless path first: a headless install over SSH (no
 # tty) where the user has NOPASSWD for commands but the %sudo group rule still
 # requires a password would otherwise fail here — `sudo -v` has no command to
@@ -47,17 +51,29 @@ sudo -n true 2>/dev/null || sudo -v
 # --- 1. system packages -----------------------------------------------------
 echo "==> apt packages"
 sudo apt-get update -qq
-# libgbm1/libdrm2 + the mesa EGL/GLES stack: SDL's kmsdrm backend creates its
-# scanout surface via GBM+EGL even for 2D, so without libegl1/libegl-mesa0/
-# libgles2 pygame dies with "EGL not initialized" on a bare-KMS (Lite) image.
-sudo apt-get install -y git python3-venv python3-pip \
-    libgbm1 libdrm2 libegl1 libegl-mesa0 libgles2
+# git/venv for the app; the mesa GBM/EGL/GLES stack for GL; and a minimal X
+# server + libinput input driver + xinit/xrandr/xinput for the X session that
+# actually drives this panel. xserver-xorg-legacy + the Xwrapper config below
+# let xinit start X from a systemd service that has no controlling tty.
+sudo apt-get install -y \
+    git python3-venv python3-pip \
+    libgbm1 libdrm2 libegl1 libegl-mesa0 libgles2 \
+    xserver-xorg-core xserver-xorg-legacy xserver-xorg-input-libinput \
+    xinit x11-xserver-utils xinput
 
 # --- 2. groups for DRM + touch ---------------------------------------------
 echo "==> groups (video render input)"
 sudo usermod -aG video,render,input "$RUNUSER"
 
-# --- 3. checkout ------------------------------------------------------------
+# --- 3. allow xinit to start X without a console session --------------------
+# The GUI service runs xinit over systemd (no tty/seat); permit the setuid
+# Xorg.wrap to start X for it.
+echo "==> Xwrapper.config (allow headless X start)"
+sudo install -d /etc/X11
+printf 'allowed_users=anybody\nneeds_root_rights=yes\n' \
+    | sudo tee /etc/X11/Xwrapper.config >/dev/null
+
+# --- 4. checkout ------------------------------------------------------------
 if [ -d "$APPDIR/.git" ]; then
     echo "==> updating checkout at $APPDIR"
     git -C "$APPDIR" fetch --quiet origin "$UPDATE_REF"
@@ -69,15 +85,15 @@ else
     git -C "$APPDIR" checkout --quiet "$UPDATE_REF"
 fi
 
-# --- 4. venv + install ------------------------------------------------------
-# Bookworm marks the system Python externally-managed (PEP 668), so a venv is
-# the supported way to install — `pip install --user` is refused there.
+# --- 5. venv + install ------------------------------------------------------
+# Trixie marks the system Python externally-managed (PEP 668), so a venv is the
+# supported way to install — `pip install --user` is refused there.
 echo "==> venv + install (.[gui])"
 [ -d "$VENV" ] || python3 -m venv "$VENV"
 "$VENV/bin/pip" install --quiet --upgrade pip
 ( cd "$APPDIR" && "$VENV/bin/pip" install --quiet -e '.[gui]' )
 
-# --- 5. env file (never clobber an existing one) ----------------------------
+# --- 6. env file (never clobber an existing one) ----------------------------
 if [ ! -f "$ENV_FILE" ]; then
     echo "==> installing $ENV_FILE (EDIT SERVER_URL + API_KEY)"
     sudo cp "$HERE/usage-dashboard-gui.env.example" "$ENV_FILE"
@@ -87,40 +103,42 @@ else
     echo "==> $ENV_FILE exists, leaving it"
 fi
 
-# --- 6. display: rotation + no console blanking -----------------------------
+# --- 7. display: stop console blanking --------------------------------------
+# Rotation is handled under X by xrandr (step 9), not the kernel cmdline, so we
+# only need to keep the backlight from blanking. The console stays portrait-
+# native; that's cosmetic (it's only visible for a second before X takes over).
 if [ ! -f "$CMDLINE" ]; then
     echo "==> WARNING: no cmdline.txt found (looked in /boot/firmware and /boot)."
-    echo "    Skipping display rotation + blanking config; set it by hand later."
-    echo "    See deploy/pi/README.md section 1."
+    echo "    Skipping consoleblank config; set it by hand later if the panel dims."
 else
     echo "==> display config ($CMDLINE)"
-    add_cmdline_token() {
-        local tok="$1"
-        if grep -qF -- "$tok" "$CMDLINE"; then
-            echo "    already set: $tok"
-        else
-            sudo cp "$CMDLINE" "$CMDLINE.bak.$(date +%s)"
-            # cmdline.txt must stay a single line; append space-separated.
-            sudo sed -i "1 s|\$| $tok|" "$CMDLINE"
-            echo "    added: $tok"
-        fi
-    }
-    if grep -q "video=DSI-1" "$CMDLINE" && ! grep -qF "rotate=$DISPLAY_ROTATE" "$CMDLINE"; then
-        echo "    NOTE: a different video=DSI-1 line is already present; leaving it."
-        echo "          Edit $CMDLINE by hand if the rotation is wrong."
+    if grep -qF -- "consoleblank=0" "$CMDLINE"; then
+        echo "    already set: consoleblank=0"
     else
-        add_cmdline_token "video=DSI-1:720x1280@60,rotate=$DISPLAY_ROTATE"
+        sudo cp "$CMDLINE" "$CMDLINE.bak.$(date +%s)"
+        sudo sed -i "1 s|\$| consoleblank=0|" "$CMDLINE"
+        echo "    added: consoleblank=0"
     fi
-    add_cmdline_token "consoleblank=0"
 fi
 
-# --- 7. systemd units (fill placeholders, install, enable) ------------------
+# --- 8. touch probe-race workaround -----------------------------------------
+echo "==> Goodix touch rebind (boot probe-race workaround)"
+sudo install -m 0755 "$HERE/goodix-touch-rebind.sh" /usr/local/bin/goodix-touch-rebind.sh
+sudo cp "$HERE/goodix-touch-rebind.service" "$UNIT_DIR/goodix-touch-rebind.service"
+
+# --- 9. X session launcher --------------------------------------------------
+echo "==> X session launcher"
+sed -e "s|@VENV@|$VENV|g" "$HERE/usage-dashboard-xsession" \
+    | sudo tee /usr/local/bin/usage-dashboard-xsession >/dev/null
+sudo chmod 0755 /usr/local/bin/usage-dashboard-xsession
+
+# --- 10. systemd units (fill placeholders, install, enable) -----------------
 echo "==> systemd units"
 render_unit() {  # render_unit <src> <dst>
     sed -e "s|@RUNUSER@|$RUNUSER|g" \
         -e "s|@APPDIR@|$APPDIR|g" \
         -e "s|@VENV@|$VENV|g" \
-        -e "s|@TOUCH_ROTATE@|$GUI_TOUCH_ROTATE|g" \
+        -e "s|@XRANDR_ROTATE@|$XRANDR_ROTATE|g" \
         "$1" | sudo tee "$2" >/dev/null
 }
 render_unit "$HERE/usage-dashboard-gui.service"    "$UNIT_DIR/usage-dashboard-gui.service"
@@ -138,9 +156,10 @@ echo "$RUNUSER ALL=(root) NOPASSWD: /usr/bin/systemctl restart usage-dashboard-g
 sudo chmod 440 /etc/sudoers.d/usage-dashboard-update
 
 sudo systemctl daemon-reload
-# Enable (don't start yet): the GUI needs SERVER_URL/API_KEY first, and the
-# reboot below applies the display rotation and starts it cleanly. The update
-# timer is safe to start now.
+# Enable (don't start yet): the GUI needs SERVER_URL/API_KEY first, and a reboot
+# brings the whole chain (touch rebind -> X -> GUI) up cleanly. The touch rebind
+# and update timer are safe to enable now.
+sudo systemctl enable goodix-touch-rebind.service
 sudo systemctl enable usage-dashboard-gui.service
 sudo systemctl enable --now usage-dashboard-update.timer
 
@@ -152,7 +171,7 @@ echo " 1. Set the server URL + key:"
 echo "      sudo nano $ENV_FILE"
 echo "    (fill in SERVER_URL and API_KEY, save with Ctrl-O Enter, exit Ctrl-X)"
 echo
-echo " 2. Reboot to apply the display rotation and start the dashboard:"
+echo " 2. Reboot to start the dashboard (touch rebind -> X -> GUI):"
 echo "      sudo reboot"
 echo "------------------------------------------------------------"
 echo " After reboot, watch it with:"
