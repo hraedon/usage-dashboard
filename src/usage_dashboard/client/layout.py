@@ -67,6 +67,7 @@ class MainLayout:
     tiles: list[TileSpec]
     status_text: str
     status_rect: Rect
+    footer_note: str = ""  # quota-less provider (umans) summary, shown by the status bar
 
 
 @dataclass(frozen=True)
@@ -171,14 +172,24 @@ def build_main_layout(
             primary = by_provider.get(Provider.CLAUDE) or by_provider.get(Provider.CLAUDE_WORK)
             if primary is not None:
                 tile_plan.append((Provider.CLAUDE, primary))
+        elif provider is Provider.UMANS:
+            # umans is quota-less; it goes in the footer, not a tile (see below).
+            continue
         elif provider in by_provider:
             tile_plan.append((provider, by_provider[provider]))
 
+    # umans summary for the status-bar footer (quota-less: just its detail).
+    umans = by_provider.get(Provider.UMANS)
+    footer_note = ""
+    if umans is not None:
+        footer_note = f"UMANS {umans.detail}".strip() if umans.detail else "UMANS"
+
     margin = max(4, round(width * 0.02))
-    status_h = max(18, round(height * 0.08))
+    status_h = max(18, round(height * 0.10))
     grid_h = height - status_h - margin
 
-    cols, rows = _grid_dimensions(len(tile_plan)) if tile_plan else (1, 1)
+    # Single-column vertical stack.
+    cols, rows = (1, max(len(tile_plan), 1))
     cell_w = (width - margin * (cols + 1)) // cols
     cell_h = (grid_h - margin * (rows + 1)) // max(rows, 1)
 
@@ -219,6 +230,7 @@ def build_main_layout(
         tiles=tiles,
         status_text=_status_text(readings, now),
         status_rect=status_rect,
+        footer_note=footer_note,
     )
 
 

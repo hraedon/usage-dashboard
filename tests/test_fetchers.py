@@ -280,6 +280,28 @@ class TestFetchOllama:
         assert reading.stale is False
 
     @patch("usage_dashboard.server.fetch_ollama.httpx.Client")
+    def test_fetch_ollama_weekly_reset_far_after_label(self, mock_client_cls):
+        # On the live page the weekly bar renders a long row of segment <button>s
+        # between "Weekly usage" and its "Resets in …" text (~4.6k chars), and
+        # it's the last section so nothing bounds the block. The reset must still
+        # be parsed — i.e. _BLOCK_MAX_CHARS stays comfortably above that gap.
+        filler = '<button class="seg"></button>' * 200  # ~5.8k chars
+        html = f"""
+        <html><body><span>Cloud Usage</span><span>Pro</span>
+        <div><h3>Session usage</h3><span>10.0% used</span>
+          <span>Resets in <time data-time="2026-06-21T20:00:00Z">28m</time></span></div>
+        <div><h3>Weekly usage</h3><span>33.1% used</span>
+          {filler}
+          <span>Resets in <time data-time="2026-06-22T00:00:00Z">4h</time></span></div>
+        </body></html>
+        """
+        self._mock_get(mock_client_cls, text=html)
+
+        reading = fetch_ollama_usage("session=abc123")
+        assert reading.weekly_percent == 33.1
+        assert reading.weekly_resets_at == datetime(2026, 6, 22, 0, 0, 0)
+
+    @patch("usage_dashboard.server.fetch_ollama.httpx.Client")
     def test_fetch_ollama_parses_relative_reset_text(self, mock_client_cls):
         # The real settings page renders "Resets in N hours/days" text, not a
         # data-time attribute (WI-005). Reset times should be computed from it.

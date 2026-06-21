@@ -68,10 +68,11 @@ class DashboardGui:
         self._state = ViewState()
         self._running = True
         # Fonts scaled to the panel so the same code reads on any resolution.
-        unit = max(12, self._height // 24)
+        # Sized for a 5" panel read at arm's length — bigger than a desktop UI.
+        unit = max(18, self._height // 15)
         self._font = pygame.font.Font(None, unit)
-        self._font_small = pygame.font.Font(None, max(10, unit * 3 // 4))
-        self._font_title = pygame.font.Font(None, unit * 3 // 2)
+        self._font_small = pygame.font.Font(None, max(14, unit * 4 // 5))
+        self._font_title = pygame.font.Font(None, unit * 5 // 4)
 
     # -- event loop ---------------------------------------------------------
 
@@ -120,9 +121,17 @@ class DashboardGui:
     def _draw_main(self, layout: MainLayout) -> None:
         for tile in layout.tiles:
             self._draw_tile(tile)
-        status = self._font_small.render(layout.status_text, True, fmt.GRAY)
         sr = layout.status_rect
+        status = self._font_small.render(layout.status_text, True, fmt.GRAY)
         self._screen.blit(status, (sr.x + 8, sr.y + (sr.h - status.get_height()) // 2))
+        # Quota-less umans summary sits in the status bar, next to the timer.
+        if layout.footer_note:
+            note = self._font_title.render(layout.footer_note, True, fmt.TEXT)
+            self._screen.blit(
+                note,
+                (sr.x + sr.w - note.get_width() - 12,
+                 sr.y + (sr.h - note.get_height()) // 2),
+            )
 
     def _draw_tile(self, tile: TileSpec) -> None:
         r = tile.rect
@@ -130,47 +139,48 @@ class DashboardGui:
         pygame.draw.rect(self._screen, _TILE_BG, rect, border_radius=8)
         pygame.draw.rect(self._screen, tile.accent, rect, width=2, border_radius=8)
 
-        pad = max(6, r.w // 20)
-        self._screen.blit(
-            self._font.render(tile.title, True, fmt.TEXT), (r.x + pad, r.y + pad)
-        )
+        # Pad off the smaller dimension so wide, short stacked tiles aren't
+        # over-padded (r.w//20 was huge once tiles span the full width).
+        pad = max(8, min(r.w, r.h) // 12)
+        title_surf = self._font_title.render(tile.title, True, fmt.TEXT)
+        self._screen.blit(title_surf, (r.x + pad, r.y + pad))
 
-        if tile.detail is not None:
-            det = self._font_small.render(tile.detail, True, fmt.GRAY)
-            self._screen.blit(det, (r.x + pad, r.y + r.h // 2))
-            return
-
-        # Two stacked bars in the lower portion of the tile.
-        bar_top = r.y + pad + self._font.get_height() + pad
-        row_h = (r.y + r.h - pad - bar_top) // max(len(tile.bars), 1)
-        track_x = r.x + pad
-        track_w = r.w - pad * 2
-        bar_h = max(6, row_h // 4)
+        # One horizontal row per bar: "Session 49%" | track | "resets 3h 38m".
+        content_top = r.y + pad + title_surf.get_height() + pad // 2
+        bottom = r.y + r.h - pad
+        n = max(len(tile.bars), 1)
+        row_h = (bottom - content_top) // n
+        bar_h = max(8, row_h // 3)
         for i, bar in enumerate(tile.bars):
-            row_y = bar_top + i * row_h
-            # Tag a second account's bars (e.g. "work · Session"); single
-            # account leaves account empty, so the label is unchanged.
+            cy = content_top + i * row_h + row_h // 2  # vertical centre of row
+
             label_text = f"{bar.account} · {bar.label}" if bar.account else bar.label
-            label = self._font_small.render(
-                f"{label_text} {bar.percent_text}", True, fmt.TEXT
-            )
-            self._screen.blit(label, (track_x, row_y))
-            track_y = row_y + label.get_height() + 2
-            pygame.draw.rect(
-                self._screen, fmt.BAR_BG,
-                pygame.Rect(track_x, track_y, track_w, bar_h), border_radius=3,
-            )
-            fill_w = max(0, int(track_w * bar.fraction))
-            if fill_w > 0:
-                fill_color = fmt.mute(bar.color) if bar.muted else bar.color
-                pygame.draw.rect(
-                    self._screen, fill_color,
-                    pygame.Rect(track_x, track_y, fill_w, bar_h), border_radius=3,
-                )
+            label = self._font.render(f"{label_text} {bar.percent_text}", True, fmt.TEXT)
+            self._screen.blit(label, (r.x + pad, cy - label.get_height() // 2))
+
+            right_limit = r.x + r.w - pad
             if bar.reset_text:
-                color = fmt.YELLOW if bar.reset_highlight else fmt.GRAY
-                reset = self._font_small.render(f"resets {bar.reset_text}", True, color)
-                self._screen.blit(reset, (track_x, track_y + bar_h + 2))
+                rc = fmt.YELLOW if bar.reset_highlight else fmt.GRAY
+                reset = self._font.render(f"resets {bar.reset_text}", True, rc)
+                rx = r.x + r.w - pad - reset.get_width()
+                self._screen.blit(reset, (rx, cy - reset.get_height() // 2))
+                right_limit = rx - pad
+
+            track_x = r.x + pad + label.get_width() + pad
+            track_w = right_limit - track_x
+            if track_w > 20:
+                track_y = cy - bar_h // 2
+                pygame.draw.rect(
+                    self._screen, fmt.BAR_BG,
+                    pygame.Rect(track_x, track_y, track_w, bar_h), border_radius=4,
+                )
+                fill_w = max(0, int(track_w * bar.fraction))
+                if fill_w > 0:
+                    fill_color = fmt.mute(bar.color) if bar.muted else bar.color
+                    pygame.draw.rect(
+                        self._screen, fill_color,
+                        pygame.Rect(track_x, track_y, fill_w, bar_h), border_radius=4,
+                    )
 
     def _draw_detail(self, readings: list[Reading]) -> None:
         by_provider = {r.provider: r for r in readings}
