@@ -15,14 +15,20 @@ from usage_dashboard.shared.models import Provider, ReadingStatus
 
 
 def _claude_response_data():
+    # Mirrors the live /api/oauth/usage shape observed 2026-06-21: the window
+    # blocks carry `utilization` + `resets_at` (the old `utilization_percent` +
+    # `reset_time` names were dropped). Extra keys (limits[], spend, dollar
+    # fields) are present in real responses and ignored by the parser.
     return {
         "five_hour": {
-            "utilization_percent": 65.0,
-            "reset_time": "2026-01-15T10:00:00Z",
+            "utilization": 65.0,
+            "resets_at": "2026-01-15T10:00:00Z",
+            "limit_dollars": None,
         },
         "seven_day": {
-            "utilization_percent": 45.0,
-            "reset_time": "2026-01-19T00:00:00Z",
+            "utilization": 45.0,
+            "resets_at": "2026-01-19T00:00:00Z",
+            "limit_dollars": None,
         },
     }
 

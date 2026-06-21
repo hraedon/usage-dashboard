@@ -95,13 +95,13 @@ def fetch_claude_usage(access_token: str) -> Reading:
     try:
         five_hour = data["five_hour"]
         seven_day = data["seven_day"]
-        session_percent: float | None = float(five_hour["utilization_percent"])
+        session_percent: float | None = float(five_hour["utilization"])
         session_resets_at = _to_naive_utc(
-            datetime.fromisoformat(five_hour["reset_time"]).replace(tzinfo=timezone.utc)
+            datetime.fromisoformat(five_hour["resets_at"]).replace(tzinfo=timezone.utc)
         )
-        weekly_percent: float | None = float(seven_day["utilization_percent"])
+        weekly_percent: float | None = float(seven_day["utilization"])
         weekly_resets_at = _to_naive_utc(
-            datetime.fromisoformat(seven_day["reset_time"]).replace(tzinfo=timezone.utc)
+            datetime.fromisoformat(seven_day["resets_at"]).replace(tzinfo=timezone.utc)
         )
     except (KeyError, ValueError, TypeError) as exc:
         raise FetchError(f"Claude usage response parse error: {type(exc).__name__}") from exc
