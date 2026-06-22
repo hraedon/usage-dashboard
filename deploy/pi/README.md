@@ -119,9 +119,19 @@ SERVER_URL=https://<server-host>
 API_KEY=<the shared bearer token>     # same api-key the server uses
 # UPDATE_REF=main                     # or pin a tag, e.g. v0.2.0
 # GUI_FPS=10
+# BACKLIGHT_SLEEP=1                    # blank the panel on a schedule (tap to wake)
+# UNIT_ID=mpmusageNN                   # this unit's key in the schedules ConfigMap
+# BACKLIGHT_SCHEDULE=daily 00:00-08:00; fri 18:00-mon 08:00   # local fallback
 ```
 
 Then `sudo systemctl restart usage-dashboard-gui`.
+
+> **Backlight sleep** is opt-in: set `BACKLIGHT_SLEEP=1` (and a `UNIT_ID` so the
+> server can hand this unit its schedule). The panel dims its `brightness` to 0
+> on schedule and wakes on a tap until the next sleep boundary. See the main
+> [README](../../README.md#backlight-sleep-schedule) for the schedule grammar
+> and the server-side ConfigMap. This is distinct from §7 below, which only
+> stops the *console* from blanking before X takes over.
 
 ## 4. Touch: the Goodix boot probe-race workaround
 

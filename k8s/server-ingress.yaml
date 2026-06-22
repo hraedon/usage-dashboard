@@ -1,31 +1,58 @@
-# Internal ingress for the usage dashboard.
+# Ingress for the usage dashboard. The live cluster splits this across two
+# ingresses, mirrored here; fill in the CHANGE-ME host / TLS / class values to
+# match your setup (hostnames are left as placeholders because this repo is
+# public).
 #
-# The /dashboard view is unauthenticated by design (it exposes usage stats
-# only, never credentials), so this is intended for an INTERNAL hostname.
-# /readings stays bearer-protected regardless.
+# 1. EXTERNAL — the API the Pi clients poll. Exposes ONLY the bearer-protected
+#    paths: /readings and /schedule. Do NOT add / here (that would expose the
+#    unauthenticated /dashboard externally). Both endpoints require the Bearer
+#    token, so they're safe on an external host.
+#    NOTE: /schedule must be listed here — clients fetch their backlight schedule
+#    from it; omitting it silently falls clients back to their built-in default.
 #
-# Before applying, fill in the three CHANGE-ME values to match your cluster
-# (clone the pattern from an existing app's ingress — e.g. cert-watch):
-#   1. ingressClassName  — your controller (nginx / traefik / ...)
-#   2. host              — the internal DNS name you'll create
-#   3. tls               — the cert source (cert-manager annotation + secret,
-#                          or a pre-provisioned TLS secret). Delete the tls
-#                          block and the annotation to serve plain HTTP.
+# 2. INTERNAL — the full app (incl. the unauthenticated /dashboard at `/`) on an
+#    internal-only host.
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
-  name: usage-dashboard
+  name: usage-dashboard-readings-ext
   namespace: usage-dashboard
-  annotations:
-    # If you use cert-manager, point this at your issuer; otherwise remove it
-    # and reference a pre-made secret in the tls block below.
-    cert-manager.io/cluster-issuer: "CHANGE-ME-issuer"
 spec:
-  ingressClassName: CHANGE-ME-ingress-class
+  ingressClassName: CHANGE-ME-external-ingress-class
+  tls:
+    - hosts:
+        - CHANGE-ME.example.com
+      secretName: usage-dashboard-ext-tls
+  rules:
+    - host: CHANGE-ME.example.com
+      http:
+        paths:
+          - path: /readings
+            pathType: Prefix
+            backend:
+              service:
+                name: usage-dashboard-server
+                port:
+                  number: 8080
+          - path: /schedule
+            pathType: Prefix
+            backend:
+              service:
+                name: usage-dashboard-server
+                port:
+                  number: 8080
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: usage-dashboard-ui-int
+  namespace: usage-dashboard
+spec:
+  ingressClassName: CHANGE-ME-internal-ingress-class
   tls:
     - hosts:
         - CHANGE-ME.internal.example.com
-      secretName: usage-dashboard-tls
+      secretName: usage-dashboard-int-tls
   rules:
     - host: CHANGE-ME.internal.example.com
       http:
