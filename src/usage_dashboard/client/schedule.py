@@ -14,8 +14,11 @@ the *earlier of* (a) the current contiguous sleep period's natural end, or
 """
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import datetime, time, timedelta
+
+logger = logging.getLogger(__name__)
 
 _DAY = 24 * 60
 _WEEK = 7 * _DAY  # minutes in a week
@@ -110,6 +113,35 @@ def parse_schedule(spec: str) -> "SleepSchedule":
 def default_sleep_schedule() -> "SleepSchedule":
     """The fleet default (plans/002), parsed from ``DEFAULT_SCHEDULE_SPEC``."""
     return parse_schedule(DEFAULT_SCHEDULE_SPEC)
+
+
+class ScheduleResolver:
+    """Resolves the active :class:`SleepSchedule` from, in priority order, the
+    server-delivered spec, a local env override, then the built-in default.
+
+    Re-parses only when the chosen spec string changes (so the GUI can call it
+    every frame cheaply), and on a malformed spec keeps the previously-good
+    schedule rather than crashing or going un-scheduled. This is what lets a
+    remote ConfigMap edit take effect on the client's next poll without a
+    restart.
+    """
+
+    def __init__(self, env_spec: str | None = None) -> None:
+        self._env_spec = env_spec or None
+        self._cached_spec: str | None = None
+        self._schedule: SleepSchedule = parse_schedule(DEFAULT_SCHEDULE_SPEC)
+
+    def resolve(self, server_spec: str | None) -> SleepSchedule:
+        chosen = (server_spec or None) or self._env_spec or DEFAULT_SCHEDULE_SPEC
+        if chosen != self._cached_spec:
+            self._cached_spec = chosen  # set first so a bad spec isn't retried each call
+            try:
+                self._schedule = parse_schedule(chosen)
+                logger.info("active sleep schedule: %s", chosen)
+            except ValueError as exc:
+                logger.warning("ignoring bad schedule spec %r (%s); keeping previous",
+                               chosen, exc)
+        return self._schedule
 
 
 class SleepSchedule:

@@ -90,9 +90,14 @@ spec:
               value: "300"
             - name: PORT
               value: "8080"
+            - name: SCHEDULES_DIR
+              value: "/etc/usage-dashboard/schedules"
           volumeMounts:
             - name: data
               mountPath: /data
+            - name: schedules
+              mountPath: /etc/usage-dashboard/schedules
+              readOnly: true
           livenessProbe:
             httpGet:
               path: /health
@@ -103,3 +108,10 @@ spec:
         - name: data
           persistentVolumeClaim:
             claimName: server-data
+        # Per-unit backlight schedules. Optional: if the ConfigMap is absent the
+        # mount is empty and the server serves no schedule (clients fall back to
+        # their own default). Edit the ConfigMap + rollout restart to update.
+        - name: schedules
+          configMap:
+            name: usage-dashboard-schedules
+            optional: true

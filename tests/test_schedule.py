@@ -6,6 +6,7 @@ import pytest
 
 from usage_dashboard.client.schedule import (
     DEFAULT_SCHEDULE_SPEC,
+    ScheduleResolver,
     SleepSchedule,
     SleepWindow,
     default_sleep_schedule,
@@ -124,6 +125,42 @@ class TestParseSchedule:
     def test_malformed_raises_value_error(self, spec: str) -> None:
         with pytest.raises(ValueError):
             parse_schedule(spec)
+
+
+class TestScheduleResolver:
+    def test_default_when_no_server_or_env(self) -> None:
+        r = ScheduleResolver()
+        s = r.resolve(None)
+        # Behaves like the fleet default.
+        assert s.is_asleep(_dt(TUE, 2)) is True
+        assert s.is_asleep(_dt(TUE, 12)) is False
+
+    def test_server_spec_takes_priority(self) -> None:
+        r = ScheduleResolver(env_spec="daily 01:00-02:00")
+        s = r.resolve("daily 00:00-08:00")  # server wins
+        assert s.is_asleep(_dt(TUE, 3)) is True   # in server window
+        assert s.is_asleep(_dt(TUE, 1, 30)) is True
+
+    def test_env_used_when_server_absent(self) -> None:
+        r = ScheduleResolver(env_spec="daily 09:00-10:00")
+        s = r.resolve(None)
+        assert s.is_asleep(_dt(TUE, 9, 30)) is True
+        assert s.is_asleep(_dt(TUE, 3)) is False
+
+    def test_remote_change_applies_on_next_resolve(self) -> None:
+        r = ScheduleResolver()
+        first = r.resolve("daily 00:00-08:00")
+        assert first.is_asleep(_dt(TUE, 3)) is True
+        second = r.resolve("daily 12:00-13:00")  # server pushed a new schedule
+        assert second.is_asleep(_dt(TUE, 3)) is False
+        assert second.is_asleep(_dt(TUE, 12, 30)) is True
+
+    def test_bad_server_spec_keeps_previous(self) -> None:
+        r = ScheduleResolver()
+        good = r.resolve("daily 00:00-08:00")
+        kept = r.resolve("daily 99:99-08:00")  # malformed -> keep previous
+        assert kept is good
+        assert kept.is_asleep(_dt(TUE, 3)) is True
 
 
 class TestSimpleWindow:
