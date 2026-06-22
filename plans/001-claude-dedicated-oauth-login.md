@@ -2,7 +2,7 @@
 
 **Status:** implemented 2026-06-14 (`usage-dashboard login claude`).
 **Known bug:** the browser-login path currently fails with "invalid response" at
-code-exchange — see `breadcrumbs/active/BC-001`. Workaround in use (manual login
+code-exchange — see agent-notes **WI-013**. Workaround in use (manual login
 on a separate VM → tokens into the Secret).
 **Tracking:** WI-009
 
