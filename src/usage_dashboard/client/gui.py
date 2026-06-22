@@ -14,11 +14,13 @@ import logging
 import os
 import signal
 import sys
+from datetime import datetime
 from typing import Any
 
 import pygame
 
 from usage_dashboard.client import format as fmt
+from usage_dashboard.client.backlight import Backlight
 from usage_dashboard.client.fetcher import ClientFetcher
 from usage_dashboard.client.layout import (
     DetailLayout,
@@ -30,6 +32,7 @@ from usage_dashboard.client.layout import (
     rotate_touch_norm,
     tap_transition,
 )
+from usage_dashboard.client.schedule import SleepSchedule, default_sleep_schedule
 from usage_dashboard.shared.models import Provider, Reading
 
 logger = logging.getLogger(__name__)
@@ -44,6 +47,10 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _env_bool(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
 class DashboardGui:
     """Owns the pygame window, fonts, view state, and render loop."""
 
@@ -53,6 +60,8 @@ class DashboardGui:
         size: tuple[int, int],
         fps: int = 10,
         touch_rotate: int = 0,
+        sleep_schedule: SleepSchedule | None = None,
+        backlight: Backlight | None = None,
     ) -> None:
         self._fetcher = fetcher
         screen = pygame.display.get_surface()
@@ -67,6 +76,15 @@ class DashboardGui:
         self._clock = pygame.time.Clock()
         self._state = ViewState()
         self._running = True
+        # Backlight sleep schedule (None = never sleep). While the panel is dark
+        # the loop keeps running to catch the wake tap, but skips drawing; a tap
+        # sets _wake_until (the schedule's deadline) and wakes the panel.
+        self._schedule = sleep_schedule
+        self._backlight = backlight if backlight is not None else Backlight()
+        self._wake_until: datetime | None = None
+        self._dark = False
+        # While dark we tick slowly to save CPU but still pump touch events.
+        self._sleep_fps = 4
         # Fonts scaled to the panel so the same code reads on any resolution.
         # Sized for a 5" panel read at arm's length — bigger than a desktop UI.
         unit = max(18, self._height // 15)
@@ -94,7 +112,10 @@ class DashboardGui:
             return int(nx * self._width), int(ny * self._height)
         return None
 
-    def _handle_events(self, layout: MainLayout) -> None:
+    def _handle_events(
+        self, layout: MainLayout, swallow_wake: bool = False,
+        now: datetime | None = None,
+    ) -> None:
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 self._running = False
@@ -104,24 +125,48 @@ class DashboardGui:
                 self._running = False
             else:
                 pos = self._tap_position(event)
-                if pos is not None:
-                    self._state = tap_transition(self._state, layout, pos)
+                if pos is None:
+                    continue
+                if swallow_wake:
+                    # Panel is dark: a tap only wakes it (held until the
+                    # schedule's deadline); it is NOT routed into a tile.
+                    if self._schedule is not None and now is not None:
+                        self._wake_until = self._schedule.wake_until(now)
+                    continue
+                self._state = tap_transition(self._state, layout, pos)
+
+    def _is_dark(self, now: datetime) -> bool:
+        """True if the panel should be blanked now (asleep and not tap-woken)."""
+        if self._schedule is None:
+            return False
+        if self._wake_until is not None and now < self._wake_until:
+            return False
+        return self._schedule.is_asleep(now)
 
     def run(self) -> None:
         while self._running:
+            now = datetime.now()  # local wall clock for the sleep schedule
+            if self._wake_until is not None and now >= self._wake_until:
+                self._wake_until = None
+            dark = self._is_dark(now)
+            self._dark = dark
             readings = self._fetcher.get_latest_readings()
             layout = build_main_layout(
                 readings, (self._width, self._height),
                 refresh_interval=self._fetcher.current_interval,
             )
-            self._handle_events(layout)
-            self._screen.fill(fmt.BG)
-            if self._state.detail_provider is None:
-                self._draw_main(layout)
-            else:
-                self._draw_detail(readings)
-            pygame.display.flip()
-            self._clock.tick(self._fps)
+            # While dark, a tap wakes (sets _wake_until) instead of navigating.
+            self._handle_events(layout, swallow_wake=dark, now=now)
+            dark = self._is_dark(now)  # a wake tap may have just cleared it
+            self._backlight.set_power(on=not dark)
+            if not dark:
+                self._screen.fill(fmt.BG)
+                if self._state.detail_provider is None:
+                    self._draw_main(layout)
+                else:
+                    self._draw_detail(readings)
+                pygame.display.flip()
+            self._clock.tick(self._fps if not dark else self._sleep_fps)
 
     # -- rendering ----------------------------------------------------------
 
@@ -280,11 +325,17 @@ def main() -> None:
 
     size = _init_display()
     fetcher = ClientFetcher(server_url=server_url, api_key=api_key)
+    # Backlight sleep is opt-in (BACKLIGHT_SLEEP=1) so an auto-update rollout
+    # doesn't start blanking panels until each unit is configured and the
+    # backlight node is confirmed writable. Defaults to the fleet schedule
+    # (nightly + weekend); Slice 2 will let the server override it per unit.
+    sleep_schedule = default_sleep_schedule() if _env_bool("BACKLIGHT_SLEEP") else None
     gui = DashboardGui(
         fetcher,
         size,
         fps=_env_int("GUI_FPS", 10),
         touch_rotate=_env_int("GUI_TOUCH_ROTATE", 0),
+        sleep_schedule=sleep_schedule,
     )
 
     def _handle_sigterm(signum: int, frame: Any) -> None:
