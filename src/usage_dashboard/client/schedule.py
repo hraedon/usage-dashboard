@@ -49,12 +49,67 @@ def _at(day: int, hour: int, minute: int = 0) -> int:
     return day * _DAY + hour * 60 + minute
 
 
+_DAYS = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
+
+# The fleet default, as a spec string (the same format the server delivers and
+# the BACKLIGHT_SCHEDULE env override accepts). Nightly 00:00-08:00 plus a
+# weekend block Fri 18:00 -> Mon 08:00.
+DEFAULT_SCHEDULE_SPEC = "daily 00:00-08:00; fri 18:00-mon 08:00"
+
+
+def _parse_hhmm(text: str) -> int:
+    """``HH:MM`` -> minutes past midnight (0..1439)."""
+    hh, mm = text.strip().split(":")
+    h, m = int(hh), int(mm)
+    if not (0 <= h < 24 and 0 <= m < 60):
+        raise ValueError(f"bad time {text!r}")
+    return h * 60 + m
+
+
+def _parse_rule(rule: str) -> list[SleepWindow]:
+    """One ``;``-separated rule -> its sleep window(s).
+
+    Two forms:
+      ``daily HH:MM-HH:MM``           applied to all seven days
+      ``<day> HH:MM-<day> HH:MM``     a single span (may cross days/the week)
+    A daily window whose end <= start crosses midnight into the next day.
+    """
+    body = rule.strip()
+    lower = body.lower()
+    if lower.startswith("daily "):
+        start_s, end_s = body[len("daily "):].split("-")
+        s, e = _parse_hhmm(start_s), _parse_hhmm(end_s)
+        out: list[SleepWindow] = []
+        for d in range(7):
+            start = d * _DAY + s
+            end = d * _DAY + e + (_DAY if e <= s else 0)  # cross-midnight -> next day
+            out.append(SleepWindow(start, end))
+        return out
+    left, right = body.split("-")
+    sd, st = left.split()
+    ed, et = right.split()
+    start = _DAYS[sd.lower()] * _DAY + _parse_hhmm(st)
+    end = _DAYS[ed.lower()] * _DAY + _parse_hhmm(et)
+    return [SleepWindow(start, end)]
+
+
+def parse_schedule(spec: str) -> "SleepSchedule":
+    """Build a :class:`SleepSchedule` from a spec string. Raises ``ValueError``
+    on a malformed spec (so a bad remote/env value can be rejected and the
+    caller fall back to a known-good schedule)."""
+    windows: list[SleepWindow] = []
+    for raw in spec.split(";"):
+        if raw.strip():
+            try:
+                windows.extend(_parse_rule(raw))
+            except (ValueError, KeyError) as exc:
+                raise ValueError(f"bad schedule rule {raw.strip()!r}: {exc}") from exc
+    return SleepSchedule(windows)
+
+
 def default_sleep_schedule() -> "SleepSchedule":
-    """The fleet default (plans/002): nightly 00:00-08:00 every day, plus a
-    weekend block Fri 18:00 -> Mon 08:00."""
-    nightly = [SleepWindow(_at(d, 0), _at(d, 8)) for d in range(7)]
-    weekend = SleepWindow(_at(4, 18), _at(0, 8))  # Fri 18:00 -> Mon 08:00 (wraps)
-    return SleepSchedule([*nightly, weekend])
+    """The fleet default (plans/002), parsed from ``DEFAULT_SCHEDULE_SPEC``."""
+    return parse_schedule(DEFAULT_SCHEDULE_SPEC)
 
 
 class SleepSchedule:

@@ -2,10 +2,14 @@ from __future__ import annotations
 
 from datetime import datetime
 
+import pytest
+
 from usage_dashboard.client.schedule import (
+    DEFAULT_SCHEDULE_SPEC,
     SleepSchedule,
     SleepWindow,
     default_sleep_schedule,
+    parse_schedule,
 )
 
 # Reference week: Mon 2026-06-22 .. Sun 2026-06-28 (weekday() 0..6).
@@ -74,6 +78,52 @@ class TestTapToWakeRule:
         # The contiguous weekend sleep period runs to the *following* Mon 08:00
         # (2026-06-29), even though nightly windows are nested inside it.
         assert self.s.current_window_end(_dt(SAT, 14, 0)) == datetime(2026, 6, 29, 8, 0)
+
+
+class TestParseSchedule:
+    def test_default_spec_matches_programmatic_default(self) -> None:
+        # The spec-parsed default must behave identically to the fleet default
+        # across a representative set of moments.
+        s = parse_schedule(DEFAULT_SCHEDULE_SPEC)
+        d = default_sleep_schedule()
+        for moment in (
+            _dt(TUE, 2), _dt(TUE, 8), _dt(TUE, 12),
+            _dt(FRI, 17, 59), _dt(FRI, 18), _dt(SAT, 14), _dt(MON, 7, 59), _dt(MON, 8),
+        ):
+            assert s.is_asleep(moment) == d.is_asleep(moment)
+            assert s.wake_until(moment) == d.wake_until(moment)
+
+    def test_daily_window(self) -> None:
+        s = parse_schedule("daily 00:00-08:00")
+        assert s.is_asleep(_dt(TUE, 3)) is True
+        assert s.is_asleep(_dt(SAT, 3)) is True   # every day
+        assert s.is_asleep(_dt(TUE, 9)) is False
+
+    def test_daily_window_crossing_midnight(self) -> None:
+        s = parse_schedule("daily 22:00-06:00")
+        assert s.is_asleep(_dt(TUE, 23)) is True
+        assert s.is_asleep(_dt(TUE, 2)) is True    # spilled from Monday night
+        assert s.is_asleep(_dt(TUE, 12)) is False
+
+    def test_span_rule(self) -> None:
+        s = parse_schedule("fri 18:00-mon 08:00")
+        assert s.is_asleep(_dt(SAT, 12)) is True
+        assert s.is_asleep(_dt(FRI, 12)) is False
+        assert s.is_asleep(_dt(MON, 9)) is False
+
+    def test_whitespace_and_empty_rules_tolerated(self) -> None:
+        s = parse_schedule(" daily 00:00-08:00 ;  ; ")
+        assert s.is_asleep(_dt(TUE, 3)) is True
+
+    @pytest.mark.parametrize("spec", [
+        "daily 25:00-08:00",   # bad hour
+        "daily 00:00",         # missing range
+        "funday 1-2",          # unknown day
+        "fri 18:00-08:00",     # span missing end day
+    ])
+    def test_malformed_raises_value_error(self, spec: str) -> None:
+        with pytest.raises(ValueError):
+            parse_schedule(spec)
 
 
 class TestSimpleWindow:
