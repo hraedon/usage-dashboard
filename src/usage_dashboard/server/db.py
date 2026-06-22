@@ -32,6 +32,7 @@ class Database:
                     consecutive_failures INTEGER NOT NULL DEFAULT 0,
                     detail TEXT,
                     models TEXT,
+                    throttle TEXT NOT NULL DEFAULT 'none',
                     PRIMARY KEY (provider)
                 )
                 """
@@ -50,6 +51,14 @@ class Database:
             if "models" not in columns:
                 try:
                     self._conn.execute("ALTER TABLE readings ADD COLUMN models TEXT")
+                except sqlite3.OperationalError as exc:
+                    if "duplicate column" not in str(exc):
+                        raise
+            if "throttle" not in columns:
+                try:
+                    self._conn.execute(
+                        "ALTER TABLE readings ADD COLUMN throttle TEXT NOT NULL DEFAULT 'none'"
+                    )
                 except sqlite3.OperationalError as exc:
                     if "duplicate column" not in str(exc):
                         raise
@@ -72,8 +81,8 @@ class Database:
                 """
                 INSERT INTO readings (provider, status, session_percent, session_resets_at,
                                       weekly_percent, weekly_resets_at, fetched_at, stale,
-                                      consecutive_failures, detail, models)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                      consecutive_failures, detail, models, throttle)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(provider) DO UPDATE SET
                     status = excluded.status,
                     session_percent = excluded.session_percent,
@@ -84,7 +93,8 @@ class Database:
                     stale = excluded.stale,
                     consecutive_failures = excluded.consecutive_failures,
                     detail = excluded.detail,
-                    models = excluded.models
+                    models = excluded.models,
+                    throttle = excluded.throttle
                 """,
                 (
                     reading.provider.value,
@@ -98,6 +108,7 @@ class Database:
                     consecutive_failures,
                     reading.detail,
                     models_json,
+                    reading.throttle,
                 ),
             )
             self._conn.commit()
@@ -120,6 +131,7 @@ class Database:
                 "stale": bool(row["stale"]),
                 "detail": row["detail"],
                 "models": json.loads(row["models"]) if row["models"] else None,
+                "throttle": row["throttle"],
             }
             reading = Reading.from_dict(data)
             result[reading.provider] = reading

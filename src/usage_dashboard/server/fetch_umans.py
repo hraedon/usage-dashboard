@@ -5,7 +5,14 @@ from datetime import datetime, timezone
 import httpx
 
 from usage_dashboard.server.fetch_types import FetchError
-from usage_dashboard.shared.models import Provider, Reading, ReadingStatus
+from usage_dashboard.shared.models import (
+    THROTTLE_BOXED,
+    THROTTLE_LOW,
+    THROTTLE_NONE,
+    Provider,
+    Reading,
+    ReadingStatus,
+)
 
 _UMANS_USAGE_URL = "https://api.code.umans.ai/v1/usage"
 _TIMEOUT = 30.0
@@ -53,6 +60,24 @@ def fetch_umans_usage(api_key: str) -> Reading:
             if resets_raw is not None
             else None
         )
+
+        # priority is umans' only severity signal (it has no usage quota).
+        # boxed_until = penalty box: the account is locked for the window (worst,
+        # so it wins). low = deprioritised routing, e.g. over the concurrency
+        # threshold. Neither = normal.
+        priority = usage.get("priority") or {}
+        priority = priority if isinstance(priority, dict) else {}
+        boxed_until = priority.get("boxed_until")
+        if boxed_until is not None:
+            throttle = THROTTLE_BOXED
+            # While boxed, the box-clear time is the only meaningful reset and
+            # the request/token metrics are moot, so surface boxed_until as the
+            # reading's reset; the client shows a live countdown in their place.
+            resets_at = _to_naive_utc(datetime.fromisoformat(str(boxed_until)))
+        elif priority.get("low"):
+            throttle = THROTTLE_LOW
+        else:
+            throttle = THROTTLE_NONE
     except (KeyError, ValueError, TypeError, AttributeError) as exc:
         raise FetchError(f"umans usage response parse error: {type(exc).__name__}") from exc
 
@@ -68,4 +93,5 @@ def fetch_umans_usage(api_key: str) -> Reading:
         fetched_at=datetime.now(timezone.utc).replace(tzinfo=None),
         stale=False,
         detail=detail,
+        throttle=throttle,
     )

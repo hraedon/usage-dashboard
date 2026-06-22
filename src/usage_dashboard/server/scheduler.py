@@ -19,6 +19,7 @@ from usage_dashboard.server.fetch_umans import fetch_umans_usage
 from usage_dashboard.server.fetch_zai import fetch_zai_usage
 from usage_dashboard.server.token_store import TokenStore
 from usage_dashboard.shared.models import (
+    THROTTLE_BOXED,
     Provider,
     Reading,
     make_offline_reading,
@@ -171,7 +172,14 @@ class FetchScheduler:
     ) -> None:
         sched = self._schedule(provider)
         recovered = previous is None or previous.stale
-        if recovered or self._reading_changed(previous, reading):  # type: ignore[arg-type]
+        if reading.throttle == THROTTLE_BOXED:
+            # While the account is in the penalty box the reading is unchanged
+            # poll-to-poll (boxed_until is fixed), which would let the idle
+            # ladder widen the gap to ~30m. Pin to the floor instead so the box
+            # clearing is caught on the next scan and the metrics return promptly.
+            new_interval = self._poll_floor
+            reason = "boxed"
+        elif recovered or self._reading_changed(previous, reading):  # type: ignore[arg-type]
             new_interval = self._poll_floor
             reason = "recovered" if recovered else "changed"
         else:

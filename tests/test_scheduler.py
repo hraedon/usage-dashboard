@@ -8,6 +8,7 @@ from usage_dashboard.server.fetch_types import FetchError
 from usage_dashboard.server.scheduler import FetchScheduler
 from usage_dashboard.server.token_store import TokenStore
 from usage_dashboard.shared.models import (
+    THROTTLE_BOXED,
     Provider,
     Reading,
     ReadingStatus,
@@ -496,6 +497,24 @@ class TestIdleLadder:
             session_resets_at=None, weekly_resets_at=None, detail="req 11 tok 1.2M",
         )
         scheduler._fetch_one(Provider.UMANS, MagicMock(return_value=r2))
+        assert _interval(scheduler, Provider.UMANS) == 300
+
+    def test_boxed_reading_stays_at_floor(self, tmp_path):
+        # An unchanged reading normally lets the idle ladder widen the gap, but a
+        # boxed (penalty-box) reading must keep polling at the floor so the box
+        # clearing is caught on the next scan.
+        db = Database(str(tmp_path / "sched.db"))
+        db.initialize()
+        scheduler = FetchScheduler(db, umans_key="key", interval_seconds=300)
+        boxed = _make_reading(
+            provider=Provider.UMANS, session_percent=None, weekly_percent=None,
+            session_resets_at=datetime(2026, 1, 14, 17, 0, 0), weekly_resets_at=None,
+            detail="req 10 tok 1M", throttle=THROTTLE_BOXED,
+        )
+        # Identical boxed reading three scans running — would widen to 900 if the
+        # idle ladder applied; instead it stays pinned at the 300s floor.
+        for _ in range(3):
+            scheduler._fetch_one(Provider.UMANS, MagicMock(return_value=boxed))
         assert _interval(scheduler, Provider.UMANS) == 300
 
 
