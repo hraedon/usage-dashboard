@@ -91,11 +91,16 @@ owns the loop, the touch events, and is the X foreground app. No new process.
 - Server change (Slice 2) is an image rebuild + `kubectl rollout restart`,
   same as any server change.
 
-## Open questions / to confirm on-device
-- Exact `/sys/class/backlight/<name>/` device on the Touch Display 2, and that a
-  `video`-group process can write `bl_power` (~10s: `ls /sys/class/backlight` +
-  a test `echo`). If udev doesn't grant it, add a one-line udev rule in
-  `install.sh`.
+## On-device findings (confirmed 2026-06-22 on mpmusage01/02)
+- Device is `/sys/class/backlight/panel_backlight@1`. `bl_power` is **root-only**
+  (`-rw-r--r-- root root`), but `brightness` is **`video`-group writable**
+  (`-rw-rw-r-- root video`, range 0–31). The GUI user (`itadmin`) is in `video`.
+- `brightness=0` is **fully dark** (verified by eye), so we drive `brightness`
+  (off=0, wake=prior level) — no udev rule, no privileged helper, no `install.sh`
+  re-run; ships over the client auto-update path. The real `backlight.py` was
+  exercised against the live panel (15→0→15, redundant write skipped).
+
+## Open questions / to confirm
 - Whether to also pause server polling while asleep (power vs. instant-fresh on
   wake). Lean: pause, refresh once on wake.
 - Schedule spec format (keep it small): e.g.
