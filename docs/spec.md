@@ -37,6 +37,13 @@ for the planned pieces):
 **Reading schema** now also carries `detail`, `models`, and `throttle` (the §6
 schema shows only the original fields).
 
+**Not built:** history/trends (Phase 2). Storage is **latest-only** — the
+`readings` table is keyed by provider and each fetch overwrites the row — so the
+§6 "configurable retention 7 days" assumption does not hold; trends would need a
+separate append/time-series table or a `(provider, fetched_at)` key plus a prune
+job. The `login claude` browser flow is also currently broken
+(`breadcrumbs/active/BC-001`); the workaround is a manual login elsewhere.
+
 **Resolved open questions (§13):** z.ai `unit` mappings and the Claude
 `seven_day` reset timestamp are both resolved in the implementation.
 
