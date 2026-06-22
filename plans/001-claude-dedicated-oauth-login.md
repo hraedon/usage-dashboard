@@ -1,6 +1,9 @@
 # Plan 001 — Dedicated Claude OAuth login (don't share the interactive session)
 
-**Status:** implemented 2026-06-14 (`usage-dashboard login claude`)
+**Status:** implemented 2026-06-14 (`usage-dashboard login claude`).
+**Known bug:** the browser-login path currently fails with "invalid response" at
+code-exchange — see `breadcrumbs/active/BC-001`. Workaround in use (manual login
+on a separate VM → tokens into the Secret).
 **Tracking:** WI-009
 
 > **Landed:** PKCE login CLI (loopback + manual `CODE#STATE` paste), with the
