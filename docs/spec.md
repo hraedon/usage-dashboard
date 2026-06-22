@@ -42,7 +42,7 @@ schema shows only the original fields).
 §6 "configurable retention 7 days" assumption does not hold; trends would need a
 separate append/time-series table or a `(provider, fetched_at)` key plus a prune
 job. The `login claude` browser flow is also currently broken
-(`breadcrumbs/active/BC-001`); the workaround is a manual login elsewhere.
+(agent-notes WI-013); the workaround is a manual login elsewhere.
 
 **Resolved open questions (§13):** z.ai `unit` mappings and the Claude
 `seven_day` reset timestamp are both resolved in the implementation.
