@@ -29,6 +29,18 @@ uv venv && uv pip install -e ".[dev]"
 
 - **Spec acceptance criteria are the boundary.** Don't add features beyond the spec without a tracked breadcrumb or plan entry.
 
-## Active breadcrumbs
+## Work items / breadcrumbs
 
-Check `breadcrumbs/active/` for active work items. Resolved items move to `breadcrumbs/resolved/`.
+Tracking lives in the **agent-notes** DB (the canonical store), not the
+`breadcrumbs/` dir (which is legacy scaffold, empty, and safe to delete). Use the
+CLI, resolving the project by path:
+
+```bash
+agent-notes orient --path .                 # open work items, recent changes, memories
+agent-notes work-item find --path .         # list/search work items
+agent-notes work-item file  --path . --title "…" --type bug --severity medium
+agent-notes work-item get   WI-XXX --path . --with-body
+agent-notes work-item close WI-XXX --path .
+```
+
+Don't add features beyond the spec without a tracked work item or `plans/` entry.
