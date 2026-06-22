@@ -32,7 +32,7 @@ from usage_dashboard.client.layout import (
     rotate_touch_norm,
     tap_transition,
 )
-from usage_dashboard.client.schedule import SleepSchedule, default_sleep_schedule
+from usage_dashboard.client.schedule import ScheduleResolver, SleepSchedule
 from usage_dashboard.shared.models import Provider, Reading
 
 logger = logging.getLogger(__name__)
@@ -60,7 +60,7 @@ class DashboardGui:
         size: tuple[int, int],
         fps: int = 10,
         touch_rotate: int = 0,
-        sleep_schedule: SleepSchedule | None = None,
+        schedule_resolver: ScheduleResolver | None = None,
         backlight: Backlight | None = None,
     ) -> None:
         self._fetcher = fetcher
@@ -76,10 +76,13 @@ class DashboardGui:
         self._clock = pygame.time.Clock()
         self._state = ViewState()
         self._running = True
-        # Backlight sleep schedule (None = never sleep). While the panel is dark
-        # the loop keeps running to catch the wake tap, but skips drawing; a tap
-        # sets _wake_until (the schedule's deadline) and wakes the panel.
-        self._schedule = sleep_schedule
+        # Backlight sleep. _resolver None = never sleep. When set, each loop
+        # resolves the active schedule (server spec > env > default) so a remote
+        # change takes effect without a restart. While dark the loop keeps
+        # running to catch the wake tap but skips drawing; a tap sets _wake_until
+        # (the schedule's deadline) and wakes the panel.
+        self._resolver = schedule_resolver
+        self._schedule: SleepSchedule | None = None
         self._backlight = backlight if backlight is not None else Backlight()
         self._wake_until: datetime | None = None
         self._dark = False
@@ -146,6 +149,13 @@ class DashboardGui:
     def run(self) -> None:
         while self._running:
             now = datetime.now()  # local wall clock for the sleep schedule
+            # Resolve the active schedule each frame so a remote schedule change
+            # (picked up by the fetcher) takes effect without a restart.
+            self._schedule = (
+                self._resolver.resolve(self._fetcher.current_schedule_spec)
+                if self._resolver is not None
+                else None
+            )
             if self._wake_until is not None and now >= self._wake_until:
                 self._wake_until = None
             dark = self._is_dark(now)
@@ -324,18 +334,27 @@ def main() -> None:
         sys.exit(1)
 
     size = _init_display()
-    fetcher = ClientFetcher(server_url=server_url, api_key=api_key)
     # Backlight sleep is opt-in (BACKLIGHT_SLEEP=1) so an auto-update rollout
     # doesn't start blanking panels until each unit is configured and the
-    # backlight node is confirmed writable. Defaults to the fleet schedule
-    # (nightly + weekend); Slice 2 will let the server override it per unit.
-    sleep_schedule = default_sleep_schedule() if _env_bool("BACKLIGHT_SLEEP") else None
+    # backlight node is confirmed writable. When enabled, the active schedule is
+    # resolved each frame from the server (per UNIT_ID) > BACKLIGHT_SCHEDULE env
+    # > built-in default, so a remote ConfigMap edit applies without a restart.
+    sleep_enabled = _env_bool("BACKLIGHT_SLEEP")
+    unit_id = os.environ.get("UNIT_ID") or None
+    fetcher = ClientFetcher(
+        server_url=server_url, api_key=api_key,
+        unit_id=unit_id, fetch_schedule=sleep_enabled,
+    )
+    resolver = (
+        ScheduleResolver(env_spec=os.environ.get("BACKLIGHT_SCHEDULE") or None)
+        if sleep_enabled else None
+    )
     gui = DashboardGui(
         fetcher,
         size,
         fps=_env_int("GUI_FPS", 10),
         touch_rotate=_env_int("GUI_TOUCH_ROTATE", 0),
-        sleep_schedule=sleep_schedule,
+        schedule_resolver=resolver,
     )
 
     def _handle_sigterm(signum: int, frame: Any) -> None:

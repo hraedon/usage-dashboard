@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 from datetime import datetime
+from unittest.mock import MagicMock, patch
+
+import httpx
 
 from usage_dashboard.client.fetcher import ClientFetcher
 from usage_dashboard.shared.models import Provider, Reading, ReadingStatus
@@ -123,3 +126,35 @@ class TestAdaptiveInterval:
         new = [_make_reading()]
         fetcher._update_interval(new)
         assert fetcher._interval == 60
+
+
+class TestSchedulePolling:
+    def _resp(self, payload):
+        r = MagicMock()
+        r.raise_for_status = MagicMock()
+        r.json.return_value = payload
+        return r
+
+    @patch("usage_dashboard.client.fetcher.httpx.get")
+    def test_poll_schedule_sets_spec_and_sends_unit(self, mock_get):
+        mock_get.return_value = self._resp({"schedule": "daily 00:00-08:00"})
+        f = ClientFetcher("http://srv", "key", unit_id="mpmusage02", fetch_schedule=True)
+        f._poll_schedule()
+        assert f.current_schedule_spec == "daily 00:00-08:00"
+        # unit id passed through as the ?unit= query param
+        assert mock_get.call_args.kwargs["params"] == {"unit": "mpmusage02"}
+
+    @patch("usage_dashboard.client.fetcher.httpx.get")
+    def test_poll_schedule_null_when_server_has_none(self, mock_get):
+        mock_get.return_value = self._resp({"schedule": None})
+        f = ClientFetcher("http://srv", "key", fetch_schedule=True)
+        f._poll_schedule()
+        assert f.current_schedule_spec is None
+
+    @patch("usage_dashboard.client.fetcher.httpx.get")
+    def test_poll_schedule_error_keeps_previous(self, mock_get):
+        f = ClientFetcher("http://srv", "key", unit_id="u1", fetch_schedule=True)
+        f._schedule_spec = "daily 00:00-08:00"  # previously good
+        mock_get.side_effect = httpx.ConnectError("down")
+        f._poll_schedule()
+        assert f.current_schedule_spec == "daily 00:00-08:00"  # not clobbered
