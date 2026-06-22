@@ -2,8 +2,48 @@
 
 **Spec Level:** 2
 **Desired Level:** 3
-**Date:** 2026-06-11
+**Date:** 2026-06-11 (original elicitation)
 **Extensions active:** None
+
+---
+
+## 0. Status — implementation has moved beyond this spec
+
+This section was added 2026-06-22. Everything below it is the **original
+2026-06-11 elicitation**, kept as the record of intent; it is no longer an
+accurate description of the shipped system. The MVP (FR-01–FR-14, all three
+original providers) was delivered, then extended well past the original scope.
+
+**Shipped beyond this spec** (see `README.md` for current behaviour, `plans/`
+for the planned pieces):
+
+- **umans** as a 4th provider — quota-less, rendered via `Reading.detail`, with
+  a `throttle` severity (none/low/boxed) that colours its line and shows a
+  penalty-box countdown. *(No spec/plan entry — added directly.)*
+- **Second Claude account** (work login) — merged into the Claude tile as a
+  muted second set of bars. *(No spec/plan entry.)*
+- **Dedicated Claude OAuth login** replacing the `~/.claude/.credentials.json`
+  assumption — see `plans/001`. Resolves the §14 token-longevity assumption.
+- **Cookie-based Ollama auth** (human-in-the-loop Playwright CLI), not
+  email/password — resolves the §13 open question; §6/§14 still say
+  email/password.
+- **Primary display is a Pi 4B + Touch Display 2** (720×1280, pygame under a
+  minimal X server), not the Pi Zero / ST7789 240×320 of §9/§14 (now the legacy
+  PNG client). Adds per-model breakdown, local-timezone display, and
+  **scheduled backlight sleep + tap-to-wake** with server-served per-unit
+  schedules — see `plans/002` and the `/schedule` endpoint.
+- **Responsive web `/dashboard`** — listed *out of scope* in §3, but built.
+
+**Reading schema** now also carries `detail`, `models`, and `throttle` (the §6
+schema shows only the original fields).
+
+**Resolved open questions (§13):** z.ai `unit` mappings and the Claude
+`seven_day` reset timestamp are both resolved in the implementation.
+
+> Governance note: per `AGENTS.md`, features beyond the spec are supposed to land
+> with a breadcrumb or plan entry. Several above (umans, 2nd Claude account,
+> model breakdown, web dashboard) did not — hence this reconciliation. A full
+> rewrite to a current Level-3 spec is the cleaner long-term fix if desired.
 
 ---
 
