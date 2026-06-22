@@ -32,6 +32,15 @@ class ReadingStatus(Enum):
     OFFLINE = "offline"
 
 
+# Throttle severity for quota-less providers (umans), which have no percentage
+# to colour by. "low" = deprioritised routing (e.g. exceeded the concurrency
+# threshold); "boxed" = penalty box, the account is locked for the window. Worse
+# states win, so a provider that is both low and boxed reports "boxed".
+THROTTLE_NONE = "none"
+THROTTLE_LOW = "low"
+THROTTLE_BOXED = "boxed"
+
+
 @dataclass(frozen=True, slots=True)
 class ModelUsage:
     """A single model/tool's share of a provider's usage.
@@ -91,6 +100,9 @@ class Reading:
     stale: bool
     detail: str | None = None
     models: list[ModelUsage] | None = None
+    # Throttle severity (THROTTLE_NONE/LOW/BOXED). Quota-less providers use this
+    # as their only severity signal, since they have no percentage to colour by.
+    throttle: str = THROTTLE_NONE
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -104,6 +116,7 @@ class Reading:
             "stale": self.stale,
             "detail": self.detail,
             "models": [m.to_dict() for m in self.models] if self.models else None,
+            "throttle": self.throttle,
         }
 
     @classmethod
@@ -123,6 +136,7 @@ class Reading:
                 if data.get("models")
                 else None
             ),
+            throttle=data.get("throttle", THROTTLE_NONE) or THROTTLE_NONE,
         )
 
 

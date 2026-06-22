@@ -13,7 +13,13 @@ from dataclasses import dataclass, field
 from datetime import datetime
 
 from usage_dashboard.client import format as fmt
-from usage_dashboard.shared.models import ModelUsage, Provider, Reading
+from usage_dashboard.shared.models import (
+    THROTTLE_BOXED,
+    THROTTLE_LOW,
+    ModelUsage,
+    Provider,
+    Reading,
+)
 
 # Fixed tile order so a provider always lands in the same place frame to frame.
 # CLAUDE_WORK is intentionally absent: it has no tile of its own — it folds into
@@ -69,6 +75,7 @@ class MainLayout:
     status_text: str
     status_rect: Rect
     footer_note: str = ""  # quota-less provider (umans) summary, shown by the status bar
+    footer_color: Color = fmt.TEXT  # yellow=low priority, red=penalty box
 
 
 @dataclass(frozen=True)
@@ -194,8 +201,21 @@ def build_main_layout(
     # umans summary for the status-bar footer (quota-less: just its detail).
     umans = by_provider.get(Provider.UMANS)
     footer_note = ""
+    footer_color = fmt.TEXT
     if umans is not None:
-        footer_note = f"UMANS {umans.detail}".strip() if umans.detail else "UMANS"
+        # umans has no quota to colour by; throttle severity is its signal.
+        # boxed (account locked) = red, low priority = yellow, else default.
+        if umans.throttle == THROTTLE_BOXED:
+            # Replace the (now-moot) req/tok metrics with a countdown to when
+            # the penalty box clears.
+            text, _ = fmt.format_countdown(umans.session_resets_at, now)
+            footer_note = f"UMANS boxed {text}".strip()
+            footer_color = fmt.RED
+        elif umans.throttle == THROTTLE_LOW:
+            footer_note = f"UMANS {umans.detail}".strip() if umans.detail else "UMANS"
+            footer_color = fmt.YELLOW
+        else:
+            footer_note = f"UMANS {umans.detail}".strip() if umans.detail else "UMANS"
 
     margin = max(4, round(width * 0.02))
     status_h = max(18, round(height * 0.10))
@@ -251,6 +271,7 @@ def build_main_layout(
         status_text=_status_text(readings, now, refresh_interval),
         status_rect=status_rect,
         footer_note=footer_note,
+        footer_color=footer_color,
     )
 
 
