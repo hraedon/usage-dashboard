@@ -11,7 +11,13 @@ from usage_dashboard.server.fetch_ollama import _parse_relative_reset, fetch_oll
 from usage_dashboard.server.fetch_types import FetchAuthError, FetchError
 from usage_dashboard.server.fetch_umans import _format_tokens, fetch_umans_usage
 from usage_dashboard.server.fetch_zai import fetch_zai_usage
-from usage_dashboard.shared.models import Provider, ReadingStatus
+from usage_dashboard.shared.models import (
+    THROTTLE_BOXED,
+    THROTTLE_LOW,
+    THROTTLE_NONE,
+    Provider,
+    ReadingStatus,
+)
 
 
 def _claude_response_data():
@@ -147,6 +153,54 @@ class TestFetchClaude:
             assert False, "Should have raised FetchError"
         except FetchError:
             pass
+
+    @patch("usage_dashboard.server.fetch_claude.httpx.Client")
+    def test_fetch_claude_idle_window_yields_none_not_stale(self, mock_client_cls):
+        # When there's been no Claude activity in the trailing five hours, the
+        # /oauth/usage endpoint returns the window's utilization/resets_at as
+        # null. float(None) used to raise TypeError -> the tile went stale until
+        # activity resumed. The idle window must parse to None and stay CURRENT.
+        data = _claude_response_data()
+        data["five_hour"] = {
+            "utilization": None,
+            "resets_at": None,
+            "limit_dollars": None,
+        }
+        mock_response = MagicMock()
+        mock_response.json.return_value = data
+        mock_response.raise_for_status = MagicMock()
+        mock_client = MagicMock()
+        mock_client.get.return_value = mock_response
+        mock_client.__enter__ = MagicMock(return_value=mock_client)
+        mock_client.__exit__ = MagicMock(return_value=False)
+        mock_client_cls.return_value = mock_client
+
+        reading = fetch_claude_usage("test-token")
+        assert reading.status is ReadingStatus.CURRENT
+        assert reading.stale is False
+        assert reading.session_percent is None
+        assert reading.session_resets_at is None
+        # The still-populated weekly window is unaffected.
+        assert reading.weekly_percent == 45.0
+
+    @patch("usage_dashboard.server.fetch_claude.httpx.Client")
+    def test_fetch_claude_null_block_yields_none(self, mock_client_cls):
+        # The whole window block may also come back as null.
+        data = _claude_response_data()
+        data["five_hour"] = None
+        mock_response = MagicMock()
+        mock_response.json.return_value = data
+        mock_response.raise_for_status = MagicMock()
+        mock_client = MagicMock()
+        mock_client.get.return_value = mock_response
+        mock_client.__enter__ = MagicMock(return_value=mock_client)
+        mock_client.__exit__ = MagicMock(return_value=False)
+        mock_client_cls.return_value = mock_client
+
+        reading = fetch_claude_usage("test-token")
+        assert reading.status is ReadingStatus.CURRENT
+        assert reading.session_percent is None
+        assert reading.session_resets_at is None
 
     @patch("usage_dashboard.server.fetch_claude.httpx.Client")
     def test_fetch_claude_sends_authorization_header(self, mock_client_cls):
@@ -589,6 +643,57 @@ class TestFetchUmans:
 
         assert reading.session_resets_at is None
         assert reading.detail == "req 161  tok 63.9M"
+
+    @patch("usage_dashboard.server.fetch_umans.httpx.Client")
+    def test_throttle_none_by_default(self, mock_client_cls):
+        # No priority block (or priority.low false) -> not throttled.
+        _mock_umans_client(mock_client_cls, _umans_response_data())
+
+        reading = fetch_umans_usage("test-key")
+
+        assert reading.throttle == THROTTLE_NONE
+
+    @patch("usage_dashboard.server.fetch_umans.httpx.Client")
+    def test_priority_low_is_throttle_low(self, mock_client_cls):
+        data = _umans_response_data()
+        data["usage"]["priority"] = {"low": True, "boxed_until": None, "reason": "fair-use"}
+        _mock_umans_client(mock_client_cls, data)
+
+        reading = fetch_umans_usage("test-key")
+
+        assert reading.throttle == THROTTLE_LOW
+
+    @patch("usage_dashboard.server.fetch_umans.httpx.Client")
+    def test_boxed_until_is_throttle_boxed(self, mock_client_cls):
+        data = _umans_response_data()
+        data["usage"]["priority"] = {
+            "low": False,
+            "boxed_until": "2026-06-22T02:00:00+00:00",
+            "reason": None,
+        }
+        _mock_umans_client(mock_client_cls, data)
+
+        reading = fetch_umans_usage("test-key")
+
+        assert reading.throttle == THROTTLE_BOXED
+        # While boxed, boxed_until replaces the window reset so the client can
+        # count down to the box clearing.
+        assert reading.session_resets_at == datetime(2026, 6, 22, 2, 0, 0)
+
+    @patch("usage_dashboard.server.fetch_umans.httpx.Client")
+    def test_boxed_wins_over_low(self, mock_client_cls):
+        # In the penalty box and low-priority at once -> the worse state (boxed).
+        data = _umans_response_data()
+        data["usage"]["priority"] = {
+            "low": True,
+            "boxed_until": "2026-06-22T02:00:00+00:00",
+            "reason": "rate",
+        }
+        _mock_umans_client(mock_client_cls, data)
+
+        reading = fetch_umans_usage("test-key")
+
+        assert reading.throttle == THROTTLE_BOXED
 
     @patch("usage_dashboard.server.fetch_umans.httpx.Client")
     def test_http_error_raises_fetch_error(self, mock_client_cls):

@@ -11,7 +11,14 @@ from usage_dashboard.client.layout import (
     rotate_touch_norm,
     tap_transition,
 )
-from usage_dashboard.shared.models import ModelUsage, Provider, Reading, ReadingStatus
+from usage_dashboard.shared.models import (
+    THROTTLE_BOXED,
+    THROTTLE_LOW,
+    ModelUsage,
+    Provider,
+    Reading,
+    ReadingStatus,
+)
 
 _NOW = datetime(2026, 1, 10, 12, 0, 0, tzinfo=timezone.utc)
 _SIZE = (800, 480)
@@ -88,6 +95,39 @@ class TestMainLayout:
         layout = build_main_layout(_all_four(), _SIZE, now=_NOW)
         assert Provider.UMANS not in [t.provider for t in layout.tiles]
         assert layout.footer_note == "UMANS req 5 tok 1M"
+
+    def test_footer_default_color_when_not_throttled(self) -> None:
+        layout = build_main_layout(_all_four(), _SIZE, now=_NOW)
+        assert layout.footer_color == fmt.TEXT
+
+    def _umans_with_throttle(self, throttle: str) -> list[Reading]:
+        readings = _all_four()
+        readings[-1] = _reading(
+            Provider.UMANS, session_percent=None, weekly_percent=None,
+            session_resets_at=None, weekly_resets_at=None, detail="req 5 tok 1M",
+            throttle=throttle,
+        )
+        return readings
+
+    def test_footer_yellow_when_umans_low_priority(self) -> None:
+        layout = build_main_layout(self._umans_with_throttle(THROTTLE_LOW), _SIZE, now=_NOW)
+        assert layout.footer_color == fmt.YELLOW
+        # Low priority still shows the normal req/tok metrics.
+        assert layout.footer_note == "UMANS req 5 tok 1M"
+
+    def test_footer_boxed_shows_countdown_not_metrics(self) -> None:
+        readings = _all_four()
+        readings[-1] = _reading(
+            Provider.UMANS, session_percent=None, weekly_percent=None,
+            session_resets_at=_NOW + timedelta(hours=4, minutes=30),
+            weekly_resets_at=None, detail="req 5 tok 1M",
+            throttle=THROTTLE_BOXED,
+        )
+        layout = build_main_layout(readings, _SIZE, now=_NOW)
+        assert layout.footer_color == fmt.RED
+        # The req/tok metrics are replaced by a countdown to the box clearing.
+        assert layout.footer_note == "UMANS boxed 4h 30m"
+        assert "req" not in layout.footer_note
 
     def test_accent_is_worst_bar_color(self) -> None:
         layout = build_main_layout(_all_four(), _SIZE, now=_NOW)

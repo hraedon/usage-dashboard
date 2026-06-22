@@ -26,6 +26,30 @@ def _to_naive_utc(dt: datetime) -> datetime:
     return dt.replace(tzinfo=None)
 
 
+def _extract_window(block: object) -> tuple[float | None, datetime | None]:
+    """Pull (utilization%, resets_at) from a usage window block.
+
+    The /oauth/usage endpoint returns ``utilization`` and ``resets_at`` as
+    ``null`` when the window is idle (e.g. no Claude activity in the trailing
+    five hours), and may omit the block entirely. The old code assumed both
+    fields were always present and non-null, so ``float(None)`` /
+    ``fromisoformat(None)`` raised TypeError and the provider went stale until
+    activity resumed. Treat an absent/null value as "unknown" (None), which the
+    model and renderers already handle (gray bar / "N/A").
+    """
+    if not isinstance(block, dict):
+        return None, None
+    util = block.get("utilization")
+    percent = float(util) if util is not None else None
+    resets_raw = block.get("resets_at")
+    resets_at = (
+        _to_naive_utc(datetime.fromisoformat(resets_raw).replace(tzinfo=timezone.utc))
+        if resets_raw is not None
+        else None
+    )
+    return percent, resets_at
+
+
 def refresh_claude_token(
     refresh_token: str,
     client_id: str | None = None,
@@ -96,16 +120,11 @@ def fetch_claude_usage(access_token: str) -> Reading:
     dump_json("claude_raw.json", data)
 
     try:
-        five_hour = data["five_hour"]
-        seven_day = data["seven_day"]
-        session_percent: float | None = float(five_hour["utilization"])
-        session_resets_at = _to_naive_utc(
-            datetime.fromisoformat(five_hour["resets_at"]).replace(tzinfo=timezone.utc)
-        )
-        weekly_percent: float | None = float(seven_day["utilization"])
-        weekly_resets_at = _to_naive_utc(
-            datetime.fromisoformat(seven_day["resets_at"]).replace(tzinfo=timezone.utc)
-        )
+        # Subscript (not .get) so a response missing these keys entirely is
+        # still treated as malformed (KeyError -> FetchError); a present-but-null
+        # block is the idle case _extract_window tolerates.
+        session_percent, session_resets_at = _extract_window(data["five_hour"])
+        weekly_percent, weekly_resets_at = _extract_window(data["seven_day"])
     except (KeyError, ValueError, TypeError) as exc:
         raise FetchError(f"Claude usage response parse error: {type(exc).__name__}") from exc
 

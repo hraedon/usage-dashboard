@@ -133,7 +133,7 @@ class DashboardGui:
         self._screen.blit(status, (sr.x + 8, sr.y + (sr.h - status.get_height()) // 2))
         # Quota-less umans summary sits in the status bar, next to the timer.
         if layout.footer_note:
-            note = self._font_title.render(layout.footer_note, True, fmt.TEXT)
+            note = self._font_title.render(layout.footer_note, True, layout.footer_color)
             self._screen.blit(
                 note,
                 (sr.x + sr.w - note.get_width() - 12,
