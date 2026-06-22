@@ -1,6 +1,6 @@
 # usage-dashboard
 
-A two-component system for monitoring AI usage across [Claude](https://claude.ai), [z.ai](https://z.ai), [Ollama](https://ollama.com), and [umans](https://umans.ai). A server fetches usage data from all configured providers, normalizes it into a unified format, stores it in SQLite, and serves it via an authenticated API. A client polls the server and renders usage as color-coded progress bars on a 240x320 ST7789 LCD display (designed for a Pi Zero); umans (whose plan has no percentage quotas) renders as a single text line of requests and tokens in the current window. The server also serves a mobile-friendly HTML view at `/dashboard`.
+A two-component system for monitoring AI usage across [Claude](https://claude.ai), [z.ai](https://z.ai), [Ollama](https://ollama.com), and [umans](https://umans.ai). A server fetches usage data from all configured providers, normalizes it into a unified format, stores it in SQLite, and serves it via an authenticated API. A client polls the server and renders usage as color-coded progress bars. The primary client is a fullscreen touch GUI for a **Raspberry Pi 4B + Touch Display 2** (with optional scheduled backlight-sleep + tap-to-wake); a legacy 240×320 ST7789 PNG renderer (Pi Zero) is also kept. umans (whose plan has no percentage quotas) renders as a single text line of requests and tokens, color-coded if the account is throttled. The server also serves a mobile-friendly HTML view at `/dashboard`.
 
 ## Architecture
 
@@ -37,6 +37,7 @@ SQLite storage.
 | Endpoint | Auth | Description |
 |----------|------|-------------|
 | `GET /readings` | Bearer token | Returns latest reading per provider as JSON |
+| `GET /schedule` | Bearer token | Returns the backlight sleep-schedule spec for the requesting unit (`?unit=<UNIT_ID>`, falling back to the `default` entry), or `null`. See *Backlight sleep schedule* |
 | `GET /dashboard` | None | Mobile-friendly HTML view of the same readings (intended for private networks; exposes usage stats only, never credentials) |
 | `GET /health` | None | Health check |
 
@@ -52,7 +53,9 @@ SQLite storage.
   "weekly_resets_at": "2026-06-18T12:00:00Z",
   "fetched_at": "2026-06-11T14:32:00Z",
   "stale": false,
-  "detail": null
+  "detail": null,
+  "models": null,
+  "throttle": "none"
 }
 ```
 
@@ -60,6 +63,16 @@ Status values: `current` | `stale` | `offline`
 
 `detail` is an optional pre-formatted text line for providers that don't fit
 the percentage model; umans uses it (e.g. `"req 161  tok 63.9M"`).
+
+`models` is an optional per-model breakdown (Ollama's weekly segments, z.ai's
+tool calls), sorted by share — the clients show the top two on the tile title
+and the top several in the detail view.
+
+`throttle` is a severity signal for quota-less providers (umans): `none`,
+`low` (deprioritised — over the concurrency threshold), or `boxed` (penalty
+box, account locked for the window). The clients colour the umans line
+yellow/red accordingly, and on `boxed` replace its metrics with a countdown to
+when the box clears.
 
 ## Clients
 
@@ -70,14 +83,17 @@ Both clients poll the server API with adaptive refresh (60s when values change,
 - **PNG renderer** (`usage-dashboard`, `client/main.py`) — the original Pi Zero
   client. Renders a 240×320 image and writes it to `/tmp/dashboard.png` for an
   SPI display (or headless use).
-- **Touch GUI** (`usage-dashboard-gui`, `client/gui.py`) — fullscreen pygame app
-  for a **Raspberry Pi 4B + official Touch Display 2** (5", 720×1280). Renders
-  straight on the panel via KMS/DRM (no desktop); provider tiles with
-  session/weekly bars and reset countdowns; tap a tile for a detail view.
-  Resolution-independent (works portrait or landscape, and in a dev window).
-  Prep a Pi with one command — `./deploy/pi/install.sh` sets up a venv, the
-  systemd service, display rotation, and a git-based auto-update timer; see
-  [`deploy/pi/README.md`](deploy/pi/README.md).
+- **Touch GUI** (`usage-dashboard-gui`, `client/gui.py`) — the primary client: a
+  fullscreen pygame app for a **Raspberry Pi 4B + official Touch Display 2**
+  (5", 720×1280). Runs under a **minimal X server** (`xinit` + `xrandr`), *not*
+  bare KMS/DRM — SDL's `kmsdrm` backend presents black on this panel; the X path
+  also gives real landscape rotation (see [`deploy/pi/README.md`](deploy/pi/README.md)).
+  Provider tiles with session/weekly bars and reset countdowns; tap a tile for a
+  detail view. Resolution-independent (works portrait or landscape, and in a dev
+  window). Optionally blanks the backlight on a schedule with tap-to-wake (see
+  *Backlight sleep schedule*). Prep a Pi with one command —
+  `./deploy/pi/install.sh` sets up a venv, the systemd service, display rotation,
+  and a git-based auto-update timer.
 
 ## Deploy
 
@@ -87,15 +103,18 @@ Both clients poll the server API with adaptive refresh (60s when values change,
 # Apply manifests
 kubectl apply -f k8s/namespace.yaml
 kubectl apply -f k8s/server-pvc.yaml
-kubectl apply -f k8s/server-secret.yaml
+kubectl apply -f k8s/server-secret.yaml      # edit with real values first
 kubectl apply -f k8s/server-deployment.yaml
 kubectl apply -f k8s/server-service.yaml
 
-# Populate secrets (edit server-secret.yaml with real values first)
-kubectl apply -f k8s/server-secret.yaml
+# Optional: per-unit backlight sleep schedules for the touch clients
+# (see *Backlight sleep schedule*)
+kubectl apply -f k8s/server-schedules-configmap.yaml
 
-# Optional: expose the dashboard at an internal hostname (edit the three
-# CHANGE-ME values — ingress class, host, TLS — first; see comments in the file)
+# Optional: expose the dashboard (edit the CHANGE-ME host/TLS/class values
+# first; see the comments in the file). This is two ingresses — an external one
+# exposing only the bearer-protected /readings + /schedule, and an internal one
+# exposing the full app incl. the unauthenticated /dashboard.
 kubectl apply -f k8s/server-ingress.yaml
 ```
 
@@ -233,6 +252,44 @@ refresh — the cookie still expires, so re-run it when the Ollama tile goes
 offline. `--headless` exists but rarely clears the anti-bot check.
 
 Only providers with configured credentials are fetched.
+
+## Backlight sleep schedule
+
+The touch GUI can blank the panel backlight on a time-of-day schedule and wake
+on a tap — handy for an always-on desk display that's just glowing overnight.
+It's **opt-in per unit** (`BACKLIGHT_SLEEP=1`) and off by default.
+
+- **Mechanism:** the GUI dims `brightness` to 0 (fully dark on the Touch Display
+  2) when asleep and restores it on wake — `brightness` is writable by the GUI
+  user's `video` group, so no root/udev/privileged helper is needed. Touch is
+  independent of the backlight, so a tap is caught even while dark.
+- **Tap-to-wake:** a tap during sleep wakes the panel until the *earlier of* the
+  current sleep window's end or the next local midnight, then it re-sleeps. (The
+  waking tap isn't also routed to a tile.)
+- **Schedule source (highest wins):** the server (`/schedule`, per `UNIT_ID`) →
+  the `BACKLIGHT_SCHEDULE` env override → a built-in default (nightly
+  `00:00-08:00` + weekend `Fri 18:00 → Mon 08:00`). A remote ConfigMap edit
+  takes effect on the client's next poll — no restart.
+
+**Schedule grammar** (rules joined by `;`):
+
+```
+daily HH:MM-HH:MM            # applied to all seven days (may cross midnight)
+<day> HH:MM-<day> HH:MM      # a single span (may cross days / the week)
+# e.g. daily 00:00-08:00; fri 18:00-mon 08:00
+```
+
+**Per-unit schedules** live in the `usage-dashboard-schedules` ConfigMap, keyed
+by `UNIT_ID` (or `default`). To change one:
+
+```bash
+kubectl -n usage-dashboard edit configmap usage-dashboard-schedules
+kubectl -n usage-dashboard rollout restart deploy/usage-dashboard-server
+```
+
+**Enable on a unit:** set `BACKLIGHT_SLEEP=1` and `UNIT_ID=<name>` in
+`/etc/usage-dashboard-gui.env`, then restart the GUI (or let the auto-updater
+do it). A malformed/unset schedule degrades gracefully to the built-in default.
 
 ## Development
 
