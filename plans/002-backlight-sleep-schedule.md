@@ -1,6 +1,8 @@
 # Plan 002 — Scheduled backlight sleep + tap-to-wake
 
-**Status:** planned 2026-06-22
+**Status:** implemented + deployed 2026-06-22 (PRs #12 Slice 1, #13 Slice 2;
+live on mpmusage01/02). Remaining nice-to-have: pause server polling while
+asleep (see Open questions).
 
 > Goal: let the touch panels turn their backlight off on a time-of-day schedule
 > (to save the backlight and stop a near-static image glowing all night), and
