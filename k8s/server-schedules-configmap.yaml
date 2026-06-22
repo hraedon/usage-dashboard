@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: usage-dashboard-schedules
+  namespace: usage-dashboard
+# Per-unit backlight sleep schedules. Each key is a unit id (the client's
+# UNIT_ID) or "default"; each value is a schedule spec:
+#   daily HH:MM-HH:MM            applied to all seven days (cross-midnight ok)
+#   <day> HH:MM-<day> HH:MM      a single span (may cross days/the week)
+# rules joined with ";". To update: edit this ConfigMap and
+#   kubectl rollout restart deploy/usage-dashboard-server
+# Clients pick up the new schedule on their next poll. A malformed value is
+# rejected by the client, which falls back to its built-in default.
+data:
+  default: "daily 00:00-08:00; fri 18:00-mon 08:00"
+  # Example per-unit override (uncomment / adjust):
+  # mpmusage02: "daily 00:00-08:00; fri 18:00-mon 08:00"

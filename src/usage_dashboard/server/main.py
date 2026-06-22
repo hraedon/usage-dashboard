@@ -9,6 +9,7 @@ import uvicorn
 
 from usage_dashboard.server.api import create_app
 from usage_dashboard.server.db import Database
+from usage_dashboard.server.schedule_config import ScheduleConfig
 from usage_dashboard.server.scheduler import FetchScheduler
 from usage_dashboard.server.token_store import TokenStore
 
@@ -116,6 +117,7 @@ def main() -> None:
         api_key=api_key,
         db=database,
         configured_providers=scheduler.configured_providers(),
+        schedule_config=ScheduleConfig.load(os.environ.get("SCHEDULES_DIR") or None),
     )
 
     scheduler.start()

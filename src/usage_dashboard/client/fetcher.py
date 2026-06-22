@@ -19,15 +19,20 @@ class ClientFetcher:
         default_interval: int = 300,
         fast_interval: int = 60,
         stable_threshold: int = 5,
+        unit_id: str | None = None,
+        fetch_schedule: bool = False,
     ) -> None:
         self._server_url = server_url.rstrip("/")
         self._api_key = api_key
         self._default_interval = default_interval
         self._fast_interval = fast_interval
         self._stable_threshold = stable_threshold
+        self._unit_id = unit_id
+        self._fetch_schedule = fetch_schedule
 
         self._lock = threading.Lock()
         self._readings: list[Reading] = []
+        self._schedule_spec: str | None = None
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._interval = default_interval
@@ -55,6 +60,13 @@ class ClientFetcher:
         with self._lock:
             return self._interval
 
+    @property
+    def current_schedule_spec(self) -> str | None:
+        """Latest server-delivered backlight schedule spec, or None (not
+        fetched yet, server has none, or the server was unreachable)."""
+        with self._lock:
+            return self._schedule_spec
+
     def _poll_loop(self) -> None:
         self._fetch_once()
         while not self._stop_event.wait(timeout=self._interval):
@@ -75,6 +87,26 @@ class ClientFetcher:
                 self._readings = new_readings
         except (httpx.HTTPError, ValueError, KeyError, TypeError) as exc:
             logger.warning("Failed to fetch readings: %s", exc)
+        if self._fetch_schedule:
+            self._poll_schedule()
+
+    def _poll_schedule(self) -> None:
+        """Refresh the backlight schedule spec from the server. On any error the
+        previously-cached spec is kept (the client falls back on its own)."""
+        try:
+            params = {"unit": self._unit_id} if self._unit_id else {}
+            response = httpx.get(
+                f"{self._server_url}/schedule",
+                headers={"Authorization": f"Bearer {self._api_key}"},
+                params=params,
+                timeout=15.0,
+            )
+            response.raise_for_status()
+            spec = response.json().get("schedule")
+            with self._lock:
+                self._schedule_spec = spec if isinstance(spec, str) else None
+        except (httpx.HTTPError, ValueError, KeyError, TypeError) as exc:
+            logger.warning("Failed to fetch schedule: %s", exc)
 
     def _update_interval(self, new_readings: list[Reading]) -> None:
         with self._lock:

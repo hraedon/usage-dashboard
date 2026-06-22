@@ -79,12 +79,18 @@ owns the loop, the touch events, and is the X foreground app. No new process.
 5. Unit tests for `schedule.py` (the worked examples above) and `backlight.py`
    (no-op path).
 
-### Slice 2 — server-served per-unit schedules (remote update)
-6. Server: schedule config (ConfigMap/env or DB-backed), keyed by unit; expose
-   via the existing client API (extend the readings response or add `/schedule`).
-7. Client fetcher: send unit identity, receive + cache schedule, fall back to the
-   Slice-1 local default on error.
-8. Docs: how to change a unit's schedule and roll out.
+### Slice 2 — server-served per-unit schedules (remote update) — IMPLEMENTED
+Decision: **ConfigMap + rollout** (not a DB/admin endpoint).
+6. Server: `ScheduleConfig` loads `unit_id -> spec` from a ConfigMap-mounted dir
+   (`SCHEDULES_DIR`); `GET /schedule?unit=<id>` (Bearer auth) serves the raw
+   spec (unit, else `default`, else null). Server does not parse — the client
+   validates. ConfigMap manifest + deployment volume mount added.
+7. Client: `UNIT_ID` env; `ClientFetcher` polls `/schedule` (when sleep enabled),
+   caches the spec, keeps the last good one on error. `ScheduleResolver` picks
+   server > env > default, re-parses only on change, keeps the previous schedule
+   on a bad spec — so a remote edit applies on the next poll without a restart.
+8. Docs: `UNIT_ID` + `BACKLIGHT_SCHEDULE` in the env example; update path in the
+   ConfigMap manifest header.
 
 ### Deploy
 - Client changes ride the existing **auto-update** path (no image rebuild).
@@ -102,8 +108,9 @@ owns the loop, the touch events, and is the X foreground app. No new process.
 
 ## Open questions / to confirm
 - Whether to also pause server polling while asleep (power vs. instant-fresh on
-  wake). Lean: pause, refresh once on wake.
-- Schedule spec format (keep it small): e.g.
-  `daily:00:00-08:00;fri:18:00-;sat,sun:all;mon:-08:00` — finalise in Slice 1.
+  wake). Lean: pause, refresh once on wake. (Not yet done.)
 - Which unit is "work" for any future per-unit divergence (`mpmusage02` per the
   user's note); irrelevant while the schedule is unified.
+
+Resolved: schedule spec format finalised as `daily HH:MM-HH:MM` and
+`<day> HH:MM-<day> HH:MM` rules joined by `;` (see `client/schedule.py`).

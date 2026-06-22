@@ -11,6 +11,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from usage_dashboard.server.db import Database
+from usage_dashboard.server.schedule_config import ScheduleConfig
 from usage_dashboard.shared.models import (
     Provider,
     Reading,
@@ -166,6 +167,7 @@ def create_app(
     api_key: str,
     db: Database,
     configured_providers: Iterable[Provider] | None = None,
+    schedule_config: ScheduleConfig | None = None,
 ) -> FastAPI:
     app = FastAPI()
     auth = _make_auth_dependency(api_key)
@@ -205,6 +207,16 @@ def create_app(
         # exposes nothing beyond what the display already shows.
         now = datetime.now(timezone.utc).replace(tzinfo=None)
         return HTMLResponse(_render_dashboard_html(_reported_readings(), now))
+
+    @app.get("/schedule")
+    async def get_schedule(
+        unit: str | None = None,
+        _user: str = Depends(auth),
+    ) -> dict[str, str | None]:
+        # Raw spec for the requesting unit (?unit=<UNIT_ID>), or the default,
+        # or null. The client parses/validates and falls back on its own.
+        spec = schedule_config.for_unit(unit) if schedule_config is not None else None
+        return {"schedule": spec}
 
     @app.get("/health")
     async def health() -> dict[str, str]:
