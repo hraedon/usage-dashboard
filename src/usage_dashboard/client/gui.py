@@ -23,8 +23,10 @@ from usage_dashboard.client import format as fmt
 from usage_dashboard.client.backlight import Backlight
 from usage_dashboard.client.fetcher import ClientFetcher
 from usage_dashboard.client.layout import (
+    BarSpec,
     DetailLayout,
     MainLayout,
+    Rect,
     TileSpec,
     ViewState,
     build_detail_layout,
@@ -240,9 +242,43 @@ class DashboardGui:
 
     # -- rendering ----------------------------------------------------------
 
+    def _bar_label(self, bar: BarSpec) -> str:
+        """The left-column text for a bar: ``[account · ]Label NN%``."""
+        return (
+            f"{(bar.account + ' · ') if bar.account else ''}"
+            f"{bar.label} {bar.percent_text}"
+        )
+
+    def _label_col_width(self, tiles: list[TileSpec]) -> int:
+        """Widest bar label across *all* tiles.
+
+        Computing this fleet-wide (rather than per tile) is what makes every
+        tile's bar track start at the same x and run the same length, so the
+        bars read as aligned columns regardless of per-tile label widths
+        (percent digit-count, the folded Claude work account). The reset column
+        is already a global sentinel width; this gives the label column the same
+        treatment. The trade is uniform bars at the cost of a little length —
+        the single widest label anywhere sets the column for all."""
+        return max(
+            (self._font.size(self._bar_label(bar))[0]
+             for tile in tiles for bar in tile.bars),
+            default=0,
+        )
+
+    def _bar_track(self, rect: Rect, label_col_w: int) -> tuple[int, int]:
+        """``(track_x, track_right)`` for a tile's bars given the global label
+        column width. Both edges depend only on tile geometry and the two global
+        column widths, so every tile in the single-column stack yields the same
+        pair."""
+        pad = max(8, min(rect.w, rect.h) // 12)
+        track_x = rect.x + pad + label_col_w + pad
+        track_right = rect.x + rect.w - pad - self._reset_col_w - pad
+        return track_x, track_right
+
     def _draw_main(self, layout: MainLayout) -> None:
+        label_col_w = self._label_col_width(layout.tiles)
         for tile in layout.tiles:
-            self._draw_tile(tile)
+            self._draw_tile(tile, label_col_w)
         sr = layout.status_rect
         status = self._font_small.render(layout.status_text, True, fmt.GRAY)
         self._screen.blit(status, (sr.x + 8, sr.y + (sr.h - status.get_height()) // 2))
@@ -255,7 +291,7 @@ class DashboardGui:
                  sr.y + (sr.h - note.get_height()) // 2),
             )
 
-    def _draw_tile(self, tile: TileSpec) -> None:
+    def _draw_tile(self, tile: TileSpec, label_col_w: int) -> None:
         r = tile.rect
         rect = pygame.Rect(r.x, r.y, r.w, r.h)
         pygame.draw.rect(self._screen, _TILE_BG, rect, border_radius=8)
@@ -281,23 +317,17 @@ class DashboardGui:
         row_h = (bottom - content_top) // n
         bar_h = max(8, row_h // 3)
 
-        # Fixed columns so every bar in the tile is the same length and the
-        # resets right-align: label column = widest label in this tile, reset
-        # column = the fixed sentinel width. The track ends before the reset
-        # column, so a 100% bar lands at that edge and never bleeds into it.
+        # Fixed columns so bars are uniform across *all* tiles: the label column
+        # (*label_col_w*, the widest label fleet-wide) and the reset column (the
+        # fixed sentinel width) are both global, so every tile's track starts and
+        # ends at the same x. The track ends before the reset column, so a 100%
+        # bar lands at that edge and never bleeds into it.
         labels = [
-            self._font.render(
-                f"{(bar.account + ' · ') if bar.account else ''}"
-                f"{bar.label} {bar.percent_text}",
-                True, fmt.TEXT,
-            )
+            self._font.render(self._bar_label(bar), True, fmt.TEXT)
             for bar in tile.bars
         ]
-        label_col_w = max((s.get_width() for s in labels), default=0)
-        track_x = r.x + pad + label_col_w + pad
-        # Reserve the reset column (sentinel width) with a gap each side, so the
-        # bar ends before it and every reset starts at the same x, abutting the bar.
-        track_right = r.x + r.w - pad - self._reset_col_w - pad
+        track_x, track_right = self._bar_track(r, label_col_w)
+        # The reset text starts a gap past the bar end, so every reset lines up.
         reset_x = track_right + pad
         track_w = track_right - track_x
 

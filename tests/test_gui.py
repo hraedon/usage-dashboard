@@ -105,6 +105,42 @@ def test_detail_for_absent_provider_falls_back_to_main(gui) -> None:
     assert gui._state.detail_provider is None
 
 
+def test_bars_share_one_track_across_tiles() -> None:
+    # Every provider tile must place its bar track at the same x and run the same
+    # length, so the bars read as aligned columns regardless of per-tile label
+    # widths (percent digit-count, the folded Claude work account). This is the
+    # worst case: Claude folds in a wide "work" account and z.ai sits at 100%
+    # while the others are low — exactly when the old per-tile column drifted.
+    pygame.display.init()
+    pygame.font.init()
+    size = (1280, 720)  # the units run the 5" panel rotated to landscape
+    pygame.display.set_mode(size)
+    try:
+        def r(provider: Provider, sp: float, wp: float) -> Reading:
+            return Reading(
+                provider=provider, status=ReadingStatus.CURRENT,
+                session_percent=sp, session_resets_at=_NOW.replace(tzinfo=timezone.utc),
+                weekly_percent=wp, weekly_resets_at=_NOW.replace(tzinfo=timezone.utc),
+                fetched_at=_NOW, stale=False,
+            )
+        readings = [
+            r(Provider.CLAUDE, 9, 9), r(Provider.CLAUDE_WORK, 100, 100),
+            r(Provider.ZAI, 100, 100), r(Provider.OLLAMA, 7, 5),
+        ]
+        gui = DashboardGui(_FakeFetcher(readings), size)  # type: ignore[arg-type]
+        layout = build_main_layout(readings, size)
+        assert len(layout.tiles) >= 2  # guard: an empty/1-tile layout would pass vacuously
+        label_col_w = gui._label_col_width(layout.tiles)
+        tracks = {
+            tile.provider: gui._bar_track(tile.rect, label_col_w)
+            for tile in layout.tiles
+        }
+        # Identical (track_x, track_right) — hence identical width — everywhere.
+        assert len(set(tracks.values())) == 1, tracks
+    finally:
+        pygame.display.quit()
+
+
 def test_smaller_resolution_renders(gui) -> None:
     layout = build_main_layout(_readings(), (240, 320))
     gui._width, gui._height = 240, 320
