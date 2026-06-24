@@ -18,7 +18,10 @@ WORKDIR /app
 
 COPY --from=builder /install /usr/local
 
-ENV SERVER_URL="" \
-    API_KEY=""
+# SERVER_URL and API_KEY are injected at runtime (k8s env / `docker run -e`).
+# API_KEY is deliberately given no in-image default: baking a secret-named ENV
+# trips BuildKit's SecretsUsedInArgOrEnv check, and the code already defaults it
+# to "" and errors clearly when unset (usage_dashboard.client.main).
+ENV SERVER_URL=""
 
 CMD ["python", "-m", "usage_dashboard.client.main"]
