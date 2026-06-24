@@ -51,6 +51,43 @@ def _env_bool(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
 
 
+class DoubleTapDetector:
+    """Detects a double-tap: two taps within ``window_ms`` and ``tolerance_px``
+    of each other.
+
+    Pure logic — the caller supplies a monotonic millisecond clock and the tap
+    position — so the gesture timing is unit-tested without pygame. The position
+    tolerance is what keeps a quick *open-tile-then-tap-back* (two taps in
+    different places) from registering as the deliberate same-spot double-tap.
+    """
+
+    def __init__(self, window_ms: int = 350, tolerance_px: int = 80) -> None:
+        self._window_ms = window_ms
+        self._tolerance_px = tolerance_px
+        self._last_ms: int | None = None
+        self._last_pos: tuple[int, int] | None = None
+
+    def reset(self) -> None:
+        self._last_ms = None
+        self._last_pos = None
+
+    def register(self, now_ms: int, pos: tuple[int, int]) -> bool:
+        """Record a tap; return True if it completes a double-tap. On a match the
+        state resets, so a third quick tap starts a fresh pair rather than
+        chaining into overlapping triple-taps."""
+        prev_ms, prev_pos = self._last_ms, self._last_pos
+        self._last_ms, self._last_pos = now_ms, pos
+        if prev_ms is None or prev_pos is None:
+            return False
+        if not (0 <= now_ms - prev_ms <= self._window_ms):
+            return False
+        dx, dy = pos[0] - prev_pos[0], pos[1] - prev_pos[1]
+        if dx * dx + dy * dy > self._tolerance_px * self._tolerance_px:
+            return False
+        self.reset()  # consume the pair
+        return True
+
+
 class DashboardGui:
     """Owns the pygame window, fonts, view state, and render loop."""
 
@@ -86,6 +123,14 @@ class DashboardGui:
         self._backlight = backlight if backlight is not None else Backlight()
         self._wake_until: datetime | None = None
         self._dark = False
+        # Manual sleep: a double-tap blanks the panel immediately, independent of
+        # the schedule, until the next tap wakes it. Sticky across schedule
+        # changes; only a wake tap clears it. The position tolerance scales with
+        # the panel so a same-spot double-tap is forgiving on any resolution.
+        self._manual_sleep = False
+        self._double_tap = DoubleTapDetector(
+            tolerance_px=max(40, min(self._width, self._height) // 6)
+        )
         # While dark we tick slowly to save CPU but still pump touch events.
         self._sleep_fps = 4
         # Fonts scaled to the panel so the same code reads on any resolution.
@@ -131,15 +176,30 @@ class DashboardGui:
                 if pos is None:
                     continue
                 if swallow_wake:
-                    # Panel is dark: a tap only wakes it (held until the
-                    # schedule's deadline); it is NOT routed into a tile.
+                    # Panel is dark: a tap only wakes it; it is NOT routed into a
+                    # tile. Clears a manual (double-tap) sleep, and — if a
+                    # schedule window also has it asleep — holds it awake until
+                    # that window's deadline.
+                    self._manual_sleep = False
+                    self._double_tap.reset()
                     if self._schedule is not None and now is not None:
                         self._wake_until = self._schedule.wake_until(now)
+                    continue
+                if self._double_tap.register(pygame.time.get_ticks(), pos):
+                    # A double-tap puts the panel to sleep now (if the backlight
+                    # is actually controllable) and drops back to the home grid,
+                    # so it wakes on the dashboard rather than a stale detail
+                    # view. Swallow this second tap either way.
+                    if self._backlight.available:
+                        self._manual_sleep = True
+                        self._state = ViewState()
                     continue
                 self._state = tap_transition(self._state, layout, pos)
 
     def _is_dark(self, now: datetime) -> bool:
         """True if the panel should be blanked now (asleep and not tap-woken)."""
+        if self._manual_sleep:  # double-tap override, independent of the schedule
+            return True
         if self._schedule is None:
             return False
         if self._wake_until is not None and now < self._wake_until:

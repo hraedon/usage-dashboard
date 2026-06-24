@@ -16,7 +16,10 @@ os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
 
 pygame = pytest.importorskip("pygame")
 
-from usage_dashboard.client.gui import DashboardGui  # noqa: E402
+from usage_dashboard.client.gui import (  # noqa: E402
+    DashboardGui,
+    DoubleTapDetector,
+)
 from usage_dashboard.client.layout import ViewState, build_main_layout  # noqa: E402
 from usage_dashboard.shared.models import (  # noqa: E402
     Provider,
@@ -57,6 +60,18 @@ class _FakeFetcher:
 
     def get_latest_readings(self) -> list[Reading]:
         return self._readings
+
+
+class _FakeBacklight:
+    """Stands in for the sysfs backlight so a double-tap can engage manual sleep
+    in tests (the real Backlight reports unavailable with no hardware device)."""
+
+    def __init__(self, available: bool = True) -> None:
+        self.available = available
+        self.power: list[bool] = []
+
+    def set_power(self, on: bool) -> None:
+        self.power.append(on)
 
 
 @pytest.fixture
@@ -132,5 +147,100 @@ def test_mouse_tap_is_not_rotated() -> None:
         gui = DashboardGui(_FakeFetcher(_readings()), (1280, 720), touch_rotate=90)  # type: ignore[arg-type]
         event = pygame.event.Event(pygame.MOUSEBUTTONDOWN, {"pos": (300, 200), "button": 1})
         assert gui._tap_position(event) == (300, 200)
+    finally:
+        pygame.display.quit()
+
+
+# -- double-tap-to-sleep ----------------------------------------------------
+
+
+def test_double_tap_detector_pairs_quick_close_taps() -> None:
+    d = DoubleTapDetector(window_ms=350, tolerance_px=50)
+    assert d.register(1000, (10, 10)) is False  # first tap never pairs
+    assert d.register(1200, (12, 12)) is True   # within 350ms and 50px
+
+
+def test_double_tap_detector_rejects_slow_second_tap() -> None:
+    d = DoubleTapDetector(window_ms=350, tolerance_px=50)
+    assert d.register(1000, (10, 10)) is False
+    assert d.register(1500, (10, 10)) is False  # 500ms apart, too slow
+
+
+def test_double_tap_detector_rejects_distant_second_tap() -> None:
+    d = DoubleTapDetector(window_ms=350, tolerance_px=20)
+    assert d.register(1000, (10, 10)) is False
+    assert d.register(1100, (200, 200)) is False  # quick but far apart
+
+
+def test_double_tap_detector_does_not_chain_triples() -> None:
+    d = DoubleTapDetector(window_ms=350, tolerance_px=50)
+    assert d.register(1000, (10, 10)) is False
+    assert d.register(1100, (10, 10)) is True   # pair fires, state consumed
+    assert d.register(1150, (10, 10)) is False  # third starts a fresh pair
+    assert d.register(1200, (10, 10)) is True   # fourth completes it
+
+
+def _post_taps(positions: list[tuple[int, int]]) -> None:
+    pygame.event.clear()
+    for pos in positions:
+        pygame.event.post(
+            pygame.event.Event(pygame.MOUSEBUTTONDOWN, {"pos": pos, "button": 1})
+        )
+
+
+def test_double_tap_engages_manual_sleep_and_returns_home() -> None:
+    pygame.display.init()
+    pygame.font.init()
+    pygame.display.set_mode((480, 320))
+    try:
+        backlight = _FakeBacklight(available=True)
+        gui = DashboardGui(
+            _FakeFetcher(_readings()), (480, 320), backlight=backlight,  # type: ignore[arg-type]
+        )
+        gui._state = ViewState(detail_provider=Provider.CLAUDE)  # a detail view is open
+        layout = build_main_layout(_readings(), (480, 320))
+        _post_taps([(200, 150), (200, 150)])
+        gui._handle_events(layout, swallow_wake=False, now=_NOW)
+        assert gui._manual_sleep is True
+        assert gui._state.detail_provider is None  # reset to the home grid
+        assert gui._is_dark(_NOW) is True
+    finally:
+        pygame.display.quit()
+
+
+def test_double_tap_ignored_when_backlight_unavailable() -> None:
+    pygame.display.init()
+    pygame.font.init()
+    pygame.display.set_mode((480, 320))
+    try:
+        gui = DashboardGui(
+            _FakeFetcher(_readings()), (480, 320),
+            backlight=_FakeBacklight(available=False),  # type: ignore[arg-type]
+        )
+        layout = build_main_layout(_readings(), (480, 320))
+        _post_taps([(200, 150), (200, 150)])
+        gui._handle_events(layout, swallow_wake=False, now=_NOW)
+        assert gui._manual_sleep is False
+        assert gui._is_dark(_NOW) is False
+    finally:
+        pygame.display.quit()
+
+
+def test_tap_wakes_from_manual_sleep() -> None:
+    pygame.display.init()
+    pygame.font.init()
+    pygame.display.set_mode((480, 320))
+    try:
+        gui = DashboardGui(
+            _FakeFetcher(_readings()), (480, 320),
+            backlight=_FakeBacklight(available=True),  # type: ignore[arg-type]
+        )
+        gui._manual_sleep = True
+        assert gui._is_dark(_NOW) is True
+        layout = build_main_layout(_readings(), (480, 320))
+        _post_taps([(200, 150)])
+        gui._handle_events(layout, swallow_wake=True, now=_NOW)
+        assert gui._manual_sleep is False
+        assert gui._is_dark(_NOW) is False  # no schedule -> awake again
     finally:
         pygame.display.quit()

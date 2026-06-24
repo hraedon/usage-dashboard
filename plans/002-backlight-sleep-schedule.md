@@ -94,6 +94,22 @@ Decision: **ConfigMap + rollout** (not a DB/admin endpoint).
 8. Docs: `UNIT_ID` + `BACKLIGHT_SCHEDULE` in the env example; update path in the
    ConfigMap manifest header.
 
+### Slice 3 — manual double-tap-to-sleep — IMPLEMENTED 2026-06-24
+Added on user request: a manual sleep gesture, complementing the schedule.
+9. `gui.py`: a pure `DoubleTapDetector` (window_ms + position tolerance, fed a
+   monotonic `pygame.time.get_ticks()` clock so it's unit-tested without pygame
+   timing). Two quick taps within ~350ms and a panel-scaled position tolerance
+   set a sticky `_manual_sleep` flag that `_is_dark` honours independently of the
+   schedule; the gesture also resets the view to the home grid. A wake tap clears
+   `_manual_sleep` (and resets the detector) on the same swallow-wake path as
+   schedule wake. Gated on `backlight.available` so it no-ops in dev/windowed
+   mode. **Decision (with user 2026-06-24):** keep single-tap nav instant — the
+   *first* tap still navigates; only the second tap is swallowed into the sleep
+   gesture. The position tolerance is what stops a fast open-then-tap-back from
+   reading as a sleep. (Rejected: deferring every tap ~350ms — too laggy for a
+   glanceable panel; status-bar-only gesture — less discoverable.)
+   Rides the client **auto-update** path; no server/image change.
+
 ### Deploy
 - Client changes ride the existing **auto-update** path (no image rebuild).
 - Server change (Slice 2) is an image rebuild + `kubectl rollout restart`,
