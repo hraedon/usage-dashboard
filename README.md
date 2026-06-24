@@ -266,6 +266,12 @@ It's **opt-in per unit** (`BACKLIGHT_SLEEP=1`) and off by default.
 - **Tap-to-wake:** a tap during sleep wakes the panel until the *earlier of* the
   current sleep window's end or the next local midnight, then it re-sleeps. (The
   waking tap isn't also routed to a tile.)
+- **Double-tap-to-sleep:** two quick taps (within ~350ms, in roughly the same
+  spot) blank the panel immediately and return it to the home grid; the next tap
+  wakes it. This works even with the schedule disabled — it's a manual override —
+  but only when the backlight is actually controllable (no-op in dev/windowed
+  mode). The same-spot position tolerance keeps a fast open-tile-then-tap-back
+  from being read as a sleep gesture; single-tap navigation stays instant.
 - **Schedule source (highest wins):** the server (`/schedule`, per `UNIT_ID`) →
   the `BACKLIGHT_SCHEDULE` env override → a built-in default (nightly
   `00:00-08:00` + weekend `Fri 18:00 → Mon 08:00`). A remote ConfigMap edit
