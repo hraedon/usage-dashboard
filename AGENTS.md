@@ -13,6 +13,7 @@ Key modules:
 - `src/usage_dashboard/shared/models.py` — Normalized reading schema (Provider enum, Reading dataclass)
 - `src/usage_dashboard/server/` — Fetchers (Claude, z.ai, Ollama, umans), SQLite DB, API, scheduler
 - `src/usage_dashboard/client/` — HTTP fetcher with adaptive refresh, Pillow-based display renderer
+- `src/usage_dashboard/deploy/` — `redeploy.py`: opt-in self-redeploy of the Pi's installer-managed components (units/scripts) from the pulled checkout (`AUTO_REDEPLOY=1`); driven by `deploy/pi/update.sh` via the root `usage-dashboard-redeploy` helper. Content-addressed + atomic-write + unit-verify + GUI rollback
 - `k8s/` — Kubernetes manifests for deployment
 - `docs/spec.md` — Full specification with acceptance criteria (AC-01 through AC-16)
 

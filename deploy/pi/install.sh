@@ -150,8 +150,17 @@ sed -e "s|@APPDIR@|$APPDIR|g" -e "s|@VENV@|$VENV|g" \
     "$HERE/update.sh" | sudo tee /usr/local/bin/usage-dashboard-update >/dev/null
 sudo chmod 755 /usr/local/bin/usage-dashboard-update
 
-# Let the updater restart the GUI without a password (scoped to that one verb).
-echo "$RUNUSER ALL=(root) NOPASSWD: /usr/bin/systemctl restart usage-dashboard-gui.service" \
+# Privileged redeploy helper for opt-in auto-redeploy (AUTO_REDEPLOY=1). Static
+# (it recovers per-unit values from the installed files at runtime), so no
+# templating. Inert until update.sh invokes it.
+sudo install -m 0755 "$HERE/usage-dashboard-redeploy" /usr/local/bin/usage-dashboard-redeploy
+
+# Updater sudo rules, each scoped to one exact command (no args): restart the GUI
+# (the app path), and run the redeploy helper (the infra path). The helper itself
+# does the daemon-reload/unit-write/restarts as root once invoked — see WI-016.
+printf '%s\n%s\n' \
+    "$RUNUSER ALL=(root) NOPASSWD: /usr/bin/systemctl restart usage-dashboard-gui.service" \
+    "$RUNUSER ALL=(root) NOPASSWD: /usr/local/bin/usage-dashboard-redeploy" \
     | sudo tee /etc/sudoers.d/usage-dashboard-update >/dev/null
 sudo chmod 440 /etc/sudoers.d/usage-dashboard-update
 
