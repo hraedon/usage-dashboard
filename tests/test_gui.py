@@ -16,11 +16,16 @@ os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
 
 pygame = pytest.importorskip("pygame")
 
+from usage_dashboard.client.brightness import step_for_level  # noqa: E402
 from usage_dashboard.client.gui import (  # noqa: E402
     DashboardGui,
     DoubleTapDetector,
 )
-from usage_dashboard.client.layout import ViewState, build_main_layout  # noqa: E402
+from usage_dashboard.client.layout import (  # noqa: E402
+    ViewState,
+    build_brightness_overlay,
+    build_main_layout,
+)
 from usage_dashboard.shared.models import (  # noqa: E402
     Provider,
     Reading,
@@ -66,12 +71,25 @@ class _FakeBacklight:
     """Stands in for the sysfs backlight so a double-tap can engage manual sleep
     in tests (the real Backlight reports unavailable with no hardware device)."""
 
-    def __init__(self, available: bool = True) -> None:
+    def __init__(
+        self, available: bool = True, level: int = 15, max_level: int = 31,
+    ) -> None:
         self.available = available
+        self.max_level = max_level
         self.power: list[bool] = []
+        self.levels: list[int] = []  # set_level history
+        self._level = level
+
+    @property
+    def current_level(self) -> int:
+        return self._level
 
     def set_power(self, on: bool) -> None:
         self.power.append(on)
+
+    def set_level(self, level: int) -> None:
+        self._level = level
+        self.levels.append(level)
 
 
 @pytest.fixture
@@ -258,6 +276,153 @@ def test_double_tap_ignored_when_backlight_unavailable() -> None:
         gui._handle_events(layout, swallow_wake=False, now=_NOW)
         assert gui._manual_sleep is False
         assert gui._is_dark(_NOW) is False
+    finally:
+        pygame.display.quit()
+
+
+# -- brightness overlay -----------------------------------------------------
+
+
+def _status_pos(size: tuple[int, int]) -> tuple[int, int]:
+    """A point inside the status ("Updated…") line for *size*."""
+    layout = build_main_layout(_readings(), size)
+    sr = layout.status_rect
+    return sr.x + sr.w // 2, sr.y + sr.h // 2
+
+
+def _make_brightness_gui(
+    size: tuple[int, int] = (480, 320),
+    *,
+    available: bool = True,
+    level: int = 15,
+    state_file=None,
+    steps: int = 10,
+):
+    return DashboardGui(
+        _FakeFetcher(_readings()), size,  # type: ignore[arg-type]
+        backlight=_FakeBacklight(available=available, level=level),  # type: ignore[arg-type]
+        brightness_steps=steps,
+        brightness_state_file=state_file,
+    )
+
+
+def test_status_tap_opens_brightness_overlay() -> None:
+    pygame.display.init()
+    pygame.font.init()
+    size = (480, 320)
+    pygame.display.set_mode(size)
+    try:
+        gui = _make_brightness_gui(size)
+        layout = build_main_layout(_readings(), size)
+        _post_taps([_status_pos(size)])
+        gui._handle_events(layout, swallow_wake=False, now=_NOW)
+        assert gui._state.brightness is True
+    finally:
+        pygame.display.quit()
+
+
+def test_status_tap_noop_when_backlight_unavailable() -> None:
+    pygame.display.init()
+    pygame.font.init()
+    size = (480, 320)
+    pygame.display.set_mode(size)
+    try:
+        gui = _make_brightness_gui(size, available=False)
+        layout = build_main_layout(_readings(), size)
+        _post_taps([_status_pos(size)])
+        gui._handle_events(layout, swallow_wake=False, now=_NOW)
+        assert gui._state.brightness is False
+    finally:
+        pygame.display.quit()
+
+
+def test_plus_minus_nudge_changes_level_and_persists(tmp_path) -> None:
+    pygame.display.init()
+    pygame.font.init()
+    size = (480, 320)
+    pygame.display.set_mode(size)
+    try:
+        from usage_dashboard.client.brightness import load_level
+
+        state = tmp_path / "brightness"
+        # Start mid-scale (step 5 of 10 on a 31-max panel) so + and - both move.
+        gui = _make_brightness_gui(size, level=16, state_file=state, steps=10)
+        gui._state = ViewState(brightness=True)
+        before = gui._brightness_step
+
+        overlay = build_brightness_overlay(size)
+        _post_taps([(overlay.plus.x + overlay.plus.w // 2,
+                     overlay.plus.y + overlay.plus.h // 2)])
+        gui._handle_events(build_main_layout(_readings(), size),
+                           swallow_wake=False, now=_NOW)
+        assert gui._brightness_step == before + 1
+        assert gui._backlight.levels  # set_level was called  # type: ignore[attr-defined]
+        assert load_level(state) == gui._backlight.levels[-1]  # type: ignore[attr-defined]
+
+        _post_taps([(overlay.minus.x + overlay.minus.w // 2,
+                     overlay.minus.y + overlay.minus.h // 2)])
+        gui._handle_events(build_main_layout(_readings(), size),
+                           swallow_wake=False, now=_NOW)
+        assert gui._brightness_step == before
+    finally:
+        pygame.display.quit()
+
+
+def test_tap_outside_panel_closes_overlay() -> None:
+    pygame.display.init()
+    pygame.font.init()
+    size = (480, 320)
+    pygame.display.set_mode(size)
+    try:
+        gui = _make_brightness_gui(size)
+        gui._state = ViewState(brightness=True)
+        _post_taps([(1, 1)])  # corner, outside the centred card
+        gui._handle_events(build_main_layout(_readings(), size),
+                           swallow_wake=False, now=_NOW)
+        assert gui._state.brightness is False
+    finally:
+        pygame.display.quit()
+
+
+def test_nudge_clamps_at_rails() -> None:
+    pygame.display.init()
+    pygame.font.init()
+    pygame.display.set_mode((480, 320))
+    try:
+        gui = _make_brightness_gui((480, 320), level=31, steps=10)  # at max
+        assert gui._brightness_step == 10
+        gui._nudge_brightness(+1)
+        assert gui._brightness_step == 10  # can't exceed the top rail
+        for _ in range(20):
+            gui._nudge_brightness(-1)
+        assert gui._brightness_step == 1  # floors at 1, never 0
+    finally:
+        pygame.display.quit()
+
+
+def test_persisted_level_applied_at_startup(tmp_path) -> None:
+    pygame.display.init()
+    pygame.font.init()
+    pygame.display.set_mode((480, 320))
+    try:
+        state = tmp_path / "brightness"
+        state.write_text("8")  # a level persisted from a previous run
+        gui = _make_brightness_gui((480, 320), level=31, state_file=state, steps=10)
+        # Startup re-applies the persisted level to the panel (reboot survival)...
+        assert gui._backlight.levels == [8]  # type: ignore[attr-defined]
+        # ...and the step reflects it, not the hardware's power-on default.
+        assert gui._brightness_step == step_for_level(8, 10, 31)
+    finally:
+        pygame.display.quit()
+
+
+def test_draw_brightness_does_not_raise(tmp_path) -> None:
+    pygame.display.init()
+    pygame.font.init()
+    pygame.display.set_mode((1280, 720))
+    try:
+        gui = _make_brightness_gui((1280, 720), steps=11)  # exercise an odd count
+        gui._draw_brightness()
     finally:
         pygame.display.quit()
 

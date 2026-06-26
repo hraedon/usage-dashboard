@@ -325,9 +325,42 @@ def hit_test(layout: MainLayout, pos: tuple[int, int]) -> Provider | None:
 
 @dataclass(frozen=True)
 class ViewState:
-    """Which screen is showing. ``detail_provider`` None means the main grid."""
+    """Which screen is showing. With ``brightness`` False and ``detail_provider``
+    None the main grid is up; ``detail_provider`` set shows that provider's
+    detail; ``brightness`` True shows the brightness overlay (on top of the
+    grid)."""
 
     detail_provider: Provider | None = None
+    brightness: bool = False
+
+
+@dataclass(frozen=True)
+class BrightnessOverlay:
+    """Tap regions for the brightness card: a big ``−`` and ``+`` flanking a
+    centre readout, inside a centred *panel*. A tap outside *panel* closes it."""
+
+    panel: Rect
+    minus: Rect
+    plus: Rect
+    level_rect: Rect
+
+
+def build_brightness_overlay(size: tuple[int, int]) -> BrightnessOverlay:
+    """Centred brightness card sized as a fraction of the screen, so the same
+    code yields finger-sized targets on the 5" panel and the dev window alike."""
+    width, height = size
+    pw, ph = int(width * 0.72), int(height * 0.55)
+    px, py = (width - pw) // 2, (height - ph) // 2
+    panel = Rect(px, py, pw, ph)
+    pad = max(10, min(pw, ph) // 12)
+    title_h = ph // 4
+    row_y = py + title_h
+    row_h = ph - title_h - pad
+    col_w = (pw - 2 * pad) // 3
+    minus = Rect(px + pad, row_y, col_w, row_h)
+    plus = Rect(px + pw - pad - col_w, row_y, col_w, row_h)
+    level_rect = Rect(minus.x + col_w, row_y, pw - 2 * pad - 2 * col_w, row_h)
+    return BrightnessOverlay(panel=panel, minus=minus, plus=plus, level_rect=level_rect)
 
 
 def tap_transition(
