@@ -325,9 +325,71 @@ def hit_test(layout: MainLayout, pos: tuple[int, int]) -> Provider | None:
 
 @dataclass(frozen=True)
 class ViewState:
-    """Which screen is showing. ``detail_provider`` None means the main grid."""
+    """Which screen is showing. With ``overlay`` False and ``detail_provider``
+    None the main grid is up; ``detail_provider`` set shows that provider's
+    detail; ``overlay`` True shows the status overlay — unit diagnostics on the
+    left, brightness ``−``/``+`` on the right — on top of the grid."""
 
     detail_provider: Provider | None = None
+    overlay: bool = False
+
+
+@dataclass(frozen=True)
+class BrightnessOverlay:
+    """Tap regions for the brightness controls: a big ``−`` and ``+`` flanking a
+    centre readout, laid into *region* (the overlay's right column)."""
+
+    region: Rect
+    minus: Rect
+    plus: Rect
+    level_rect: Rect
+
+
+@dataclass(frozen=True)
+class StatusOverlay:
+    """The status card opened by tapping the "Updated…" line: a *panel* split
+    into a left *diag_rect* (unit diagnostics text) and right *brightness*
+    controls. A tap outside *panel* closes it."""
+
+    panel: Rect
+    diag_rect: Rect
+    brightness: BrightnessOverlay
+
+
+def build_brightness_overlay(region: Rect) -> BrightnessOverlay:
+    """Lay the ``−`` | readout | ``+`` controls into *region* as three columns,
+    so the same code sizes finger targets on the 5" panel and the dev window."""
+    pad = max(8, min(region.w, region.h) // 12)
+    title_h = region.h // 5
+    row_y = region.y + title_h
+    row_h = region.h - title_h - pad
+    col_w = (region.w - 2 * pad) // 3
+    minus = Rect(region.x + pad, row_y, col_w, row_h)
+    plus = Rect(region.x + region.w - pad - col_w, row_y, col_w, row_h)
+    level_rect = Rect(
+        minus.x + col_w, row_y, region.w - 2 * pad - 2 * col_w, row_h
+    )
+    return BrightnessOverlay(
+        region=region, minus=minus, plus=plus, level_rect=level_rect
+    )
+
+
+def build_status_overlay(size: tuple[int, int]) -> StatusOverlay:
+    """Centred status card sized as a fraction of the screen, split into a wider
+    left column for diagnostics text and a right column for brightness."""
+    width, height = size
+    pw, ph = int(width * 0.82), int(height * 0.6)
+    px, py = (width - pw) // 2, (height - ph) // 2
+    panel = Rect(px, py, pw, ph)
+    pad = max(10, min(pw, ph) // 14)
+    inner = Rect(px + pad, py + pad, pw - 2 * pad, ph - 2 * pad)
+    left_w = int(inner.w * 0.56)
+    diag_rect = Rect(inner.x, inner.y, left_w, inner.h)
+    right_x = inner.x + left_w + pad
+    right = Rect(right_x, inner.y, inner.x + inner.w - right_x, inner.h)
+    return StatusOverlay(
+        panel=panel, diag_rect=diag_rect, brightness=build_brightness_overlay(right)
+    )
 
 
 def tap_transition(

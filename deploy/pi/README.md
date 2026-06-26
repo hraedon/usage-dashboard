@@ -122,6 +122,7 @@ API_KEY=<the shared bearer token>     # same api-key the server uses
 # BACKLIGHT_SLEEP=1                    # blank the panel on a schedule (tap to wake)
 # UNIT_ID=mpmusageNN                   # this unit's key in the schedules ConfigMap
 # BACKLIGHT_SCHEDULE=daily 00:00-08:00; fri 18:00-mon 08:00   # local fallback
+# BRIGHTNESS_STEPS=10                  # status overlay -/+ notches (tap status line); try 9/11
 ```
 
 Then `sudo systemctl restart usage-dashboard-gui`.
