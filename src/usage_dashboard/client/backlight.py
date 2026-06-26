@@ -27,6 +27,10 @@ class Backlight:
 
     def __init__(self, base: Path | None = None) -> None:
         self._device = self._discover(base if base is not None else _SYSFS_BASE)
+        self._max_level = (
+            self._read_int(self._device / "max_brightness", default=0)
+            if self._device is not None else 0
+        )
         self._on_level = self._read_on_level()
         self._last_on: bool | None = None
         if self._device is None:
@@ -71,6 +75,37 @@ class Backlight:
     @property
     def available(self) -> bool:
         return self._device is not None
+
+    @property
+    def max_level(self) -> int:
+        """The panel's ``max_brightness`` (0 when no device)."""
+        return self._max_level
+
+    @property
+    def current_level(self) -> int:
+        """The brightness the node holds right now (0 when no device)."""
+        if self._device is None:
+            return 0
+        return self._read_int(self._device / "brightness", default=0)
+
+    def set_level(self, level: int) -> None:
+        """Set the backlight to an explicit brightness (clamped to ``[1, max]`` so
+        a user dim never blanks the panel — that's what sleep is for).
+
+        Crucially this also updates the wake-restore level, so a brightness the
+        user chose survives a sleep/wake cycle instead of snapping back to the
+        startup level. No-op (and swallows write errors) when unavailable."""
+        if self._device is None:
+            return
+        ceiling = self._max_level if self._max_level > 0 else level
+        level = max(1, min(level, ceiling))
+        try:
+            (self._device / "brightness").write_text(str(level))
+            self._on_level = level
+            self._last_on = True
+            logger.info("backlight level set to %d", level)
+        except OSError as exc:
+            logger.warning("backlight level write failed (%s): %s", self._device, exc)
 
     def set_power(self, on: bool) -> None:
         """Turn the backlight on (restore brightness) or off (brightness 0).

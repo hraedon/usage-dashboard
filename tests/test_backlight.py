@@ -54,6 +54,38 @@ class TestBacklight:
         bl.set_power(True)                            # state change -> writes
         assert _brightness(dev) == "15"
 
+    def test_max_and_current_level_reported(self, tmp_path: Path) -> None:
+        dev = _make_device(tmp_path, brightness=15, max_brightness=31)
+        bl = Backlight(base=tmp_path)
+        assert bl.max_level == 31
+        assert bl.current_level == 15
+        (dev / "brightness").write_text("7")
+        assert bl.current_level == 7  # read fresh each time
+
+    def test_set_level_writes_clamped_value(self, tmp_path: Path) -> None:
+        dev = _make_device(tmp_path, brightness=15, max_brightness=31)
+        bl = Backlight(base=tmp_path)
+        bl.set_level(20)
+        assert _brightness(dev) == "20"
+        bl.set_level(999)  # above max -> clamped to max
+        assert _brightness(dev) == "31"
+        bl.set_level(0)  # never blanks via a level set (0 is sleep's job)
+        assert _brightness(dev) == "1"
+
+    def test_set_level_survives_a_sleep_wake_cycle(self, tmp_path: Path) -> None:
+        # The whole point of updating the wake-restore level: a user-chosen
+        # brightness must come back after the panel sleeps, not snap to startup.
+        dev = _make_device(tmp_path, brightness=15)
+        bl = Backlight(base=tmp_path)
+        bl.set_level(8)
+        bl.set_power(False)
+        assert _brightness(dev) == "0"
+        bl.set_power(True)
+        assert _brightness(dev) == "8"  # restored the chosen level, not 15
+
+    def test_set_level_noop_without_device(self, tmp_path: Path) -> None:
+        Backlight(base=tmp_path / "missing").set_level(10)  # must not raise
+
     def test_write_error_is_swallowed(self, tmp_path: Path) -> None:
         # brightness as a directory makes write_text raise OSError; the loop must
         # not crash on a permissions/IO failure.

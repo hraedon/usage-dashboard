@@ -1,6 +1,6 @@
 # usage-dashboard
 
-A two-component system for monitoring AI usage across [Claude](https://claude.ai), [z.ai](https://z.ai), [Ollama](https://ollama.com), and [umans](https://umans.ai). A server fetches usage data from all configured providers, normalizes it into a unified format, stores it in SQLite, and serves it via an authenticated API. A client polls the server and renders usage as color-coded progress bars. The primary client is a fullscreen touch GUI for a **Raspberry Pi 4B + Touch Display 2** (with optional scheduled backlight-sleep + tap-to-wake); a legacy 240×320 ST7789 PNG renderer (Pi Zero) is also kept. umans (whose plan has no percentage quotas) renders as a single text line of requests and tokens, color-coded if the account is throttled. The server also serves a mobile-friendly HTML view at `/dashboard`.
+A two-component system for monitoring AI usage across [Claude](https://claude.ai), [z.ai](https://z.ai), [Ollama](https://ollama.com), and [umans](https://umans.ai). A server fetches usage data from all configured providers, normalizes it into a unified format, stores it in SQLite, and serves it via an authenticated API. A client polls the server and renders usage as color-coded progress bars. The primary client is a fullscreen touch GUI for a **Raspberry Pi 4B + Touch Display 2** (with optional scheduled backlight-sleep + tap-to-wake, and a tap-the-status-line overlay for unit diagnostics + brightness); a legacy 240×320 ST7789 PNG renderer (Pi Zero) is also kept. umans (whose plan has no percentage quotas) renders as a single text line of requests and tokens, color-coded if the account is throttled. The server also serves a mobile-friendly HTML view at `/dashboard`.
 
 ## Architecture
 
@@ -296,6 +296,46 @@ kubectl -n usage-dashboard rollout restart deploy/usage-dashboard-server
 **Enable on a unit:** set `BACKLIGHT_SLEEP=1` and `UNIT_ID=<name>` in
 `/etc/usage-dashboard-gui.env`, then restart the GUI (or let the auto-updater
 do it). A malformed/unset schedule degrades gracefully to the built-in default.
+
+## Status overlay (diagnostics + brightness)
+
+Tap the status line (the "Updated … · refresh … · N providers" row at the bottom
+of the grid) to open a card with **unit diagnostics on the left** and
+**brightness `−`/`+` on the right**; tap anywhere outside the card to close it.
+
+**Left — diagnostics** answer "how do I reach this unit and is it healthy?"
+without an SSH session:
+
+- **Host** and **IP**(s) — the hostname and reachable addresses.
+- **Server** — which server host this client points at.
+- **Commit** — the running short SHA, tagged `(current)` or `(rolled back)`.
+- **Update** — the auto-updater's last result (`ok` / `pip failed` /
+  `import failed`) and how long ago; a failure is shown in red. **No record** (red)
+  means the updater hasn't written a status yet.
+- **Changed** — when the code last actually moved.
+
+  Update health comes from two tiny files the updater writes under the state dir
+  (`update-last-check`, `update-last-change`); no daemon, no config. Hostname/IPs
+  are read from the OS; the running commit from the checkout (or the updater's
+  record).
+
+**Right — brightness** drives the panel `brightness` node directly (the same
+writable-by-`video` node used for sleep, so no root/udev helper), and never dims
+to 0 — blanking is what sleep is for:
+
+- **Granularity:** `BRIGHTNESS_STEPS` (default `10`) sets how many `−`/`+` notches
+  span dimmest→full. Try `9`/`11`/etc. by changing it and restarting the GUI — no
+  code change.
+- **Survives sleep/wake:** a chosen level is also used as the wake-restore level,
+  so the panel comes back at *your* brightness after a scheduled or double-tap
+  sleep, not the startup default.
+- **Survives reboot:** the chosen *level* is persisted (best-effort) to
+  `$XDG_STATE_HOME/usage-dashboard/brightness` (default
+  `~/.local/state/usage-dashboard/brightness`) and re-applied at startup. Set
+  `BRIGHTNESS_STATE_FILE` to relocate it, or to empty to disable persistence. An
+  unwritable path degrades to "remembered within the session only".
+- **No-op without a controllable backlight** (dev/windowed mode): the `−`/`+`
+  show `—` and do nothing — but the overlay still opens for the diagnostics.
 
 ## Development
 

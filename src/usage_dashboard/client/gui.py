@@ -14,23 +14,34 @@ import logging
 import os
 import signal
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 import pygame
 
+from usage_dashboard.client import diagnostics as diag
 from usage_dashboard.client import format as fmt
 from usage_dashboard.client.backlight import Backlight
+from usage_dashboard.client.brightness import (
+    level_for_step,
+    load_level,
+    save_level,
+    step_for_level,
+)
 from usage_dashboard.client.fetcher import ClientFetcher
 from usage_dashboard.client.layout import (
     BarSpec,
+    BrightnessOverlay,
     DetailLayout,
     MainLayout,
     Rect,
+    StatusOverlay,
     TileSpec,
     ViewState,
     build_detail_layout,
     build_main_layout,
+    build_status_overlay,
     rotate_touch_norm,
     tap_transition,
 )
@@ -40,6 +51,8 @@ from usage_dashboard.shared.models import Provider, Reading
 logger = logging.getLogger(__name__)
 
 _TILE_BG = (17, 17, 17)
+_OVERLAY_BG = (28, 28, 28)
+_BTN_BG = (45, 45, 45)
 
 
 def _env_int(name: str, default: int) -> int:
@@ -101,6 +114,10 @@ class DashboardGui:
         touch_rotate: int = 0,
         schedule_resolver: ScheduleResolver | None = None,
         backlight: Backlight | None = None,
+        brightness_steps: int = 10,
+        brightness_state_file: Path | None = None,
+        server_url: str = "",
+        status_dir: Path | None = None,
     ) -> None:
         self._fetcher = fetcher
         screen = pygame.display.get_surface()
@@ -133,6 +150,19 @@ class DashboardGui:
         self._double_tap = DoubleTapDetector(
             tolerance_px=max(40, min(self._width, self._height) // 6)
         )
+        # Status overlay: tapping the status ("Updated…") line opens a card with
+        # unit diagnostics (hostname/IPs, server, running commit, updater health)
+        # on the left and brightness +/- on the right. The step count (nudge
+        # granularity) is configurable so a unit can try 9/10/11/… without code
+        # changes; the chosen *level* is persisted best-effort so it survives a
+        # reboot, and applied to the panel at startup. Diagnostics are gathered
+        # once when the overlay opens (cheap, but no need to re-poll per frame).
+        self._brightness_steps = max(2, brightness_steps)
+        self._brightness_state_file = brightness_state_file
+        self._brightness_step = self._init_brightness_step()
+        self._server_url = server_url
+        self._status_dir = status_dir
+        self._diag: diag.Diagnostics | None = None
         # While dark we tick slowly to save CPU but still pump touch events.
         self._sleep_fps = 4
         # Fonts scaled to the panel so the same code reads on any resolution.
@@ -141,6 +171,8 @@ class DashboardGui:
         self._font = pygame.font.Font(None, unit)
         self._font_small = pygame.font.Font(None, max(14, unit * 4 // 5))
         self._font_title = pygame.font.Font(None, unit * 5 // 4)
+        # Oversized glyphs for the brightness overlay's +/- buttons and readout.
+        self._font_big = pygame.font.Font(None, unit * 2)
         # Fixed width reserved on the right of every bar row for the reset text,
         # sized to a worst-case countdown so the bar track always ends at the
         # same x and never bleeds into "resets …".
@@ -150,6 +182,53 @@ class DashboardGui:
 
     def stop(self) -> None:
         self._running = False
+
+    # -- brightness ---------------------------------------------------------
+
+    def _init_brightness_step(self) -> int:
+        """Resolve the starting step: a persisted level (re-applied to the panel
+        so it survives a reboot) if present, else the panel's current
+        brightness. Falls back to full when there's no controllable backlight."""
+        if not self._backlight.available:
+            return self._brightness_steps
+        max_level = self._backlight.max_level
+        persisted = (
+            load_level(self._brightness_state_file)
+            if self._brightness_state_file is not None else None
+        )
+        if persisted is not None:
+            self._backlight.set_level(persisted)
+            return step_for_level(persisted, self._brightness_steps, max_level)
+        return step_for_level(
+            self._backlight.current_level, self._brightness_steps, max_level
+        )
+
+    def _nudge_brightness(self, delta: int) -> None:
+        """Move the brightness one step (clamped to the rails), push it to the
+        panel, and persist the chosen level. No-op at a rail or with no
+        backlight."""
+        if not self._backlight.available:
+            return
+        step = max(1, min(self._brightness_steps, self._brightness_step + delta))
+        if step == self._brightness_step:
+            return
+        self._brightness_step = step
+        level = level_for_step(step, self._brightness_steps, self._backlight.max_level)
+        self._backlight.set_level(level)
+        if self._brightness_state_file is not None:
+            save_level(self._brightness_state_file, level)
+
+    def _handle_overlay_tap(self, pos: tuple[int, int]) -> None:
+        """Route a tap while the status overlay is open: the right-column
+        ``−``/``+`` nudge brightness; a tap outside the card closes it; taps on
+        the diagnostics column or the readout do nothing."""
+        overlay = build_status_overlay((self._width, self._height))
+        if overlay.brightness.minus.contains(*pos):
+            self._nudge_brightness(-1)
+        elif overlay.brightness.plus.contains(*pos):
+            self._nudge_brightness(+1)
+        elif not overlay.panel.contains(*pos):
+            self._state = ViewState()
 
     def _tap_position(self, event: pygame.event.Event) -> tuple[int, int] | None:
         if event.type == pygame.MOUSEBUTTONDOWN:
@@ -187,6 +266,11 @@ class DashboardGui:
                     if self._schedule is not None and now is not None:
                         self._wake_until = self._schedule.wake_until(now)
                     continue
+                if self._state.overlay:
+                    # Overlay open: route to its buttons; never feed the
+                    # double-tap detector so rapid +/- taps don't sleep the panel.
+                    self._handle_overlay_tap(pos)
+                    continue
                 if self._double_tap.register(pygame.time.get_ticks(), pos):
                     # A double-tap puts the panel to sleep now (if the backlight
                     # is actually controllable) and drops back to the home grid,
@@ -195,6 +279,19 @@ class DashboardGui:
                     if self._backlight.available:
                         self._manual_sleep = True
                         self._state = ViewState()
+                    continue
+                if (
+                    self._state.detail_provider is None
+                    and layout.status_rect.contains(*pos)
+                ):
+                    # Single tap on the "Updated…" line opens the status overlay.
+                    # Always available — diagnostics are useful even with no
+                    # controllable backlight (the +/- side then just no-ops).
+                    # Gather diagnostics now; reset the double-tap pair so the
+                    # opening tap can't later combine with a tap in the overlay.
+                    self._diag = diag.gather(self._status_dir, self._server_url)
+                    self._double_tap.reset()
+                    self._state = ViewState(overlay=True)
                     continue
                 self._state = tap_transition(self._state, layout, pos)
 
@@ -233,7 +330,11 @@ class DashboardGui:
             self._backlight.set_power(on=not dark)
             if not dark:
                 self._screen.fill(fmt.BG)
-                if self._state.detail_provider is None:
+                if self._state.overlay:
+                    # The grid stays behind for context; the card sits on top.
+                    self._draw_main(layout)
+                    self._draw_status_overlay()
+                elif self._state.detail_provider is None:
                     self._draw_main(layout)
                 else:
                     self._draw_detail(readings)
@@ -391,6 +492,108 @@ class DashboardGui:
         hint = self._font_small.render("tap anywhere to go back", True, fmt.GRAY)
         self._screen.blit(hint, (pad, self._height - hint.get_height() - pad))
 
+    def _draw_status_overlay(self) -> None:
+        overlay: StatusOverlay = build_status_overlay((self._width, self._height))
+        p = overlay.panel
+        panel_rect = pygame.Rect(p.x, p.y, p.w, p.h)
+        pygame.draw.rect(self._screen, _OVERLAY_BG, panel_rect, border_radius=12)
+        pygame.draw.rect(self._screen, fmt.TEXT, panel_rect, width=2, border_radius=12)
+        pad = max(8, min(p.w, p.h) // 14)
+        # A hairline divider between the diagnostics and brightness columns.
+        div_x = overlay.brightness.region.x - pad
+        pygame.draw.line(
+            self._screen, _BTN_BG, (div_x, p.y + pad), (div_x, p.y + p.h - pad), 1
+        )
+        self._draw_diagnostics(overlay.diag_rect)
+        self._draw_brightness_controls(overlay.brightness)
+
+        hint = self._font_small.render("tap outside to close", True, fmt.GRAY)
+        self._screen.blit(
+            hint,
+            (p.x + (p.w - hint.get_width()) // 2, p.y + p.h - hint.get_height() - 4),
+        )
+
+    def _draw_diagnostics(self, rect: Rect) -> None:
+        """Left column: how to reach this unit and whether the updater is happy."""
+        title = self._font_title.render("This unit", True, fmt.TEXT)
+        self._screen.blit(title, (rect.x, rect.y))
+        y = rect.y + title.get_height() + 6
+        lines = (
+            diag.diagnostic_lines(self._diag, datetime.now(timezone.utc))
+            if self._diag is not None else []
+        )
+        for line in lines:
+            if y + self._font.get_height() > rect.y + rect.h:
+                break
+            value_color = fmt.RED if line.warn else fmt.TEXT
+            if line.label:
+                self._screen.blit(
+                    self._font.render(f"{line.label}", True, fmt.GRAY), (rect.x, y)
+                )
+            if line.value:
+                val = self._font.render(line.value, True, value_color)
+                self._screen.blit(
+                    val, (rect.x + rect.w - val.get_width(), y)
+                )
+            y += self._font.get_height() + 6
+
+    def _draw_brightness_controls(self, controls: BrightnessOverlay) -> None:
+        """Right column: ``−`` | step readout + gauge | ``+``."""
+        region = controls.region
+        title = self._font_title.render("Brightness", True, fmt.TEXT)
+        self._screen.blit(
+            title, (region.x + (region.w - title.get_width()) // 2, region.y)
+        )
+        # Big finger targets. ASCII glyphs so the default font always has them.
+        for rect, glyph in ((controls.minus, "-"), (controls.plus, "+")):
+            br = pygame.Rect(rect.x, rect.y, rect.w, rect.h)
+            pygame.draw.rect(self._screen, _BTN_BG, br, border_radius=10)
+            pygame.draw.rect(self._screen, fmt.GRAY, br, width=2, border_radius=10)
+            g = self._font_big.render(glyph, True, fmt.TEXT)
+            self._screen.blit(
+                g,
+                (rect.x + (rect.w - g.get_width()) // 2,
+                 rect.y + (rect.h - g.get_height()) // 2),
+            )
+
+        # Centre readout: current step over a filled-segment gauge. "—" when
+        # there's no controllable backlight, so the inert +/- read as inert.
+        lr = controls.level_rect
+        cx = lr.x + lr.w // 2
+        available = self._backlight.available
+        num_text = str(self._brightness_step) if available else "—"
+        num = self._font_big.render(num_text, True, fmt.TEXT)
+        den = self._font_small.render(f"of {self._brightness_steps}", True, fmt.GRAY)
+        self._screen.blit(num, (cx - num.get_width() // 2, lr.y + 4))
+        if available:
+            self._screen.blit(
+                den, (cx - den.get_width() // 2, lr.y + 4 + num.get_height())
+            )
+        steps = self._brightness_steps
+        gap = 3
+        seg_w = max(2, (lr.w - (steps - 1) * gap) // steps)
+        seg_h = max(6, lr.h // 8)
+        total_w = seg_w * steps + gap * (steps - 1)
+        seg_x = lr.x + (lr.w - total_w) // 2
+        seg_y = lr.y + lr.h - seg_h
+        for i in range(steps):
+            lit = available and i < self._brightness_step
+            color = fmt.GREEN if lit else fmt.BAR_BG
+            pygame.draw.rect(
+                self._screen, color,
+                pygame.Rect(seg_x + i * (seg_w + gap), seg_y, seg_w, seg_h),
+                border_radius=2,
+            )
+
+
+def _default_brightness_state_file() -> Path | None:
+    """Where a manually-chosen brightness is remembered across reboots: the
+    ``brightness`` file in the shared per-unit state dir (see
+    :func:`diagnostics.default_state_dir`). None if the dir can't be resolved
+    (persistence then degrades to off, harmlessly)."""
+    state_dir = diag.default_state_dir()
+    return state_dir / "brightness" if state_dir is not None else None
+
 
 def _init_display() -> tuple[int, int]:
     fullscreen = os.environ.get("GUI_FULLSCREEN", "1") != "0"
@@ -439,12 +642,24 @@ def main() -> None:
         ScheduleResolver(env_spec=os.environ.get("BACKLIGHT_SCHEDULE") or None)
         if sleep_enabled else None
     )
+    # Brightness control (tap the status line): BRIGHTNESS_STEPS tunes how many
+    # +/- notches span dim→full; BRIGHTNESS_STATE_FILE overrides where the chosen
+    # level is remembered across reboots (empty string disables persistence).
+    state_env = os.environ.get("BRIGHTNESS_STATE_FILE")
+    if state_env is None:
+        brightness_state_file: Path | None = _default_brightness_state_file()
+    else:
+        brightness_state_file = Path(state_env) if state_env.strip() else None
     gui = DashboardGui(
         fetcher,
         size,
         fps=_env_int("GUI_FPS", 10),
         touch_rotate=_env_int("GUI_TOUCH_ROTATE", 0),
         schedule_resolver=resolver,
+        brightness_steps=_env_int("BRIGHTNESS_STEPS", 10),
+        brightness_state_file=brightness_state_file,
+        server_url=server_url,
+        status_dir=diag.default_state_dir(),
     )
 
     def _handle_sigterm(signum: int, frame: Any) -> None:
