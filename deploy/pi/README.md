@@ -106,6 +106,8 @@ Idempotent — safe to re-run. Run as your normal user (it uses `sudo` itself).
 7. installs the **touch rebind** script + `goodix-touch-rebind.service` (§4)
 8. installs the **X session launcher** to `/usr/local/bin/usage-dashboard-xsession`
 9. installs + enables the GUI service (xinit-wrapped) and the auto-update timer
+10. installs the **redeploy helper** (`/usr/local/bin/usage-dashboard-redeploy`) +
+    its scoped `sudoers.d` rule, for opt-in auto-redeploy (§6) — inert until enabled
 
 Config knobs (env vars): `XRANDR_ROTATE`, `UPDATE_REF`, `APPDIR`, `VENV`,
 `RUNUSER`, `REPO_URL` (use the SSH URL + a deploy key for a private repo).
@@ -123,6 +125,7 @@ API_KEY=<the shared bearer token>     # same api-key the server uses
 # UNIT_ID=mpmusageNN                   # this unit's key in the schedules ConfigMap
 # BACKLIGHT_SCHEDULE=daily 00:00-08:00; fri 18:00-mon 08:00   # local fallback
 # BRIGHTNESS_STEPS=10                  # status overlay -/+ notches (tap status line); try 9/11
+# AUTO_REDEPLOY=1                      # also self-redeploy units/scripts (see §6); off by default
 ```
 
 Then `sudo systemctl restart usage-dashboard-gui`.
@@ -185,15 +188,57 @@ with a randomised jitter so a fleet doesn't sync up). On each tick the updater:
 4. if the install or smoke check fails, it **rolls back** to the previous commit
    and leaves the running app untouched.
 
-> **Scope:** the updater only swaps the **Python app** and restarts the service.
-> It does **not** re-run `install.sh` or re-render systemd units / the X
-> launcher / the touch workaround. Changes to *those* (anything under
-> `deploy/pi/` except the app code) need a manual `install.sh` re-run on each
-> unit; pushing them to `main` will **not** disturb already-provisioned Pis.
+> **Scope:** by default the updater only swaps the **Python app** and restarts
+> the service. The **installer-managed components** — the updater script itself,
+> the systemd units, the X launcher, the touch workaround — change only on a
+> manual `install.sh` re-run, *unless* you opt into auto-redeploy (below).
 
 The updater runs from a stable copy at `/usr/local/bin/usage-dashboard-update`
 (so a `git reset` can't rewrite the script mid-run) and may restart just the GUI
 via a scoped `sudoers.d` drop-in.
+
+### Auto-redeploy of installer-managed components (opt-in)
+
+Set `AUTO_REDEPLOY=1` in `/etc/usage-dashboard-gui.env` and the updater also
+re-applies the installer-managed components from the pulled checkout each cycle,
+so an infra change (e.g. an edited unit file or the updater itself) reaches the
+fleet without a per-unit `install.sh` run. It is **off by default** — a unit only
+begins re-applying root-owned files once you opt in.
+
+How it stays safe:
+
+- **Content-addressed:** a component is touched only when the rendered source
+  differs from what's installed — a no-op in steady state.
+- **Atomic writes:** every file is written to a temp sibling and `os.replace`-d
+  into place, so replacing the running updater/wrapper mid-cycle can't corrupt it
+  (the live process keeps its handle to the old inode).
+- **Verify before install:** unit files are checked with `systemd-analyze verify`;
+  a unit that fails is **skipped** (the working one stays), never installed.
+- **Rollback:** the GUI service is bounced only if it was already running, then
+  health-checked — if it doesn't come back active, its prior unit/launcher is
+  restored and restarted. (A unit that *starts* but renders a black panel can't be
+  auto-detected; that residual risk is why this is opt-in.)
+
+The privileged work runs via a root-owned helper
+(`/usr/local/bin/usage-dashboard-redeploy`) the updater calls through a single
+argument-free `NOPASSWD` rule; the helper recovers the per-unit template values
+(`RUNUSER`/rotation from the GUI unit, `APPDIR`/`VENV` from the updater) from the
+already-installed files. The decision logic lives in
+`usage_dashboard.deploy.redeploy` and is unit-tested.
+
+> **Trust note:** auto-redeploy lets a push to the tracked ref change root-owned
+> systemd units on the fleet — a real escalation over "run app code as the GUI
+> user." Pair it with a pinned `UPDATE_REF` if that matters. Also: the `NOPASSWD`
+> helper runs the venv Python + `usage_dashboard.deploy.redeploy`, which live in
+> the run user's (writable) checkout — so enabling this effectively gives the run
+> user passwordless root through the helper. That's fine when the run user is the
+> trusted sudoer who ran `install.sh` (the intended setup); don't enable it for a
+> run user you wouldn't already hand `sudo`.
+>
+> **Bootstrap:** a unit already running the *old* updater can't pull this in
+> automatically (its installed updater predates the feature). Re-run `install.sh`
+> once per existing unit to lay down the new updater + helper + sudoers rule;
+> after that, future infra changes propagate on their own.
 
 **Pin a fleet to a release:** set `UPDATE_REF=v0.2.0` in each
 `/etc/usage-dashboard-gui.env`. They'll hold there until you bump it.

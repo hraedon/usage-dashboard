@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# Privileged re-apply of the installer-managed components (WI-016).
+#
+# install.sh copies this to /usr/local/bin/usage-dashboard-redeploy (root-owned)
+# and grants the run user a single NOPASSWD rule for *this exact command, no
+# args*. update.sh invokes it (as root, via sudo) after a successful pull when
+# AUTO_REDEPLOY=1. The redeploy logic lives in the Python module so it is
+# unit-tested without root; this wrapper only recovers the per-unit template
+# values from the already-installed files (so sudoers needs no arguments) and
+# hands off. It is itself one of the components the module keeps up to date, so
+# the module replaces it via atomic rename — never corrupting this running copy.
+set -euo pipefail
+
+GUI_UNIT="/etc/systemd/system/usage-dashboard-gui.service"
+UPDATER="/usr/local/bin/usage-dashboard-update"
+
+log() { echo "usage-dashboard-redeploy: $*"; }
+
+# RUNUSER + rotation come from the installed GUI unit; APPDIR + VENV from the
+# installed updater (where install.sh substituted them). Recovering them here —
+# rather than taking them as args — is what lets the sudoers rule stay argument-
+# free, so the run user can't smuggle a different appdir/venv past it.
+RUNUSER="$(sed -n 's/^User=//p' "$GUI_UNIT" | head -1)"
+ROTATE="$(sed -n 's/^Environment=XRANDR_ROTATE=//p' "$GUI_UNIT" | head -1)"
+ROTATE="${ROTATE:-right}"
+APPDIR="$(sed -n 's/^APPDIR="\(.*\)"$/\1/p' "$UPDATER" | head -1)"
+VENV="$(sed -n 's/^VENV="\(.*\)"$/\1/p' "$UPDATER" | head -1)"
+
+[ -n "$RUNUSER" ] || { log "could not recover RUNUSER from $GUI_UNIT"; exit 1; }
+[ -n "$APPDIR" ] && [ -d "$APPDIR" ] || { log "could not recover APPDIR"; exit 1; }
+[ -x "$VENV/bin/python" ] || { log "no venv python at $VENV"; exit 1; }
+
+exec "$VENV/bin/python" -m usage_dashboard.deploy.redeploy apply \
+    --appdir "$APPDIR" --runuser "$RUNUSER" --venv "$VENV" --rotate "$ROTATE" --root /
