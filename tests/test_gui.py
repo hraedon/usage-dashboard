@@ -16,6 +16,7 @@ os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
 
 pygame = pytest.importorskip("pygame")
 
+from usage_dashboard.client import diagnostics  # noqa: E402
 from usage_dashboard.client.brightness import step_for_level  # noqa: E402
 from usage_dashboard.client.gui import (  # noqa: E402
     DashboardGui,
@@ -23,8 +24,8 @@ from usage_dashboard.client.gui import (  # noqa: E402
 )
 from usage_dashboard.client.layout import (  # noqa: E402
     ViewState,
-    build_brightness_overlay,
     build_main_layout,
+    build_status_overlay,
 )
 from usage_dashboard.shared.models import (  # noqa: E402
     Provider,
@@ -297,16 +298,28 @@ def _make_brightness_gui(
     level: int = 15,
     state_file=None,
     steps: int = 10,
+    status_dir=None,
 ):
     return DashboardGui(
         _FakeFetcher(_readings()), size,  # type: ignore[arg-type]
         backlight=_FakeBacklight(available=available, level=level),  # type: ignore[arg-type]
         brightness_steps=steps,
         brightness_state_file=state_file,
+        status_dir=status_dir,
     )
 
 
-def test_status_tap_opens_brightness_overlay() -> None:
+def _plus(size: tuple[int, int]) -> tuple[int, int]:
+    b = build_status_overlay(size).brightness
+    return b.plus.x + b.plus.w // 2, b.plus.y + b.plus.h // 2
+
+
+def _minus(size: tuple[int, int]) -> tuple[int, int]:
+    b = build_status_overlay(size).brightness
+    return b.minus.x + b.minus.w // 2, b.minus.y + b.minus.h // 2
+
+
+def test_status_tap_opens_overlay() -> None:
     pygame.display.init()
     pygame.font.init()
     size = (480, 320)
@@ -316,12 +329,15 @@ def test_status_tap_opens_brightness_overlay() -> None:
         layout = build_main_layout(_readings(), size)
         _post_taps([_status_pos(size)])
         gui._handle_events(layout, swallow_wake=False, now=_NOW)
-        assert gui._state.brightness is True
+        assert gui._state.overlay is True
+        assert gui._diag is not None  # diagnostics gathered on open
     finally:
         pygame.display.quit()
 
 
-def test_status_tap_noop_when_backlight_unavailable() -> None:
+def test_status_tap_opens_overlay_even_without_backlight() -> None:
+    # Diagnostics are useful with no controllable backlight, so the overlay must
+    # still open (unlike double-tap-to-sleep); the +/- side just no-ops.
     pygame.display.init()
     pygame.font.init()
     size = (480, 320)
@@ -331,7 +347,10 @@ def test_status_tap_noop_when_backlight_unavailable() -> None:
         layout = build_main_layout(_readings(), size)
         _post_taps([_status_pos(size)])
         gui._handle_events(layout, swallow_wake=False, now=_NOW)
-        assert gui._state.brightness is False
+        assert gui._state.overlay is True
+        _post_taps([_plus(size)])
+        gui._handle_events(layout, swallow_wake=False, now=_NOW)
+        assert gui._backlight.levels == []  # type: ignore[attr-defined]  # inert
     finally:
         pygame.display.quit()
 
@@ -347,20 +366,17 @@ def test_plus_minus_nudge_changes_level_and_persists(tmp_path) -> None:
         state = tmp_path / "brightness"
         # Start mid-scale (step 5 of 10 on a 31-max panel) so + and - both move.
         gui = _make_brightness_gui(size, level=16, state_file=state, steps=10)
-        gui._state = ViewState(brightness=True)
+        gui._state = ViewState(overlay=True)
         before = gui._brightness_step
 
-        overlay = build_brightness_overlay(size)
-        _post_taps([(overlay.plus.x + overlay.plus.w // 2,
-                     overlay.plus.y + overlay.plus.h // 2)])
+        _post_taps([_plus(size)])
         gui._handle_events(build_main_layout(_readings(), size),
                            swallow_wake=False, now=_NOW)
         assert gui._brightness_step == before + 1
         assert gui._backlight.levels  # set_level was called  # type: ignore[attr-defined]
         assert load_level(state) == gui._backlight.levels[-1]  # type: ignore[attr-defined]
 
-        _post_taps([(overlay.minus.x + overlay.minus.w // 2,
-                     overlay.minus.y + overlay.minus.h // 2)])
+        _post_taps([_minus(size)])
         gui._handle_events(build_main_layout(_readings(), size),
                            swallow_wake=False, now=_NOW)
         assert gui._brightness_step == before
@@ -375,11 +391,30 @@ def test_tap_outside_panel_closes_overlay() -> None:
     pygame.display.set_mode(size)
     try:
         gui = _make_brightness_gui(size)
-        gui._state = ViewState(brightness=True)
+        gui._state = ViewState(overlay=True)
         _post_taps([(1, 1)])  # corner, outside the centred card
         gui._handle_events(build_main_layout(_readings(), size),
                            swallow_wake=False, now=_NOW)
-        assert gui._state.brightness is False
+        assert gui._state.overlay is False
+    finally:
+        pygame.display.quit()
+
+
+def test_diagnostics_column_tap_does_not_close() -> None:
+    # A tap on the left (diagnostics) column is display-only — it must not be
+    # read as "tap outside to close".
+    pygame.display.init()
+    pygame.font.init()
+    size = (480, 320)
+    pygame.display.set_mode(size)
+    try:
+        gui = _make_brightness_gui(size)
+        gui._state = ViewState(overlay=True)
+        dr = build_status_overlay(size).diag_rect
+        _post_taps([(dr.x + dr.w // 2, dr.y + dr.h // 2)])
+        gui._handle_events(build_main_layout(_readings(), size),
+                           swallow_wake=False, now=_NOW)
+        assert gui._state.overlay is True
     finally:
         pygame.display.quit()
 
@@ -416,13 +451,21 @@ def test_persisted_level_applied_at_startup(tmp_path) -> None:
         pygame.display.quit()
 
 
-def test_draw_brightness_does_not_raise(tmp_path) -> None:
+def test_draw_status_overlay_does_not_raise(tmp_path) -> None:
     pygame.display.init()
     pygame.font.init()
     pygame.display.set_mode((1280, 720))
     try:
-        gui = _make_brightness_gui((1280, 720), steps=11)  # exercise an odd count
-        gui._draw_brightness()
+        state_dir = tmp_path / "state"
+        state_dir.mkdir()
+        (state_dir / "update-last-check").write_text(
+            "2026-06-26T01:00:00Z up-to-date a1b2c3d4"
+        )
+        gui = _make_brightness_gui(  # odd step count + a real diag snapshot
+            (1280, 720), steps=11, status_dir=state_dir,
+        )
+        gui._diag = diagnostics.gather(state_dir, "http://server.example:8080")
+        gui._draw_status_overlay()
     finally:
         pygame.display.quit()
 
