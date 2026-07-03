@@ -14,6 +14,7 @@ from usage_dashboard.client.layout import (
 from usage_dashboard.shared.models import (
     THROTTLE_BOXED,
     THROTTLE_LOW,
+    THROTTLE_RATE_LIMITED,
     ModelUsage,
     Provider,
     Reading,
@@ -114,6 +115,20 @@ class TestMainLayout:
         assert layout.footer_color == fmt.YELLOW
         # Low priority still shows the normal req/tok metrics.
         assert layout.footer_note == "UMANS req 5 tok 1M"
+
+    def test_footer_orange_when_umans_rate_limited(self) -> None:
+        # Deprioritization window: still serving, so orange (not red) with a
+        # countdown to the window end.
+        readings = _all_four()
+        readings[-1] = _reading(
+            Provider.UMANS, session_percent=None, weekly_percent=None,
+            session_resets_at=_NOW + timedelta(hours=4, minutes=30),
+            weekly_resets_at=None, detail="req 5 tok 1M",
+            throttle=THROTTLE_RATE_LIMITED,
+        )
+        layout = build_main_layout(readings, _SIZE, now=_NOW)
+        assert layout.footer_color == fmt.ORANGE
+        assert layout.footer_note == "UMANS rate-limited 4h 30m"
 
     def test_footer_boxed_shows_countdown_not_metrics(self) -> None:
         readings = _all_four()

@@ -34,10 +34,16 @@ class ReadingStatus(Enum):
 
 # Throttle severity for quota-less providers (umans), which have no percentage
 # to colour by. "low" = deprioritised routing (e.g. exceeded the concurrency
-# threshold); "boxed" = penalty box, the account is locked for the window. Worse
-# states win, so a provider that is both low and boxed reports "boxed".
+# threshold); "rate_limited" = a limit hit set boxed_until with
+# priority.reason="rate_limited" — the account KEEPS SERVING at low priority
+# for the window (proven live 2026-07-03, sluice
+# docs/wi-024-429-capture-2026-07-03.md); "boxed" = penalty box, the account
+# is locked for the window. Worse states win, so a provider that is both low
+# and boxed reports "boxed"; an unexpired boxed_until without the known-soft
+# rate_limited reason is always "boxed" (fail safe).
 THROTTLE_NONE = "none"
 THROTTLE_LOW = "low"
+THROTTLE_RATE_LIMITED = "rate_limited"
 THROTTLE_BOXED = "boxed"
 
 

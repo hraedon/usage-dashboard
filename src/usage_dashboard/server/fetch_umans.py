@@ -9,6 +9,7 @@ from usage_dashboard.shared.models import (
     THROTTLE_BOXED,
     THROTTLE_LOW,
     THROTTLE_NONE,
+    THROTTLE_RATE_LIMITED,
     Provider,
     Reading,
     ReadingStatus,
@@ -67,13 +68,32 @@ def fetch_umans_usage(api_key: str) -> Reading:
         # threshold. Neither = normal.
         priority = usage.get("priority") or {}
         priority = priority if isinstance(priority, dict) else {}
-        boxed_until = priority.get("boxed_until")
-        if boxed_until is not None:
-            throttle = THROTTLE_BOXED
-            # While boxed, the box-clear time is the only meaningful reset and
-            # the request/token metrics are moot, so surface boxed_until as the
-            # reading's reset; the client shows a live countdown in their place.
-            resets_at = _to_naive_utc(datetime.fromisoformat(str(boxed_until)))
+        boxed_until_raw = priority.get("boxed_until")
+        boxed_until = (
+            _to_naive_utc(datetime.fromisoformat(str(boxed_until_raw)))
+            if boxed_until_raw is not None
+            else None
+        )
+        # Only an *unexpired* boxed_until means the account is actually boxed.
+        # umans keeps returning the timestamp after the box lifts (notably after
+        # a self-reactivation), so a boxed_until in the past must NOT latch us as
+        # boxed — otherwise every reading reports "boxed" forever and the Pi
+        # footer stays red even though the account is live again.
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        if boxed_until is not None and boxed_until > now:
+            # priority.reason discriminates the rung: "rate_limited" means the
+            # account keeps serving at low priority for the window (a limit
+            # hit, not a lock — proven live 2026-07-03). Any other or absent
+            # reason is treated as a hard box, fail safe.
+            reason = priority.get("reason")
+            if reason == "rate_limited":
+                throttle = THROTTLE_RATE_LIMITED
+            else:
+                throttle = THROTTLE_BOXED
+            # Either way the window-clear time is the actionable reset, so
+            # surface boxed_until as the reading's reset; the client shows a
+            # live countdown.
+            resets_at = boxed_until
         elif priority.get("low"):
             throttle = THROTTLE_LOW
         else:

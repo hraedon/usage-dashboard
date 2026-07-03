@@ -15,6 +15,7 @@ from usage_dashboard.shared.models import (
     THROTTLE_BOXED,
     THROTTLE_LOW,
     THROTTLE_NONE,
+    THROTTLE_RATE_LIMITED,
     Provider,
     ReadingStatus,
 )
@@ -664,11 +665,14 @@ class TestFetchUmans:
         assert reading.throttle == THROTTLE_LOW
 
     @patch("usage_dashboard.server.fetch_umans.httpx.Client")
-    def test_boxed_until_is_throttle_boxed(self, mock_client_cls):
+    def test_future_boxed_until_is_throttle_boxed(self, mock_client_cls):
+        # Only an unexpired boxed_until means the account is actually boxed, so
+        # the fixture must be in the future relative to "now".
+        boxed_until = datetime.now(timezone.utc) + timedelta(hours=1)
         data = _umans_response_data()
         data["usage"]["priority"] = {
             "low": False,
-            "boxed_until": "2026-06-22T02:00:00+00:00",
+            "boxed_until": boxed_until.isoformat(),
             "reason": None,
         }
         _mock_umans_client(mock_client_cls, data)
@@ -678,15 +682,90 @@ class TestFetchUmans:
         assert reading.throttle == THROTTLE_BOXED
         # While boxed, boxed_until replaces the window reset so the client can
         # count down to the box clearing.
-        assert reading.session_resets_at == datetime(2026, 6, 22, 2, 0, 0)
+        assert reading.session_resets_at == boxed_until.replace(tzinfo=None)
+
+    @patch("usage_dashboard.server.fetch_umans.httpx.Client")
+    def test_future_boxed_until_with_rate_limited_reason_is_soft(self, mock_client_cls):
+        # priority.reason="rate_limited" = deprioritization: the account keeps
+        # serving at low priority for the window (observed live 2026-07-03),
+        # so it must NOT report as boxed. The window end still lands in
+        # session_resets_at for the client countdown.
+        boxed_until = datetime.now(timezone.utc) + timedelta(hours=4)
+        data = _umans_response_data()
+        data["usage"]["priority"] = {
+            "low": True,
+            "boxed_until": boxed_until.isoformat(),
+            "reason": "rate_limited",
+        }
+        _mock_umans_client(mock_client_cls, data)
+
+        reading = fetch_umans_usage("test-key")
+
+        assert reading.throttle == THROTTLE_RATE_LIMITED
+        assert reading.session_resets_at == boxed_until.replace(tzinfo=None)
+
+    @patch("usage_dashboard.server.fetch_umans.httpx.Client")
+    def test_future_boxed_until_with_unknown_reason_stays_boxed(self, mock_client_cls):
+        # Fail safe: only the known-soft "rate_limited" reason downgrades the
+        # window; anything else (or absent, covered above) is a hard box.
+        boxed_until = datetime.now(timezone.utc) + timedelta(hours=1)
+        data = _umans_response_data()
+        data["usage"]["priority"] = {
+            "low": False,
+            "boxed_until": boxed_until.isoformat(),
+            "reason": "abuse",
+        }
+        _mock_umans_client(mock_client_cls, data)
+
+        reading = fetch_umans_usage("test-key")
+
+        assert reading.throttle == THROTTLE_BOXED
+
+    @patch("usage_dashboard.server.fetch_umans.httpx.Client")
+    def test_past_boxed_until_is_not_boxed(self, mock_client_cls):
+        # Regression: umans keeps returning the boxed_until timestamp after the
+        # box lifts (e.g. after a self-reactivation). A *past* boxed_until must
+        # not latch the reading as boxed, or the Pi footer stays red forever
+        # while the web view (which ignores throttle) looks fine.
+        past = datetime.now(timezone.utc) - timedelta(hours=5)
+        data = _umans_response_data()
+        data["usage"]["priority"] = {
+            "low": False,
+            "boxed_until": past.isoformat(),
+            "reason": None,
+        }
+        _mock_umans_client(mock_client_cls, data)
+
+        reading = fetch_umans_usage("test-key")
+
+        assert reading.throttle == THROTTLE_NONE
+        # The expired box must not hijack the reset; the window reset stands.
+        assert reading.session_resets_at == datetime(2026, 6, 13, 0, 29, 48, 490451)
+
+    @patch("usage_dashboard.server.fetch_umans.httpx.Client")
+    def test_expired_box_still_low_is_throttle_low(self, mock_client_cls):
+        # Past box + still low-priority -> falls through to LOW, not boxed.
+        past = datetime.now(timezone.utc) - timedelta(hours=5)
+        data = _umans_response_data()
+        data["usage"]["priority"] = {
+            "low": True,
+            "boxed_until": past.isoformat(),
+            "reason": "rate",
+        }
+        _mock_umans_client(mock_client_cls, data)
+
+        reading = fetch_umans_usage("test-key")
+
+        assert reading.throttle == THROTTLE_LOW
 
     @patch("usage_dashboard.server.fetch_umans.httpx.Client")
     def test_boxed_wins_over_low(self, mock_client_cls):
         # In the penalty box and low-priority at once -> the worse state (boxed).
+        boxed_until = datetime.now(timezone.utc) + timedelta(hours=1)
         data = _umans_response_data()
         data["usage"]["priority"] = {
             "low": True,
-            "boxed_until": "2026-06-22T02:00:00+00:00",
+            "boxed_until": boxed_until.isoformat(),
             "reason": "rate",
         }
         _mock_umans_client(mock_client_cls, data)

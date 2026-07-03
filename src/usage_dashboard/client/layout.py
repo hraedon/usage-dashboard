@@ -16,6 +16,7 @@ from usage_dashboard.client import format as fmt
 from usage_dashboard.shared.models import (
     THROTTLE_BOXED,
     THROTTLE_LOW,
+    THROTTLE_RATE_LIMITED,
     ModelUsage,
     Provider,
     Reading,
@@ -204,13 +205,20 @@ def build_main_layout(
     footer_color = fmt.TEXT
     if umans is not None:
         # umans has no quota to colour by; throttle severity is its signal.
-        # boxed (account locked) = red, low priority = yellow, else default.
+        # boxed (account locked) = red, rate_limited (deprioritized window,
+        # still serving) = orange, low priority = yellow, else default.
         if umans.throttle == THROTTLE_BOXED:
             # Replace the (now-moot) req/tok metrics with a countdown to when
             # the penalty box clears.
             text, _ = fmt.format_countdown(umans.session_resets_at, now)
             footer_note = f"UMANS boxed {text}".strip()
             footer_color = fmt.RED
+        elif umans.throttle == THROTTLE_RATE_LIMITED:
+            # Deprioritized window: the account is still serving; the window
+            # countdown is the actionable signal, so it takes the metrics' spot.
+            text, _ = fmt.format_countdown(umans.session_resets_at, now)
+            footer_note = f"UMANS rate-limited {text}".strip()
+            footer_color = fmt.ORANGE
         elif umans.throttle == THROTTLE_LOW:
             footer_note = f"UMANS {umans.detail}".strip() if umans.detail else "UMANS"
             footer_color = fmt.YELLOW
