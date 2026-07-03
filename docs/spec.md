@@ -18,8 +18,8 @@ original providers) was delivered, then extended well past the original scope.
 for the planned pieces):
 
 - **umans** as a 4th provider — quota-less, rendered via `Reading.detail`, with
-  a `throttle` severity (none/low/boxed) that colours its line and shows a
-  penalty-box countdown. *(No spec/plan entry — added directly.)*
+  a `throttle` severity (none/low/rate_limited/boxed) that colours its line and
+  shows a penalty-box countdown. *(No spec/plan entry — added directly.)*
 - **Second Claude account** (work login) — merged into the Claude tile as a
   muted second set of bars. *(No spec/plan entry.)*
 - **Dedicated Claude OAuth login** replacing the `~/.claude/.credentials.json`

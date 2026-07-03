@@ -69,10 +69,13 @@ tool calls), sorted by share — the clients show the top two on the tile title
 and the top several in the detail view.
 
 `throttle` is a severity signal for quota-less providers (umans): `none`,
-`low` (deprioritised — over the concurrency threshold), or `boxed` (penalty
-box, account locked for the window). The clients colour the umans line
-yellow/red accordingly, and on `boxed` replace its metrics with a countdown to
-when the box clears.
+`low` (deprioritised — over the concurrency threshold), `rate_limited` (a
+limit hit set `boxed_until` with `priority.reason = "rate_limited"` — the
+account keeps serving at low priority for the window), or `boxed` (penalty
+box, account locked for the window; any unexpired `boxed_until` *without* the
+known-soft `rate_limited` reason). The clients colour the umans line
+yellow/orange/red accordingly, and on `rate_limited`/`boxed` replace its
+metrics with a countdown to when the window clears.
 
 ## Clients
 
