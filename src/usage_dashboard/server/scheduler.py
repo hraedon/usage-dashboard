@@ -70,6 +70,7 @@ class FetchScheduler:
         failure_cap_seconds: int = 3600,
         change_epsilon: float = 0.5,
         token_store: TokenStore | None = None,
+        retention_days: int = 7,
     ) -> None:
         self._db = db
         self._claude_token = claude_token
@@ -97,6 +98,8 @@ class FetchScheduler:
         self._failure_cap = float(failure_cap_seconds)
         self._change_epsilon = change_epsilon
         self._schedules: dict[Provider, _ProviderSchedule] = {}
+        self._retention_days = retention_days
+        self._last_prune: datetime | None = None
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -279,7 +282,7 @@ class FetchScheduler:
         previous = self._db.get_latest_readings().get(provider)
         try:
             reading = fetch_fn()
-            self._db.store_reading(reading, consecutive_failures=0)
+            self._db.store_reading(reading)
             self._db.reset_failures(provider)
             self._schedule_after_success(provider, previous, reading)
         except FetchError as exc:
@@ -314,7 +317,7 @@ class FetchScheduler:
             reading = fetch_claude_usage(token or "")
         except FetchError:
             return False
-        self._db.store_reading(reading, consecutive_failures=0)
+        self._db.store_reading(reading)
         self._db.reset_failures(provider)
         self._schedule_after_success(provider, previous, reading)
         return True
@@ -348,7 +351,6 @@ class FetchScheduler:
         if failures >= self._offline_threshold:
             self._db.store_reading(
                 make_offline_reading(provider, now),
-                consecutive_failures=failures,
             )
         elif existing is not None:
             stale = make_stale_reading(existing)
@@ -356,12 +358,10 @@ class FetchScheduler:
                 stale = replace(stale, detail=None)
             self._db.store_reading(
                 stale,
-                consecutive_failures=failures,
             )
         else:
             self._db.store_reading(
                 make_offline_reading(provider, now),
-                consecutive_failures=failures,
             )
         logger.warning(
             "Fetch failed for %s (failure #%d, backing off %.0fs): %s",
@@ -381,7 +381,6 @@ class FetchScheduler:
         sched.next_due = now + timedelta(seconds=backoff)
         self._db.store_reading(
             replace(make_offline_reading(provider, now), detail="cookie expired — re-login"),
-            consecutive_failures=failures,
         )
         logger.warning(
             "Auth failed for %s (failure #%d, backing off %.0fs): %s",
@@ -412,7 +411,13 @@ class FetchScheduler:
                     return
                 if now >= self._schedule(provider).next_due:
                     self._fetch_one(provider, fetch_fn)
+            self._maybe_prune(now)
             self._stop_event.wait(timeout=self._seconds_until_next_due(tasks))
+
+    def _maybe_prune(self, now: datetime) -> None:
+        if self._last_prune is None or (now - self._last_prune).total_seconds() >= 3600:
+            self._db.prune_old_readings(self._retention_days)
+            self._last_prune = now
 
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
