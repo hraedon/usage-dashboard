@@ -20,13 +20,12 @@ _USER_AGENT = (
 # steipete/CodexBar's OllamaUsageParser, the maintained prior art.
 _SESSION_LABELS = ("Session usage", "Hourly usage")
 _WEEKLY_LABEL = "Weekly usage"
-# The reset countdown can sit far after its label — the weekly bar renders a row
-# of segment <button>s between "Weekly usage" and its "Resets in …" text (~4.6k
-# chars observed), and it's the last section so there's no following label to
-# bound the block. Keep this comfortably above that gap or the weekly reset is
-# silently dropped. (Earlier-section blocks are bounded by the next label, not
-# this cap, so a generous value is safe.)
-_BLOCK_MAX_CHARS = 8000
+# The weekly reset countdown can sit far after its label — the weekly bar
+# renders a row of segment <button>s between "Weekly usage" and its "Resets
+# in …" text. Earlier-section blocks are bounded by the next label; the
+# weekly block is the last section, so we bound it by the closing </section>
+# tag rather than a char cap (WI-018).
+_BLOCK_END_TAG = "</section>"
 
 _PERCENT_USED_RE = re.compile(r"([0-9]+(?:\.[0-9]+)?)\s*%\s*used", re.IGNORECASE)
 _BAR_WIDTH_RE = re.compile(r"width:\s*([0-9]+(?:\.[0-9]+)?)%", re.IGNORECASE)
@@ -78,8 +77,12 @@ def _block_after(label: str, html: str) -> str | None:
         for other in (*_SESSION_LABELS, _WEEKLY_LABEL)
         if other != label and tail.find(other) != -1
     ]
-    end = min(boundaries) if boundaries else _BLOCK_MAX_CHARS
-    return tail[: min(end, _BLOCK_MAX_CHARS)]
+    if boundaries:
+        end = min(boundaries)
+    else:
+        section_end = tail.find(_BLOCK_END_TAG)
+        end = section_end if section_end != -1 else len(tail)
+    return tail[:end]
 
 
 def _parse_percent(block: str) -> float | None:
