@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock
 
 from usage_dashboard.server.db import Database
-from usage_dashboard.server.fetch_types import FetchError
+from usage_dashboard.server.fetch_types import FetchAuthError, FetchError
 from usage_dashboard.server.scheduler import FetchScheduler
 from usage_dashboard.server.token_store import TokenStore
 from usage_dashboard.shared.models import (
@@ -610,3 +610,97 @@ class TestConfiguredProviders:
             ollama_cookie="o",
         )
         assert scheduler.configured_providers() == list(Provider)
+
+
+class TestOllamaAuthFailureSignal:
+    def test_auth_failure_stores_offline_with_relogin_detail(self, tmp_path):
+        db = Database(str(tmp_path / "sched.db"))
+        db.initialize()
+        scheduler = FetchScheduler(db, ollama_cookie="cookie")
+        fetch_fn = MagicMock(side_effect=FetchAuthError("HTTP 401"))
+        scheduler._fetch_one(Provider.OLLAMA, fetch_fn)
+        reading = db.get_latest_readings()[Provider.OLLAMA]
+        assert reading.status is ReadingStatus.OFFLINE
+        assert reading.detail is not None
+        assert "re-login" in reading.detail
+
+    def test_non_auth_failure_still_walks_stale_ladder(self, tmp_path):
+        db = Database(str(tmp_path / "sched.db"))
+        db.initialize()
+        original = _make_reading(
+            provider=Provider.OLLAMA, status=ReadingStatus.CURRENT, stale=False,
+        )
+        db.store_reading(original)
+        scheduler = FetchScheduler(db, ollama_cookie="cookie")
+        fetch_fn = MagicMock(side_effect=FetchError("timeout"))
+        scheduler._fetch_one(Provider.OLLAMA, fetch_fn)
+        reading = db.get_latest_readings()[Provider.OLLAMA]
+        assert reading.status is ReadingStatus.STALE
+        assert reading.detail is None
+
+    def test_auth_failure_increments_failures_and_sets_backoff(self, tmp_path):
+        db = Database(str(tmp_path / "sched.db"))
+        db.initialize()
+        scheduler = FetchScheduler(
+            db, ollama_cookie="cookie", interval_seconds=300, failure_cap_seconds=3600
+        )
+        fetch_fn = MagicMock(side_effect=FetchAuthError("HTTP 401"))
+        scheduler._fetch_one(Provider.OLLAMA, fetch_fn)
+        assert db.get_consecutive_failures(Provider.OLLAMA) == 1
+        assert _interval(scheduler, Provider.OLLAMA) == 3600
+
+    def test_repeated_auth_failures_stay_at_cap(self, tmp_path):
+        db = Database(str(tmp_path / "sched.db"))
+        db.initialize()
+        scheduler = FetchScheduler(
+            db, ollama_cookie="cookie", interval_seconds=300, failure_cap_seconds=3600
+        )
+        fetch_fn = MagicMock(side_effect=FetchAuthError("HTTP 401"))
+        scheduler._fetch_one(Provider.OLLAMA, fetch_fn)
+        scheduler._fetch_one(Provider.OLLAMA, fetch_fn)
+        assert db.get_consecutive_failures(Provider.OLLAMA) == 2
+        assert _interval(scheduler, Provider.OLLAMA) == 3600
+        reading = db.get_latest_readings()[Provider.OLLAMA]
+        assert reading.status is ReadingStatus.OFFLINE
+        assert "re-login" in reading.detail
+
+    def test_auth_failure_overwrites_prior_current_reading(self, tmp_path):
+        db = Database(str(tmp_path / "sched.db"))
+        db.initialize()
+        original = _make_reading(
+            provider=Provider.OLLAMA, status=ReadingStatus.CURRENT, stale=False,
+            session_percent=42.0,
+        )
+        db.store_reading(original)
+        scheduler = FetchScheduler(db, ollama_cookie="cookie")
+        fetch_fn = MagicMock(side_effect=FetchAuthError("HTTP 401"))
+        scheduler._fetch_one(Provider.OLLAMA, fetch_fn)
+        reading = db.get_latest_readings()[Provider.OLLAMA]
+        assert reading.status is ReadingStatus.OFFLINE
+        assert "re-login" in (reading.detail or "")
+        assert reading.session_percent is None
+
+    def test_recovery_after_auth_failure_resets_state(self, tmp_path):
+        db = Database(str(tmp_path / "sched.db"))
+        db.initialize()
+        scheduler = FetchScheduler(
+            db, ollama_cookie="cookie", interval_seconds=300, failure_cap_seconds=3600
+        )
+        scheduler._fetch_one(Provider.OLLAMA, MagicMock(side_effect=FetchAuthError("401")))
+        assert db.get_consecutive_failures(Provider.OLLAMA) == 1
+        ok = _make_reading(provider=Provider.OLLAMA, session_percent=10.0)
+        scheduler._fetch_one(Provider.OLLAMA, MagicMock(return_value=ok))
+        assert db.get_consecutive_failures(Provider.OLLAMA) == 0
+        assert _interval(scheduler, Provider.OLLAMA) == 300
+        assert db.get_latest_readings()[Provider.OLLAMA].status is ReadingStatus.CURRENT
+
+    def test_non_auth_failure_after_auth_failure_clears_relogin_detail(self, tmp_path):
+        db = Database(str(tmp_path / "sched.db"))
+        db.initialize()
+        scheduler = FetchScheduler(db, ollama_cookie="cookie", offline_threshold=99)
+        scheduler._fetch_one(Provider.OLLAMA, MagicMock(side_effect=FetchAuthError("401")))
+        assert "re-login" in (db.get_latest_readings()[Provider.OLLAMA].detail or "")
+        scheduler._fetch_one(Provider.OLLAMA, MagicMock(side_effect=FetchError("timeout")))
+        reading = db.get_latest_readings()[Provider.OLLAMA]
+        assert reading.status is ReadingStatus.STALE
+        assert reading.detail is None

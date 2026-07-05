@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from functools import partial
 from typing import Any, Callable
@@ -22,6 +22,7 @@ from usage_dashboard.shared.models import (
     THROTTLE_BOXED,
     Provider,
     Reading,
+    ReadingStatus,
     make_offline_reading,
     make_stale_reading,
 )
@@ -293,6 +294,9 @@ class FetchScheduler:
                 elif provider == Provider.CLAUDE_WORK and self._try_refresh_claude_work():
                     if self._retry_claude(provider, previous, self._claude_work_token):
                         return
+            if provider is Provider.OLLAMA and isinstance(exc, FetchAuthError):
+                self._record_auth_failure(provider, exc)
+                return
             self._record_failure(provider, exc)
         except Exception as exc:
             # A non-FetchError (e.g. AttributeError parsing an unexpected API
@@ -347,8 +351,11 @@ class FetchScheduler:
                 consecutive_failures=failures,
             )
         elif existing is not None:
+            stale = make_stale_reading(existing)
+            if existing.status is ReadingStatus.OFFLINE and existing.detail:
+                stale = replace(stale, detail=None)
             self._db.store_reading(
-                make_stale_reading(existing),
+                stale,
                 consecutive_failures=failures,
             )
         else:
@@ -358,6 +365,26 @@ class FetchScheduler:
             )
         logger.warning(
             "Fetch failed for %s (failure #%d, backing off %.0fs): %s",
+            provider.value,
+            failures,
+            backoff,
+            exc,
+        )
+
+    def _record_auth_failure(self, provider: Provider, exc: FetchError) -> None:
+        failures = self._db.increment_failures(provider)
+        now = self._now()
+        backoff = self._failure_cap
+        sched = self._schedule(provider)
+        sched.failures = failures
+        sched.interval = backoff
+        sched.next_due = now + timedelta(seconds=backoff)
+        self._db.store_reading(
+            replace(make_offline_reading(provider, now), detail="cookie expired — re-login"),
+            consecutive_failures=failures,
+        )
+        logger.warning(
+            "Auth failed for %s (failure #%d, backing off %.0fs): %s",
             provider.value,
             failures,
             backoff,
