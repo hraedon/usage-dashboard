@@ -72,11 +72,12 @@ def _block_after(label: str, html: str) -> str | None:
     if start == -1:
         return None
     tail = html[start + len(label) :]
-    boundaries = [
-        tail.find(other)
-        for other in (*_SESSION_LABELS, _WEEKLY_LABEL)
-        if other != label and tail.find(other) != -1
-    ]
+    boundaries: list[int] = []
+    for other in (*_SESSION_LABELS, _WEEKLY_LABEL):
+        if other != label:
+            pos = tail.find(other)
+            if pos != -1:
+                boundaries.append(pos)
     if boundaries:
         end = min(boundaries)
     else:

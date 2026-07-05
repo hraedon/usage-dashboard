@@ -8,7 +8,6 @@ on:
 env:
   REGISTRY: ghcr.io
   SERVER_IMAGE: ghcr.io/hraedon/usage-dashboard-server
-  CLIENT_IMAGE: ghcr.io/hraedon/usage-dashboard-client
 
 jobs:
   build-and-push:
@@ -46,26 +45,5 @@ jobs:
           push: true
           tags: ${{ steps.server-meta.outputs.tags }}
           labels: ${{ steps.server-meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-      - name: Docker metadata (client)
-        id: client-meta
-        uses: docker/metadata-action@v6
-        with:
-          images: ${{ env.CLIENT_IMAGE }}
-          tags: |
-            type=sha
-            type=ref,event=branch
-            type=semver,pattern={{version}}
-
-      - name: Build and push client
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          file: Dockerfile.client
-          push: true
-          tags: ${{ steps.client-meta.outputs.tags }}
-          labels: ${{ steps.client-meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max

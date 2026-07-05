@@ -275,6 +275,19 @@ class TestPruneOldReadings:
         assert len(result) == 1
         assert result[Provider.CLAUDE].fetched_at == r2.fetched_at
 
+    def test_prune_keeps_latest_even_when_all_old(self, tmp_path):
+        db = Database(str(tmp_path / "test.db"))
+        db.initialize()
+        old1 = _make_reading(fetched_at=datetime(2026, 1, 1, 12, 0, 0))
+        old2 = _make_reading(fetched_at=datetime(2026, 1, 2, 12, 0, 0))
+        db.store_reading(old1)
+        db.store_reading(old2)
+        deleted = db.prune_old_readings(7)
+        assert deleted == 1
+        result = db.get_latest_readings()
+        assert len(result) == 1
+        assert result[Provider.CLAUDE].fetched_at == old2.fetched_at
+
 
 class TestSchemaMigration:
     def test_initialize_migrates_old_schema(self, tmp_path):

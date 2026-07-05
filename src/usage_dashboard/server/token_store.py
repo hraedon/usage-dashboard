@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import threading
 from pathlib import Path
 
@@ -103,7 +104,8 @@ class TokenStore:
     def _flush(self) -> None:
         tmp = self._path.with_suffix(".tmp")
         try:
-            with open(tmp, "w") as f:
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w") as f:
                 json.dump(self._data, f, indent=2)
             tmp.replace(self._path)
         except OSError as exc:
