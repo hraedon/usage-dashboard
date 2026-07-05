@@ -21,7 +21,7 @@ from usage_dashboard.shared.models import (
 
 _bearer_scheme = HTTPBearer(auto_error=False)
 
-# Same thresholds as the Pi client's _bar_color (client/renderer.py)
+# Same thresholds as the Pi client's bar_color (client/format.py)
 _CSS_GREEN = "#22c55e"
 _CSS_ORANGE = "#f97316"
 _CSS_RED = "#ef4444"

@@ -86,10 +86,10 @@ if [ -z "${_INSTALL_SH_REEXECED:-}" ]; then
     _STABLE_COPY="$(mktemp --suffix=.sh)"
     cp "$0" "$_STABLE_COPY"
     chmod +x "$_STABLE_COPY"
-    trap 'rm -f "$_STABLE_COPY"' EXIT
-    export _INSTALL_SH_REEXECED=1
+    export _STABLE_COPY _INSTALL_SH_REEXECED=1
     exec "$_STABLE_COPY" "$@"
 fi
+trap 'rm -f "${_STABLE_COPY:-}"' EXIT
 
 if [ -d "$APPDIR/.git" ]; then
     echo "==> updating checkout at $APPDIR"
