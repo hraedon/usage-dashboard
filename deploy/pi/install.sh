@@ -10,8 +10,10 @@
 # tried). install.sh sets up that X session, the landscape rotation, and a
 # workaround service for the Goodix touch controller's boot probe race.
 #
-# Idempotent: safe to re-run. Run as the normal login user (NOT root); it calls
-# sudo for the privileged bits. Override any default via env, e.g.:
+# Idempotent: safe to re-run (re-execs from a stable copy before the git
+# checkout so a `git reset --hard` can't rewrite the running script). Run
+# as the normal login user (NOT root); it calls sudo for the privileged
+# bits. Override any default via env, e.g.:
 #   XRANDR_ROTATE=left ./install.sh                                   # other way
 #   REPO_URL=git@github.com:hraedon/usage-dashboard.git ./install.sh   # private
 set -euo pipefail
@@ -74,6 +76,21 @@ printf 'allowed_users=anybody\nneeds_root_rights=yes\n' \
     | sudo tee /etc/X11/Xwrapper.config >/dev/null
 
 # --- 4. checkout ------------------------------------------------------------
+# Re-exec from a stable copy before touching the working tree, so a
+# `git reset --hard` that rewrites this file mid-run can't garble execution
+# (bash reads lazily by byte-offset; if the on-disk content changes, the
+# running shell continues at the same offset into the NEW content). This
+# happens when re-running install.sh on an existing checkout after main
+# has advanced. The copy is removed on exit.
+if [ -z "${_INSTALL_SH_REEXECED:-}" ]; then
+    _STABLE_COPY="$(mktemp --suffix=.sh)"
+    cp "$0" "$_STABLE_COPY"
+    chmod +x "$_STABLE_COPY"
+    trap 'rm -f "$_STABLE_COPY"' EXIT
+    export _INSTALL_SH_REEXECED=1
+    exec "$_STABLE_COPY" "$@"
+fi
+
 if [ -d "$APPDIR/.git" ]; then
     echo "==> updating checkout at $APPDIR"
     git -C "$APPDIR" fetch --quiet origin "$UPDATE_REF"

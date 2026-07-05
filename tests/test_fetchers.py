@@ -399,7 +399,7 @@ class TestFetchOllama:
         # On the live page the weekly bar renders a long row of segment <button>s
         # between "Weekly usage" and its "Resets in …" text (~4.6k chars), and
         # it's the last section so nothing bounds the block. The reset must still
-        # be parsed — i.e. _BLOCK_MAX_CHARS stays comfortably above that gap.
+        # be parsed — the block is bounded by </section> or the end of the HTML.
         filler = '<button class="seg"></button>' * 200  # ~5.8k chars
         html = f"""
         <html><body><span>Cloud Usage</span><span>Pro</span>
