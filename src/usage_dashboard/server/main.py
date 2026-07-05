@@ -99,6 +99,7 @@ def main() -> None:
     fetch_interval = int(os.environ.get("FETCH_INTERVAL", "300"))
     failure_backoff_cap = int(os.environ.get("FAILURE_BACKOFF_CAP", "3600"))
     port = int(os.environ.get("PORT", "8080"))
+    retention_days = int(os.environ.get("RETENTION_DAYS", "7"))
 
     db_dir = os.path.dirname(db_path)
     if db_dir:
@@ -135,6 +136,7 @@ def main() -> None:
         interval_seconds=fetch_interval,
         failure_cap_seconds=failure_backoff_cap,
         token_store=token_store,
+        retention_days=retention_days,
     )
 
     app = create_app(
