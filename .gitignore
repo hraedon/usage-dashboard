@@ -22,3 +22,6 @@ plans/design/
 .claude/
 
 OPEN_BREADCRUMBS.txt
+
+# never commit the local denylist (identifier gate)
+.identifiers-denylist.local
