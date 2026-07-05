@@ -84,3 +84,28 @@ class TestSeedMarker:
         path = tmp_path / "tokens.json"
         TokenStore(path).set_claude_seed_marker("m")
         assert TokenStore(path).get_claude_seed_marker() == "m"
+
+
+class TestCredentialStore:
+    def test_save_and_get_credential(self, tmp_path: Path) -> None:
+        store = TokenStore(tmp_path / "tokens.json")
+        store.save_credential("ollama", "session=abc")
+        assert store.get_credential("ollama") == "session=abc"
+
+    def test_get_credential_none_for_missing(self, tmp_path: Path) -> None:
+        store = TokenStore(tmp_path / "tokens.json")
+        assert store.get_credential("ollama") is None
+
+    def test_save_credential_preserves_seed_marker(self, tmp_path: Path) -> None:
+        store = TokenStore(tmp_path / "tokens.json")
+        store.set_seed_marker("ollama", "marker-1")
+        store.save_credential("ollama", "cookie")
+        assert store.get_seed_marker("ollama") == "marker-1"
+        assert store.get_credential("ollama") == "cookie"
+
+    def test_credential_persists_across_instances(self, tmp_path: Path) -> None:
+        path = tmp_path / "tokens.json"
+        store1 = TokenStore(path)
+        store1.save_credential("ollama", "session=xyz")
+        store2 = TokenStore(path)
+        assert store2.get_credential("ollama") == "session=xyz"

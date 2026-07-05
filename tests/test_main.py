@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from usage_dashboard.server.main import _resolve_claude_tokens
+from usage_dashboard.server.main import _resolve_claude_tokens, _resolve_ollama_cookie
 from usage_dashboard.server.token_store import TokenStore
 
 
@@ -48,3 +48,39 @@ class TestResolveClaudeTokens:
     def test_empty_env_and_empty_store(self, tmp_path: Path) -> None:
         store = TokenStore(tmp_path / "tokens.json")
         assert _resolve_claude_tokens(store, None, None) == (None, None)
+
+
+class TestResolveOllamaCookie:
+    def test_first_boot_seeds_from_env(self, tmp_path: Path) -> None:
+        store = TokenStore(tmp_path / "tokens.json")
+        assert _resolve_ollama_cookie(store, "cookie-0") == "cookie-0"
+        assert store.get_credential("ollama") == "cookie-0"
+        assert store.get_seed_marker("ollama") is not None
+
+    def test_restart_keeps_persisted_cookie(self, tmp_path: Path) -> None:
+        path = tmp_path / "tokens.json"
+        store = TokenStore(path)
+        _resolve_ollama_cookie(store, "cookie-0")
+        store.save_credential("ollama", "cookie-1")
+
+        restarted = TokenStore(path)
+        assert _resolve_ollama_cookie(restarted, "cookie-0") == "cookie-1"
+
+    def test_changed_secret_is_adopted(self, tmp_path: Path) -> None:
+        path = tmp_path / "tokens.json"
+        store = TokenStore(path)
+        _resolve_ollama_cookie(store, "cookie-0")
+        store.save_credential("ollama", "cookie-1")
+
+        restarted = TokenStore(path)
+        assert _resolve_ollama_cookie(restarted, "cookie-2") == "cookie-2"
+        assert restarted.get_credential("ollama") == "cookie-2"
+
+    def test_empty_env_uses_persisted(self, tmp_path: Path) -> None:
+        store = TokenStore(tmp_path / "tokens.json")
+        store.save_credential("ollama", "cookie-1")
+        assert _resolve_ollama_cookie(store, None) == "cookie-1"
+
+    def test_empty_env_and_empty_store_returns_none(self, tmp_path: Path) -> None:
+        store = TokenStore(tmp_path / "tokens.json")
+        assert _resolve_ollama_cookie(store, None) is None

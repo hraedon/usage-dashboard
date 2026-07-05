@@ -49,6 +49,18 @@ class TokenStore:
             entry["refresh_token"] = refresh_token
             self._flush()
 
+    def save_credential(self, provider: str, credential: str) -> None:
+        """Persist a single opaque credential for *provider* (preserving any seed marker)."""
+        with self._lock:
+            entry = self._data.setdefault(provider, {})
+            entry["credential"] = credential
+            self._flush()
+
+    def get_credential(self, provider: str) -> str | None:
+        """Return the stored credential for *provider*, or None."""
+        with self._lock:
+            return self._data.get(provider, {}).get("credential")
+
     def get_seed_marker(self, provider: str) -> str | None:
         """Return the marker recorded for the credentials last seeded from the
         environment for *provider* (used to detect a changed Secret)."""

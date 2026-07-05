@@ -50,6 +50,29 @@ def _resolve_claude_tokens(
     return persisted_access or env_access, persisted_refresh or env_refresh
 
 
+def _resolve_ollama_cookie(
+    token_store: TokenStore,
+    env_cookie: str | None,
+) -> str | None:
+    """Decide which ollama cookie to run with (WI-017).
+
+    Mirrors ``_resolve_claude_tokens`` but for a single opaque credential
+    string (no refresh pair): only (re)seed from the env when the Secret
+    differs from what we last seeded (first boot or a deliberate re-login);
+    otherwise prefer the persisted cookie so a pod restart keeps it.
+    """
+    persisted = token_store.get_credential("ollama")
+
+    if env_cookie:
+        marker = hashlib.sha256(env_cookie.encode()).hexdigest()
+        if marker != token_store.get_seed_marker("ollama"):
+            token_store.save_credential("ollama", env_cookie)
+            token_store.set_seed_marker("ollama", marker)
+            return env_cookie
+
+    return persisted or env_cookie
+
+
 def main() -> None:
     logging.basicConfig(
         level=logging.INFO,
@@ -96,6 +119,7 @@ def main() -> None:
         token_store, claude_work_token, claude_work_refresh_token,
         store_key="claude_work",
     )
+    ollama_cookie = _resolve_ollama_cookie(token_store, ollama_cookie)
 
     scheduler = FetchScheduler(
         db=database,
