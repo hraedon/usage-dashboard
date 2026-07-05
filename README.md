@@ -1,14 +1,14 @@
 # usage-dashboard
 
-A two-component system for monitoring AI usage across [Claude](https://claude.ai), [z.ai](https://z.ai), [Ollama](https://ollama.com), and [umans](https://umans.ai). A server fetches usage data from all configured providers, normalizes it into a unified format, stores it in SQLite, and serves it via an authenticated API. A client polls the server and renders usage as color-coded progress bars. The primary client is a fullscreen touch GUI for a **Raspberry Pi 4B + Touch Display 2** (with optional scheduled backlight-sleep + tap-to-wake, and a tap-the-status-line overlay for unit diagnostics + brightness); a legacy 240×320 ST7789 PNG renderer (Pi Zero) is also kept. umans (whose plan has no percentage quotas) renders as a single text line of requests and tokens, color-coded if the account is throttled. The server also serves a mobile-friendly HTML view at `/dashboard`.
+A two-component system for monitoring AI usage across [Claude](https://claude.ai), [z.ai](https://z.ai), [Ollama](https://ollama.com), and [umans](https://umans.ai). A server fetches usage data from all configured providers, normalizes it into a unified format, stores in SQLite, and serves it via an authenticated API. A client polls the server and renders usage as color-coded progress bars — a fullscreen touch GUI for a **Raspberry Pi 4B + Touch Display 2** (with optional scheduled backlight-sleep + tap-to-wake, and a tap-the-status-line overlay for unit diagnostics + brightness). umans (whose plan has no percentage quotas) renders as a single text line of requests and tokens, color-coded if the account is throttled. The server also serves a mobile-friendly HTML view at `/dashboard`.
 
 ## Architecture
 
 ```
 ┌─────────────────┐         ┌─────────────────┐
-│   AI Providers  │         │    Pi Zero       │
-│  Claude / z.ai  │         │  ST7789 LCD      │
-│  Ollama / umans │         │  240×320 px      │
+│   AI Providers  │         │   Pi 4B         │
+│  Claude / z.ai  │         │ Touch Display 2 │
+│  Ollama / umans │         │  720×1280 px    │
 └────────┬────────┘         └────────▲─────────┘
          │                           │
          ▼                           │
@@ -79,14 +79,11 @@ metrics with a countdown to when the window clears.
 
 ## Clients
 
-Both clients poll the server API with adaptive refresh (60s when values change,
-5min when stable). They share the colour/threshold and countdown logic
-(`client/format.py`), so they never disagree on what "85% is red" means.
+The touch GUI polls the server API with adaptive refresh (60s when values
+change, 5min when stable). Colour/threshold and countdown logic lives in
+`client/format.py`.
 
-- **PNG renderer** (`usage-dashboard`, `client/main.py`) — the original Pi Zero
-  client. Renders a 240×320 image and writes it to `/tmp/dashboard.png` for an
-  SPI display (or headless use).
-- **Touch GUI** (`usage-dashboard-gui`, `client/gui.py`) — the primary client: a
+- **Touch GUI** (`usage-dashboard-gui`, `client/gui.py`) — the client: a
   fullscreen pygame app for a **Raspberry Pi 4B + official Touch Display 2**
   (5", 720×1280). Runs under a **minimal X server** (`xinit` + `xrandr`), *not*
   bare KMS/DRM — SDL's `kmsdrm` backend presents black on this panel; the X path
@@ -229,9 +226,7 @@ The work account is fetched and refreshed independently (its own
 `/data/tokens.json` namespace, its own rotation). The dashboard then shows it as
 a **second, muted set of bars in the Claude tile** — `me` and `work` — rather
 than a separate tile. With no `claude-work-*` keys set it stays completely
-hidden, and the Claude tile looks exactly as before. (The legacy ST7789 PNG
-client doesn't render the work account — it's a touch-GUI / web-dashboard
-feature.)
+hidden, and the Claude tile looks exactly as before.
 
 ### Ollama login
 

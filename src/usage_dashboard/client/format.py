@@ -1,9 +1,8 @@
 """Shared display-formatting helpers.
 
-Pure functions used by both the PIL renderer (small ST7789 client) and the
-pygame touch GUI (Pi 4B + 5" display). Keeping the colour/threshold and
-countdown logic here is the single source of truth so the two front-ends can
-never drift on what "85% is red" means.
+Pure functions used by the pygame touch GUI (Pi 4B + 5" display). Keeping
+the colour/threshold and countdown logic here is the single source of truth
+so the GUI and any future front-end never drift on what "85% is red" means.
 """
 from __future__ import annotations
 
