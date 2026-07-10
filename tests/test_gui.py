@@ -150,24 +150,25 @@ def test_bars_align_within_a_column() -> None:
         gui = DashboardGui(_FakeFetcher(readings), size)  # type: ignore[arg-type]
         layout = build_main_layout(readings, size)
         label_col_w = gui._label_col_width(layout.tiles)
-        max_w = max(t.rect.w for t in layout.tiles)
 
-        # Full-width tiles (Claude, Codex) share one exact track.
-        full_tracks = {
-            gui._bar_track(t.rect, label_col_w)
-            for t in layout.tiles if t.rect.w == max_w
-        }
-        assert len(full_tracks) == 1, full_tracks
+        # Side-by-side tiles of the same size (z.ai | ollama) must share an
+        # identical track so their bars line up; every tile's track must stay
+        # drawable. (Full-width tiles get proportional heights, so their track
+        # padding differs slightly by design — they aren't required to match.)
+        from collections import defaultdict
 
-        # The half-width paired tiles have equal-length (positive) tracks.
-        half = [t for t in layout.tiles if t.rect.w < max_w]
-        assert len(half) == 2  # z.ai + ollama
-        half_widths = set()
-        for t in half:
+        groups: dict[tuple[int, int], list[tuple[int, int]]] = defaultdict(list)
+        for t in layout.tiles:
             tx, tr = gui._bar_track(t.rect, label_col_w)
             assert tr - tx > 20, (t.provider, tx, tr)  # track stays drawable
-            half_widths.add(tr - tx)
-        assert len(half_widths) == 1, half_widths
+            # Track position relative to the tile's own left edge — side-by-side
+            # tiles differ in absolute x but must match relative to their tile.
+            groups[(t.rect.w, t.rect.h)].append((tx - t.rect.x, tr - t.rect.x))
+
+        paired = [rels for rels in groups.values() if len(rels) > 1]
+        assert paired, "expected a paired same-size group (z.ai | ollama)"
+        for rels in paired:
+            assert len(set(rels)) == 1, rels
     finally:
         pygame.display.quit()
 
