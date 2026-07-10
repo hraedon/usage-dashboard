@@ -3,7 +3,13 @@ from __future__ import annotations
 from datetime import datetime
 
 from usage_dashboard.server.db import Database
-from usage_dashboard.shared.models import ModelUsage, Provider, Reading, ReadingStatus
+from usage_dashboard.shared.models import (
+    ModelUsage,
+    Provider,
+    Reading,
+    ReadingStatus,
+    ScopedLimit,
+)
 
 
 def _make_reading(**overrides: object) -> Reading:
@@ -203,6 +209,63 @@ class TestModelsColumn:
         assert result.models[0].name == "minimax-m3"
         assert result.models[0].requests == 100
         assert result.models[1].name == "glm-5.2"
+
+    def test_scoped_limits_stored_and_retrieved(self, tmp_path):
+        db = Database(str(tmp_path / "test.db"))
+        db.initialize()
+        reading = _make_reading(
+            provider=Provider.CLAUDE,
+            scoped_limits=[
+                ScopedLimit(
+                    name="Fable",
+                    percent=13.0,
+                    resets_at=datetime(2026, 7, 14, 5, 59, 59),
+                    is_active=False,
+                )
+            ],
+        )
+        db.store_reading(reading)
+        result = db.get_latest_readings()[Provider.CLAUDE]
+        assert result.scoped_limits is not None
+        assert len(result.scoped_limits) == 1
+        assert result.scoped_limits[0].name == "Fable"
+        assert result.scoped_limits[0].percent == 13.0
+        assert result.scoped_limits[0].resets_at == datetime(2026, 7, 14, 5, 59, 59)
+
+    def test_scoped_limits_column_added_to_existing_db(self, tmp_path):
+        # A pre-scoped_limits append-only DB must gain the column on init, and
+        # round-trip scoped limits afterwards (the live-prod upgrade path).
+        import sqlite3
+
+        path = str(tmp_path / "old.db")
+        conn = sqlite3.connect(path)
+        conn.execute(
+            """
+            CREATE TABLE readings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                provider TEXT NOT NULL, status TEXT NOT NULL,
+                session_percent REAL, session_resets_at TEXT,
+                weekly_percent REAL, weekly_resets_at TEXT,
+                fetched_at TEXT NOT NULL, stale INTEGER NOT NULL DEFAULT 0,
+                detail TEXT, models TEXT, throttle TEXT NOT NULL DEFAULT 'none'
+            )
+            """
+        )
+        conn.commit()
+        conn.close()
+
+        db = Database(path)
+        db.initialize()  # should ALTER TABLE ADD COLUMN scoped_limits
+        reading = _make_reading(
+            provider=Provider.CLAUDE,
+            scoped_limits=[
+                ScopedLimit(name="Fable", percent=13.0, resets_at=None, is_active=False)
+            ],
+        )
+        db.store_reading(reading)
+        result = db.get_latest_readings()[Provider.CLAUDE]
+        assert result.scoped_limits is not None
+        assert result.scoped_limits[0].name == "Fable"
 
     def test_none_models_stored_and_retrieved(self, tmp_path):
         db = Database(str(tmp_path / "test.db"))

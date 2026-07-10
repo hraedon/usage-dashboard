@@ -47,6 +47,12 @@ class Database:
                 if needs_migration:
                     self._migrate_readings(cols)
                 else:
+                    # Idempotent column add for an existing append-only DB that
+                    # predates scoped_limits (per-model windows, e.g. Fable).
+                    if "scoped_limits" not in cols:
+                        self._conn.execute(
+                            "ALTER TABLE readings ADD COLUMN scoped_limits TEXT"
+                        )
                     self._ensure_indexes()
                 self._conn.commit()
                 return
@@ -64,7 +70,8 @@ class Database:
                     stale INTEGER NOT NULL DEFAULT 0,
                     detail TEXT,
                     models TEXT,
-                    throttle TEXT NOT NULL DEFAULT 'none'
+                    throttle TEXT NOT NULL DEFAULT 'none',
+                    scoped_limits TEXT
                 )
                 """
             )
@@ -108,7 +115,8 @@ class Database:
                 stale INTEGER NOT NULL DEFAULT 0,
                 detail TEXT,
                 models TEXT,
-                throttle TEXT NOT NULL DEFAULT 'none'
+                throttle TEXT NOT NULL DEFAULT 'none',
+                scoped_limits TEXT
             )
             """
         )
@@ -125,6 +133,7 @@ class Database:
             "detail",
             "models",
             "throttle",
+            "scoped_limits",
         ]
         present = [c for c in all_cols if c in cols]
         select_list = ", ".join(present)
@@ -142,6 +151,8 @@ class Database:
                     values.append(None)
                 elif c == "throttle":
                     values.append("none")
+                elif c == "scoped_limits":
+                    values.append(None)
             insert_list = ", ".join(all_cols)
             placeholders = ", ".join(["?"] * len(all_cols))
             self._conn.execute(
@@ -179,13 +190,18 @@ class Database:
             if reading.models
             else None
         )
+        scoped_json = (
+            json.dumps([s.to_dict() for s in reading.scoped_limits])
+            if reading.scoped_limits
+            else None
+        )
         with self._lock:
             self._conn.execute(
                 """
                 INSERT INTO readings (provider, status, session_percent, session_resets_at,
                                       weekly_percent, weekly_resets_at, fetched_at, stale,
-                                      detail, models, throttle)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                      detail, models, throttle, scoped_limits)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     reading.provider.value,
@@ -199,6 +215,7 @@ class Database:
                     reading.detail,
                     models_json,
                     reading.throttle,
+                    scoped_json,
                 ),
             )
             self._conn.commit()
@@ -228,6 +245,11 @@ class Database:
                 "detail": row["detail"],
                 "models": json.loads(row["models"]) if row["models"] else None,
                 "throttle": row["throttle"],
+                "scoped_limits": (
+                    json.loads(row["scoped_limits"])
+                    if "scoped_limits" in row.keys() and row["scoped_limits"]
+                    else None
+                ),
             }
             reading = Reading.from_dict(data)
             result[reading.provider] = reading
