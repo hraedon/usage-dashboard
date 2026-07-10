@@ -149,17 +149,16 @@ def test_bars_align_within_a_column() -> None:
         ]
         gui = DashboardGui(_FakeFetcher(readings), size)  # type: ignore[arg-type]
         layout = build_main_layout(readings, size)
-        label_col_w = gui._label_col_width(layout.tiles)
+        label_cols = gui._label_col_widths(layout.tiles)
 
         # Side-by-side tiles of the same size (z.ai | ollama) must share an
         # identical track so their bars line up; every tile's track must stay
-        # drawable. (Full-width tiles get proportional heights, so their track
-        # padding differs slightly by design — they aren't required to match.)
+        # drawable.
         from collections import defaultdict
 
         groups: dict[tuple[int, int], list[tuple[int, int]]] = defaultdict(list)
         for t in layout.tiles:
-            tx, tr = gui._bar_track(t.rect, label_col_w)
+            tx, tr = gui._bar_track(t.rect, label_cols[t.compact], compact=t.compact)
             assert tr - tx > 20, (t.provider, tx, tr)  # track stays drawable
             # Track position relative to the tile's own left edge — side-by-side
             # tiles differ in absolute x but must match relative to their tile.
@@ -177,6 +176,17 @@ def test_smaller_resolution_renders(gui) -> None:
     layout = build_main_layout(_readings(), (240, 320))
     gui._width, gui._height = 240, 320
     gui._draw_main(layout)
+
+
+def test_compact_bar_track_wider_than_full_width(gui) -> None:
+    from usage_dashboard.client.layout import Rect
+
+    r = Rect(0, 0, 400, 200)
+    full_label = gui._font.size("Session 100%")[0]
+    compact_label = gui._font.size("S 100%")[0]
+    tx_full, tr_full = gui._bar_track(r, full_label, compact=False)
+    tx_comp, tr_comp = gui._bar_track(r, compact_label, compact=True)
+    assert (tr_comp - tx_comp) > (tr_full - tx_full)
 
 
 def test_finger_tap_routes_through_touch_rotation() -> None:

@@ -274,6 +274,32 @@ class TestDashboardEndpoint:
 
         asyncio.run(_test())
 
+    def test_dashboard_shows_scoped_limit_rows(self, tmp_path):
+        from datetime import datetime
+
+        from usage_dashboard.shared.models import ScopedLimit
+
+        app, db = _create_app_with_db(tmp_path)
+        db.store_reading(
+            _make_reading(
+                scoped_limits=[
+                    ScopedLimit(
+                        name="Fable",
+                        percent=13.0,
+                        resets_at=datetime(2026, 1, 18, 0, 0, 0),
+                    )
+                ],
+            )
+        )
+
+        async def _test():
+            async with _client(app) as client:
+                response = await client.get("/dashboard")
+            assert "Fable" in response.text
+            assert "13%" in response.text
+
+        asyncio.run(_test())
+
     def test_dashboard_escapes_detail_content(self, tmp_path):
         app, db = _create_app_with_db(tmp_path)
         db.store_reading(
