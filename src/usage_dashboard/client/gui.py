@@ -180,6 +180,10 @@ class DashboardGui:
         # their column is narrower and the bar track extends further.
         self._reset_col_w = self._font.size("resets 23d 23h")[0]
         self._compact_reset_col_w = self._font.size("23d 23h")[0]
+        # Tile padding derived from the screen, not per-tile height, so a
+        # 3-bar tile gets the same padding as a 2-bar tile — the taller row
+        # accommodates the extra bar, not extra padding.
+        self._tile_pad = max(8, min(self._width, self._height) // 40)
 
     # -- event loop ---------------------------------------------------------
 
@@ -371,7 +375,7 @@ class DashboardGui:
         """``(track_x, track_right)`` for a tile's bars given the label column
         width. Compact tiles use a narrower reset column (bare countdown, no
         "resets" prefix) so the bar track extends further."""
-        pad = max(8, min(rect.w, rect.h) // 12)
+        pad = self._tile_pad
         reset_w = self._compact_reset_col_w if compact else self._reset_col_w
         track_x = rect.x + pad + label_col_w + pad
         track_right = rect.x + rect.w - pad - reset_w - pad
@@ -399,9 +403,9 @@ class DashboardGui:
         pygame.draw.rect(self._screen, _TILE_BG, rect, border_radius=8)
         pygame.draw.rect(self._screen, tile.accent, rect, width=2, border_radius=8)
 
-        # Pad off the smaller dimension so wide, short stacked tiles aren't
-        # over-padded (r.w//20 was huge once tiles span the full width).
-        pad = max(8, min(r.w, r.h) // 12)
+        # Consistent padding across all tiles (screen-derived, not per-tile
+        # height) so 2-bar and 3-bar tiles have identical spacing.
+        pad = self._tile_pad
         title_surf = self._font_title.render(tile.title, True, fmt.TEXT)
         self._screen.blit(title_surf, (r.x + pad, r.y + pad))
         if tile.subtitle:
