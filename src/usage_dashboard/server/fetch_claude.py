@@ -11,7 +11,12 @@ from usage_dashboard.server.fetch_types import (
     FetchRateLimitError,
     dump_json,
 )
-from usage_dashboard.shared.models import Provider, Reading, ReadingStatus
+from usage_dashboard.shared.models import (
+    Provider,
+    Reading,
+    ReadingStatus,
+    ScopedLimit,
+)
 
 _CLAUDE_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 _CLAUDE_TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
@@ -48,6 +53,46 @@ def _extract_window(block: object) -> tuple[float | None, datetime | None]:
         else None
     )
     return percent, resets_at
+
+
+def _extract_scoped_limits(limits: object) -> list[ScopedLimit]:
+    """Pull per-model usage windows from the ``limits[]`` array.
+
+    Only entries whose ``scope.model.display_name`` is set are surfaced — these
+    are the ``weekly_scoped`` per-model limits (e.g. Fable). The unscoped
+    ``session``/``weekly_all`` entries duplicate the top-level ``five_hour`` /
+    ``seven_day`` blocks the aggregate bars already use, so they're skipped. A
+    malformed or absent array yields an empty list rather than raising — scoped
+    limits are additive, and their loss shouldn't fail an otherwise-good fetch.
+    """
+    if not isinstance(limits, list):
+        return []
+    scoped: list[ScopedLimit] = []
+    for item in limits:
+        if not isinstance(item, dict):
+            continue
+        scope = item.get("scope")
+        model = scope.get("model") if isinstance(scope, dict) else None
+        name = model.get("display_name") if isinstance(model, dict) else None
+        if not name:
+            continue
+        pct = item.get("percent")
+        percent = float(pct) if pct is not None else None
+        resets_raw = item.get("resets_at")
+        resets_at = (
+            _to_naive_utc(datetime.fromisoformat(resets_raw))
+            if isinstance(resets_raw, str)
+            else None
+        )
+        scoped.append(
+            ScopedLimit(
+                name=name,
+                percent=percent,
+                resets_at=resets_at,
+                is_active=bool(item.get("is_active")),
+            )
+        )
+    return scoped
 
 
 def refresh_claude_token(
@@ -128,6 +173,9 @@ def fetch_claude_usage(access_token: str) -> Reading:
     except (KeyError, ValueError, TypeError) as exc:
         raise FetchError(f"Claude usage response parse error: {type(exc).__name__}") from exc
 
+    # Per-model scoped windows (e.g. Fable) live in limits[]; absence is normal.
+    scoped_limits = _extract_scoped_limits(data.get("limits"))
+
     return Reading(
         provider=Provider.CLAUDE,
         status=ReadingStatus.CURRENT,
@@ -137,4 +185,5 @@ def fetch_claude_usage(access_token: str) -> Reading:
         weekly_resets_at=weekly_resets_at,
         fetched_at=datetime.now(timezone.utc).replace(tzinfo=None),
         stale=False,
+        scoped_limits=scoped_limits or None,
     )

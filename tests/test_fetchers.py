@@ -7,8 +7,13 @@ import httpx
 import pytest
 
 from usage_dashboard.server.fetch_claude import fetch_claude_usage, refresh_claude_token
+from usage_dashboard.server.fetch_codex import fetch_codex_usage
 from usage_dashboard.server.fetch_ollama import _parse_relative_reset, fetch_ollama_usage
-from usage_dashboard.server.fetch_types import FetchAuthError, FetchError
+from usage_dashboard.server.fetch_types import (
+    FetchAuthError,
+    FetchError,
+    FetchRateLimitError,
+)
 from usage_dashboard.server.fetch_umans import _format_tokens, fetch_umans_usage
 from usage_dashboard.server.fetch_zai import fetch_zai_usage
 from usage_dashboard.shared.models import (
@@ -22,10 +27,11 @@ from usage_dashboard.shared.models import (
 
 
 def _claude_response_data():
-    # Mirrors the live /api/oauth/usage shape observed 2026-06-21: the window
+    # Mirrors the live /api/oauth/usage shape observed 2026-07-10: the window
     # blocks carry `utilization` + `resets_at` (the old `utilization_percent` +
-    # `reset_time` names were dropped). Extra keys (limits[], spend, dollar
-    # fields) are present in real responses and ignored by the parser.
+    # `reset_time` names were dropped). The aggregate five_hour/seven_day blocks
+    # drive the Session/Weekly bars; per-model windows (e.g. Fable) appear only
+    # as `weekly_scoped` entries in `limits[]` with a `scope.model.display_name`.
     return {
         "five_hour": {
             "utilization": 65.0,
@@ -37,6 +43,64 @@ def _claude_response_data():
             "resets_at": "2026-01-19T00:00:00Z",
             "limit_dollars": None,
         },
+        # seven_day_opus/sonnet exist but are null on plans without those caps.
+        "seven_day_opus": None,
+        "limits": [
+            {
+                "kind": "session",
+                "group": "session",
+                "percent": 65,
+                "severity": "normal",
+                "resets_at": "2026-01-15T10:00:00+00:00",
+                "scope": None,
+                "is_active": False,
+            },
+            {
+                "kind": "weekly_all",
+                "group": "weekly",
+                "percent": 45,
+                "severity": "normal",
+                "resets_at": "2026-01-19T00:00:00+00:00",
+                "scope": None,
+                "is_active": True,
+            },
+            {
+                "kind": "weekly_scoped",
+                "group": "weekly",
+                "percent": 13,
+                "severity": "normal",
+                "resets_at": "2026-01-19T00:00:00+00:00",
+                "scope": {"model": {"id": None, "display_name": "Fable"}, "surface": None},
+                "is_active": False,
+            },
+        ],
+    }
+
+
+def _codex_response_data():
+    # Mirrors the LIVE GET /wham/usage shape captured 2026-07-10 from a
+    # ChatGPT-plan account: a `rate_limit` (singular) object with
+    # primary_window (~5h session) and secondary_window (weekly). Each window
+    # carries used_percent + reset_at (absolute Unix epoch, seconds).
+    return {
+        "plan_type": "plus",
+        "rate_limit": {
+            "allowed": True,
+            "limit_reached": False,
+            "primary_window": {
+                "used_percent": 42,
+                "limit_window_seconds": 18000,
+                "reset_after_seconds": 16594,
+                "reset_at": 1778000000,
+            },
+            "secondary_window": {
+                "used_percent": 71.5,
+                "limit_window_seconds": 604800,
+                "reset_after_seconds": 577014,
+                "reset_at": 1778400000,
+            },
+        },
+        "credits": {"has_credits": False, "balance": "0"},
     }
 
 
@@ -123,6 +187,44 @@ class TestFetchClaude:
         assert reading.session_percent == 65.0
         assert reading.weekly_percent == 45.0
         assert reading.stale is False
+
+    @patch("usage_dashboard.server.fetch_claude.httpx.Client")
+    def test_fetch_claude_extracts_fable_scoped_limit(self, mock_client_cls):
+        mock_response = MagicMock()
+        mock_response.json.return_value = _claude_response_data()
+        mock_response.raise_for_status = MagicMock()
+        mock_client = MagicMock()
+        mock_client.get.return_value = mock_response
+        mock_client.__enter__ = MagicMock(return_value=mock_client)
+        mock_client.__exit__ = MagicMock(return_value=False)
+        mock_client_cls.return_value = mock_client
+
+        reading = fetch_claude_usage("test-token")
+        # Only the weekly_scoped (per-model) entry is surfaced; the unscoped
+        # session/weekly_all entries duplicate the aggregate windows.
+        assert reading.scoped_limits is not None
+        assert len(reading.scoped_limits) == 1
+        fable = reading.scoped_limits[0]
+        assert fable.name == "Fable"
+        assert fable.percent == 13.0
+        assert fable.is_active is False
+        assert fable.resets_at is not None
+
+    @patch("usage_dashboard.server.fetch_claude.httpx.Client")
+    def test_fetch_claude_no_limits_key_yields_no_scoped_limits(self, mock_client_cls):
+        mock_response = MagicMock()
+        data = _claude_response_data()
+        del data["limits"]
+        mock_response.json.return_value = data
+        mock_response.raise_for_status = MagicMock()
+        mock_client = MagicMock()
+        mock_client.get.return_value = mock_response
+        mock_client.__enter__ = MagicMock(return_value=mock_client)
+        mock_client.__exit__ = MagicMock(return_value=False)
+        mock_client_cls.return_value = mock_client
+
+        reading = fetch_claude_usage("test-token")
+        assert reading.scoped_limits is None
 
     @patch("usage_dashboard.server.fetch_claude.httpx.Client")
     def test_fetch_claude_raises_fetch_error_on_http_failure(self, mock_client_cls):
@@ -224,6 +326,78 @@ class TestFetchClaude:
         assert "Bearer my-secret-token" in str(headers) or any(
             "Bearer my-secret-token" in str(v) for v in headers.values()
         )
+
+
+class TestFetchCodex:
+    def _mock_get(self, mock_client_cls, data, status=200):
+        mock_response = MagicMock()
+        mock_response.json.return_value = data
+        if status >= 400:
+            request = httpx.Request("GET", "https://chatgpt.com/backend-api/wham/usage")
+            resp = httpx.Response(status, request=request)
+            mock_response.raise_for_status.side_effect = httpx.HTTPStatusError(
+                "err", request=request, response=resp
+            )
+        else:
+            mock_response.raise_for_status = MagicMock()
+        mock_client = MagicMock()
+        mock_client.get.return_value = mock_response
+        mock_client.__enter__ = MagicMock(return_value=mock_client)
+        mock_client.__exit__ = MagicMock(return_value=False)
+        mock_client_cls.return_value = mock_client
+
+    @patch("usage_dashboard.server.fetch_codex.httpx.Client")
+    def test_fetch_codex_returns_reading(self, mock_client_cls):
+        self._mock_get(mock_client_cls, _codex_response_data())
+        reading = fetch_codex_usage("test-token")
+        assert reading.provider is Provider.CODEX
+        assert reading.status is ReadingStatus.CURRENT
+        assert reading.session_percent == 42.0
+        assert reading.weekly_percent == 71.5
+        # resets_at parsed from the absolute epoch (naive UTC).
+        assert reading.session_resets_at == datetime(2026, 5, 5, 16, 53, 20)
+        assert reading.stale is False
+
+    @patch("usage_dashboard.server.fetch_codex.httpx.Client")
+    def test_fetch_codex_accepts_fallback_rate_limits_shape(self, mock_client_cls):
+        # The openai/codex struct variant: `rate_limits` with primary/secondary
+        # and `resets_at`. Parser tolerates it alongside the live shape.
+        data = {
+            "rate_limits": {
+                "primary": {"used_percent": 42, "resets_at": 1778000000},
+                "secondary": {"used_percent": 71.5, "resets_at": 1778400000},
+            }
+        }
+        self._mock_get(mock_client_cls, data)
+        reading = fetch_codex_usage("test-token")
+        assert reading.session_percent == 42.0
+        assert reading.weekly_percent == 71.5
+
+    @patch("usage_dashboard.server.fetch_codex.httpx.Client")
+    def test_fetch_codex_sends_account_id_header(self, mock_client_cls):
+        self._mock_get(mock_client_cls, _codex_response_data())
+        fetch_codex_usage("test-token", account_id="acct-123")
+        _, kwargs = mock_client_cls.return_value.get.call_args
+        assert kwargs["headers"]["chatgpt-account-id"] == "acct-123"
+        assert kwargs["headers"]["Authorization"] == "Bearer test-token"
+
+    @patch("usage_dashboard.server.fetch_codex.httpx.Client")
+    def test_fetch_codex_401_raises_auth_error(self, mock_client_cls):
+        self._mock_get(mock_client_cls, {}, status=401)
+        with pytest.raises(FetchAuthError):
+            fetch_codex_usage("bad-token")
+
+    @patch("usage_dashboard.server.fetch_codex.httpx.Client")
+    def test_fetch_codex_429_raises_rate_limit_error(self, mock_client_cls):
+        self._mock_get(mock_client_cls, {}, status=429)
+        with pytest.raises(FetchRateLimitError):
+            fetch_codex_usage("test-token")
+
+    @patch("usage_dashboard.server.fetch_codex.httpx.Client")
+    def test_fetch_codex_missing_rate_limits_raises(self, mock_client_cls):
+        self._mock_get(mock_client_cls, {"something_else": 1})
+        with pytest.raises(FetchError):
+            fetch_codex_usage("test-token")
 
 
 class TestFetchZai:

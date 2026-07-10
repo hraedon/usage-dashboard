@@ -9,6 +9,7 @@ import argparse
 import base64
 import hashlib
 import http.server
+import json
 import logging
 import secrets
 import string
@@ -334,6 +335,151 @@ def login_ollama(headless: bool = False, verify: bool = True) -> None:
     print("  kubectl -n usage-dashboard rollout restart deploy/usage-dashboard-server")
 
 
+# ---------------------------------------------------------------------------
+# Codex (OpenAI / ChatGPT-plan) login
+#
+# Mirrors the Claude PKCE flow against OpenAI's OAuth (auth.openai.com), using
+# the public Codex CLI client. Endpoints/client_id/scopes were taken from the
+# openai/codex source (not memory), same discipline as the Claude constants.
+# Loopback-only: OpenAI's redirect allow-list expects http://localhost:1455/
+# auth/callback, so there's no hosted "paste the code" page like Claude's.
+# ---------------------------------------------------------------------------
+
+_CODEX_AUTHORIZE_URL = "https://auth.openai.com/oauth/authorize"
+_CODEX_TOKEN_URL_LOGIN = "https://auth.openai.com/oauth/token"
+_CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
+_CODEX_SCOPES = "openid profile email offline_access"
+_CODEX_DEFAULT_PORT = 1455
+
+
+def _decode_jwt_payload(token: str) -> dict[str, Any]:
+    """Best-effort decode of a JWT's payload segment (no signature check)."""
+    try:
+        payload = token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)  # restore base64 padding
+        decoded = json.loads(base64.urlsafe_b64decode(payload))
+    except (IndexError, ValueError, TypeError):
+        return {}
+    return decoded if isinstance(decoded, dict) else {}
+
+
+def _extract_codex_account_id(id_token: str) -> str | None:
+    """Pull the chatgpt-account-id from the id_token's OpenAI auth claim."""
+    payload = _decode_jwt_payload(id_token)
+    auth = payload.get("https://api.openai.com/auth")
+    if isinstance(auth, dict):
+        acc = auth.get("chatgpt_account_id") or auth.get("account_id")
+        if acc:
+            return str(acc)
+    acc = payload.get("chatgpt_account_id")
+    return str(acc) if acc else None
+
+
+def _exchange_code_codex(
+    code: str, verifier: str, redirect_uri: str
+) -> tuple[str, str, str]:
+    """Exchange an auth code for (access, refresh, id_token) — form-encoded."""
+    data = {
+        "grant_type": "authorization_code",
+        "code": code,
+        "redirect_uri": redirect_uri,
+        "client_id": _CODEX_CLIENT_ID,
+        "code_verifier": verifier,
+    }
+    response = httpx.post(
+        _CODEX_TOKEN_URL_LOGIN,
+        data=data,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        timeout=_TIMEOUT,
+    )
+    response.raise_for_status()
+    body = response.json()
+    return (
+        body["access_token"],
+        body.get("refresh_token", ""),
+        body.get("id_token", ""),
+    )
+
+
+def login_codex(port: int | None = None, no_browser: bool = False) -> None:
+    """Run the PKCE OAuth login flow for Codex and print the token pair."""
+    port = port or _CODEX_DEFAULT_PORT
+    redirect_uri = f"http://localhost:{port}/auth/callback"
+
+    verifier = _generate_verifier()
+    challenge = _generate_challenge(verifier)
+    state = secrets.token_urlsafe(16)
+
+    params = urlencode({
+        "response_type": "code",
+        "client_id": _CODEX_CLIENT_ID,
+        "redirect_uri": redirect_uri,
+        "scope": _CODEX_SCOPES,
+        "code_challenge": challenge,
+        "code_challenge_method": "S256",
+        # These make the id_token carry the ChatGPT account/org, so we can
+        # surface the chatgpt-account-id the usage endpoint needs.
+        "id_token_add_organizations": "true",
+        "codex_cli_simplified_flow": "true",
+        "state": state,
+    })
+    authorize_url = f"{_CODEX_AUTHORIZE_URL}?{params}"
+
+    _CallbackHandler.code = None
+    _CallbackHandler.state = None
+    _CallbackHandler.error = None
+
+    print(f"Starting local callback server on port {port}...")
+    print(f"Opening browser to:\n  {authorize_url}\n")
+    if not no_browser:
+        webbrowser.open(authorize_url)
+
+    code, returned_state, error = _wait_for_code(port)
+    if error:
+        print(f"Authorization failed: {error}", file=sys.stderr)
+        sys.exit(1)
+    if code is None:
+        print("Timed out waiting for authorization.", file=sys.stderr)
+        sys.exit(1)
+    if returned_state is not None and returned_state != state:
+        print("State mismatch — aborting (possible CSRF).", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        access_token, refresh_token, id_token = _exchange_code_codex(
+            code, verifier, redirect_uri
+        )
+    except httpx.HTTPError as exc:
+        print(f"Token exchange failed: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    account_id = _extract_codex_account_id(id_token)
+
+    print("\nDedicated Codex OAuth tokens minted successfully.\n")
+    print("Load these into the k8s Secret (server-secret.yaml):\n")
+    print(f'  codex-token: "{access_token}"')
+    print(f'  codex-refresh-token: "{refresh_token}"')
+    print(f'  codex-client-id: "{_CODEX_CLIENT_ID}"')
+    if account_id:
+        print(f'  codex-account-id: "{account_id}"')
+    else:
+        print(
+            "  codex-account-id: <not found in id_token — the usage endpoint "
+            "may still work without it; set it if fetches 401/403>"
+        )
+    print()
+    print("Then update the Secret keys and roll the server, e.g.:")
+    acct = account_id or "$ACCOUNT"
+    print(
+        "  kubectl -n usage-dashboard patch secret server-secrets --type merge -p \\\n"
+        "    \"{\\\"stringData\\\":{\\\"codex-token\\\":\\\"$ACCESS\\\","
+        "\\\"codex-refresh-token\\\":\\\"$REFRESH\\\","
+        f"\\\"codex-client-id\\\":\\\"{_CODEX_CLIENT_ID}\\\","
+        f"\\\"codex-account-id\\\":\\\"{acct}\\\"}}}}\""
+    )
+    print("  kubectl -n usage-dashboard rollout restart deploy/usage-dashboard-server")
+
+
 def main() -> None:
     logging.basicConfig(
         level=logging.INFO,
@@ -348,13 +494,14 @@ def main() -> None:
 
     login_parser = sub.add_parser("login", help="Log in to a provider")
     login_parser.add_argument(
-        "provider", choices=["claude", "ollama"], help="Provider to log in to"
+        "provider", choices=["claude", "ollama", "codex"], help="Provider to log in to"
     )
     login_parser.add_argument(
         "--port",
         type=int,
         default=None,
-        help="[claude] Local port for OAuth callback server (omit for manual paste)",
+        help="[claude] Local port for OAuth callback server (omit for manual paste); "
+        "[codex] callback port (default 1455)",
     )
     login_parser.add_argument(
         "--no-browser",
@@ -379,6 +526,8 @@ def main() -> None:
             login_claude(port=args.port, no_browser=args.no_browser)
         elif args.provider == "ollama":
             login_ollama(headless=args.headless, verify=not args.no_verify)
+        elif args.provider == "codex":
+            login_codex(port=args.port, no_browser=args.no_browser)
     else:
         parser.print_help()
         sys.exit(1)
