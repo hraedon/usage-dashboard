@@ -9,6 +9,7 @@ from typing import Any, Callable
 
 from usage_dashboard.server.db import Database
 from usage_dashboard.server.fetch_claude import fetch_claude_usage, refresh_claude_token
+from usage_dashboard.server.fetch_codex import fetch_codex_usage, refresh_codex_token
 from usage_dashboard.server.fetch_ollama import fetch_ollama_usage
 from usage_dashboard.server.fetch_types import (
     FetchAuthError,
@@ -62,6 +63,10 @@ class FetchScheduler:
         claude_work_client_id: str | None = None,
         zai_key: str | None = None,
         ollama_cookie: str | None = None,
+        codex_token: str | None = None,
+        codex_refresh_token: str | None = None,
+        codex_client_id: str | None = None,
+        codex_account_id: str | None = None,
         umans_key: str | None = None,
         interval_seconds: int = 300,
         offline_threshold: int = 24,
@@ -82,6 +87,10 @@ class FetchScheduler:
         self._token_store = token_store
         self._zai_key = zai_key
         self._ollama_cookie = ollama_cookie
+        self._codex_token = codex_token
+        self._codex_refresh_token = codex_refresh_token
+        self._codex_client_id = codex_client_id
+        self._codex_account_id = codex_account_id
         self._umans_key = umans_key
         self._offline_threshold = offline_threshold
         self._rate_limit_default_seconds = rate_limit_default_seconds
@@ -228,6 +237,17 @@ class FetchScheduler:
             tasks.append(
                 (Provider.OLLAMA, partial(fetch_ollama_usage, self._ollama_cookie))
             )
+        if self._codex_token is not None:
+            tasks.append(
+                (
+                    Provider.CODEX,
+                    partial(
+                        fetch_codex_usage,
+                        self._codex_token,
+                        self._codex_account_id,
+                    ),
+                )
+            )
         if self._umans_key is not None:
             tasks.append(
                 (Provider.UMANS, partial(fetch_umans_usage, self._umans_key))
@@ -274,6 +294,35 @@ class FetchScheduler:
         self._claude_work_token, self._claude_work_refresh_token = pair
         return True
 
+    def _try_refresh_codex(self) -> bool:
+        if self._codex_refresh_token is None:
+            return False
+        try:
+            new_access, new_refresh = refresh_codex_token(
+                self._codex_refresh_token, client_id=self._codex_client_id
+            )
+        except FetchError as exc:
+            logger.warning("Codex token refresh failed: %s", exc)
+            return False
+        if self._token_store is not None:
+            self._token_store.save("codex", new_access, new_refresh)
+            logger.info("Codex tokens refreshed and persisted")
+        else:
+            logger.info("Codex token refreshed, not persisted")
+        self._codex_token, self._codex_refresh_token = new_access, new_refresh
+        return True
+
+    def _retry_codex(self, provider: Provider, previous: Reading | None) -> bool:
+        """Re-fetch Codex after a token refresh. Returns True on success."""
+        try:
+            reading = fetch_codex_usage(self._codex_token or "", self._codex_account_id)
+        except FetchError:
+            return False
+        self._db.store_reading(reading)
+        self._db.reset_failures(provider)
+        self._schedule_after_success(provider, previous, reading)
+        return True
+
     def _fetch_one(
         self,
         provider: Provider,
@@ -296,6 +345,9 @@ class FetchScheduler:
                         return
                 elif provider == Provider.CLAUDE_WORK and self._try_refresh_claude_work():
                     if self._retry_claude(provider, previous, self._claude_work_token):
+                        return
+                elif provider == Provider.CODEX and self._try_refresh_codex():
+                    if self._retry_codex(provider, previous):
                         return
             if provider is Provider.OLLAMA and isinstance(exc, FetchAuthError):
                 self._record_auth_failure(provider, exc)

@@ -86,6 +86,30 @@ spec:
                   name: server-secrets
                   key: umans-api-key
                   optional: true
+            - name: CODEX_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: server-secrets
+                  key: codex-token
+                  optional: true
+            - name: CODEX_REFRESH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: server-secrets
+                  key: codex-refresh-token
+                  optional: true
+            - name: CODEX_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: server-secrets
+                  key: codex-client-id
+                  optional: true
+            - name: CODEX_ACCOUNT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: server-secrets
+                  key: codex-account-id
+                  optional: true
             - name: FETCH_INTERVAL
               value: "300"
             - name: PORT

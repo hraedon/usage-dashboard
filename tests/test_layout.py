@@ -19,6 +19,7 @@ from usage_dashboard.shared.models import (
     Provider,
     Reading,
     ReadingStatus,
+    ScopedLimit,
 )
 
 _NOW = datetime(2026, 1, 10, 12, 0, 0, tzinfo=timezone.utc)
@@ -69,6 +70,14 @@ class TestMainLayout:
         ys = [t.rect.y for t in layout.tiles]
         assert ys == sorted(ys)
 
+    def test_codex_appears_as_stacked_tile_in_order(self) -> None:
+        readings = _all_four() + [_reading(Provider.CODEX)]
+        layout = build_main_layout(readings, _SIZE, now=_NOW)
+        # Codex slots in after ollama (umans stays in the footer, not a tile).
+        assert [t.provider for t in layout.tiles] == [
+            Provider.CLAUDE, Provider.ZAI, Provider.OLLAMA, Provider.CODEX,
+        ]
+
     def test_tiles_within_bounds_and_nonoverlapping(self) -> None:
         layout = build_main_layout(_all_four(), _SIZE, now=_NOW)
         w, h = _SIZE
@@ -91,6 +100,31 @@ class TestMainLayout:
         assert session.color == fmt.GREEN  # 50%
         assert weekly.fraction == 0.9
         assert weekly.color == fmt.RED     # 90%
+
+    def test_scoped_limit_renders_extra_claude_bar(self) -> None:
+        # A Fable-scoped weekly limit becomes a third bar on the Claude tile,
+        # after Session and Weekly, labelled by the model name.
+        claude = _reading(
+            Provider.CLAUDE,
+            scoped_limits=[
+                ScopedLimit(
+                    name="Fable",
+                    percent=13.0,
+                    resets_at=_NOW + timedelta(days=3),
+                    is_active=False,
+                )
+            ],
+        )
+        layout = build_main_layout([claude], _SIZE, now=_NOW)
+        bars = layout.tiles[0].bars
+        assert [b.label for b in bars] == ["Session", "Weekly", "Fable"]
+        assert bars[2].fraction == 0.13
+        assert bars[2].color == fmt.GREEN  # 13%
+
+    def test_no_scoped_bars_for_providers_without_limits(self) -> None:
+        # zai/ollama readings carry no scoped_limits, so no extra bars appear.
+        layout = build_main_layout([_reading(Provider.ZAI)], _SIZE, now=_NOW)
+        assert [b.label for b in layout.tiles[0].bars] == ["Session", "Weekly"]
 
     def test_quotaless_provider_in_footer_not_a_tile(self) -> None:
         layout = build_main_layout(_all_four(), _SIZE, now=_NOW)

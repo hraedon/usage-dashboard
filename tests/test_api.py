@@ -98,7 +98,9 @@ class TestReadingsEndpoint:
                 )
             data = response.json()
             providers = {item["provider"] for item in data}
-            assert providers == {"claude", "claude_work", "zai", "ollama", "umans"}
+            assert providers == {
+                "claude", "claude_work", "zai", "ollama", "codex", "umans",
+            }
 
         asyncio.run(_test())
 

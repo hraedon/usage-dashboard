@@ -15,6 +15,7 @@ class Provider(Enum):
     CLAUDE_WORK = "claude_work"
     ZAI = "zai"
     OLLAMA = "ollama"
+    CODEX = "codex"
     UMANS = "umans"
 
 
@@ -77,6 +78,45 @@ class ModelUsage:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class ScopedLimit:
+    """A usage window scoped to a single model (or surface), reported by the
+    Claude ``/api/oauth/usage`` endpoint in its ``limits[]`` array.
+
+    The top-level ``five_hour``/``seven_day`` blocks are all-model aggregates;
+    ``limits[]`` additionally carries ``weekly_scoped`` entries whose ``scope``
+    names a specific model (e.g. ``{"model": {"display_name": "Fable"}}``). This
+    is the only place per-model Claude usage is exposed, so a scoped limit is
+    rendered as its own extra bar rather than folded into the aggregate windows.
+
+    ``is_active`` reflects the endpoint's flag for whether this limit is the
+    currently-binding constraint on the plan (a scoped limit can be present but
+    not active).
+    """
+
+    name: str
+    percent: float | None
+    resets_at: datetime | None
+    is_active: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "percent": self.percent,
+            "resets_at": _format_dt(self.resets_at),
+            "is_active": self.is_active,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> ScopedLimit:
+        return cls(
+            name=data["name"],
+            percent=data["percent"],
+            resets_at=_parse_dt(data["resets_at"]),
+            is_active=data.get("is_active", False),
+        )
+
+
 def _format_dt(dt: datetime | None) -> str | None:
     if dt is None:
         return None
@@ -109,6 +149,10 @@ class Reading:
     # Throttle severity (THROTTLE_NONE/LOW/BOXED). Quota-less providers use this
     # as their only severity signal, since they have no percentage to colour by.
     throttle: str = THROTTLE_NONE
+    # Extra per-model usage windows (Claude ``limits[]`` weekly_scoped entries,
+    # e.g. Fable). Rendered as additional bars; None/absent for providers that
+    # don't report scoped limits.
+    scoped_limits: list[ScopedLimit] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -123,6 +167,9 @@ class Reading:
             "detail": self.detail,
             "models": [m.to_dict() for m in self.models] if self.models else None,
             "throttle": self.throttle,
+            "scoped_limits": (
+                [s.to_dict() for s in self.scoped_limits] if self.scoped_limits else None
+            ),
         }
 
     @classmethod
@@ -143,6 +190,11 @@ class Reading:
                 else None
             ),
             throttle=data.get("throttle", THROTTLE_NONE) or THROTTLE_NONE,
+            scoped_limits=(
+                [ScopedLimit.from_dict(s) for s in data["scoped_limits"]]
+                if data.get("scoped_limits")
+                else None
+            ),
         )
 
 

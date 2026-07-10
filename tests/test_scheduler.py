@@ -608,6 +608,7 @@ class TestConfiguredProviders:
             claude_work_token="cw",
             zai_key="z",
             ollama_cookie="o",
+            codex_token="cx",
         )
         assert scheduler.configured_providers() == list(Provider)
 

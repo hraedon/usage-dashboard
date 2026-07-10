@@ -95,6 +95,11 @@ def main() -> None:
     claude_work_client_id = os.environ.get("CLAUDE_WORK_CLIENT_ID") or None
     zai_api_key = os.environ.get("ZAI_API_KEY") or None
     ollama_cookie = os.environ.get("OLLAMA_COOKIE") or None
+    # Optional OpenAI Codex (ChatGPT-plan) account, via a dedicated OAuth login.
+    codex_token = os.environ.get("CODEX_TOKEN") or None
+    codex_refresh_token = os.environ.get("CODEX_REFRESH_TOKEN") or None
+    codex_client_id = os.environ.get("CODEX_CLIENT_ID") or None
+    codex_account_id = os.environ.get("CODEX_ACCOUNT_ID") or None
     umans_api_key = os.environ.get("UMANS_API_KEY") or None
     fetch_interval = int(os.environ.get("FETCH_INTERVAL", "300"))
     failure_backoff_cap = int(os.environ.get("FAILURE_BACKOFF_CAP", "3600"))
@@ -121,6 +126,11 @@ def main() -> None:
         store_key="claude_work",
     )
     ollama_cookie = _resolve_ollama_cookie(token_store, ollama_cookie)
+    # Codex reuses the Claude token-resolution logic (seed-once, prefer
+    # persisted-refreshed) under its own store key.
+    codex_token, codex_refresh_token = _resolve_claude_tokens(
+        token_store, codex_token, codex_refresh_token, store_key="codex"
+    )
 
     scheduler = FetchScheduler(
         db=database,
@@ -132,6 +142,10 @@ def main() -> None:
         claude_work_client_id=claude_work_client_id,
         zai_key=zai_api_key,
         ollama_cookie=ollama_cookie,
+        codex_token=codex_token,
+        codex_refresh_token=codex_refresh_token,
+        codex_client_id=codex_client_id,
+        codex_account_id=codex_account_id,
         umans_key=umans_api_key,
         interval_seconds=fetch_interval,
         failure_cap_seconds=failure_backoff_cap,

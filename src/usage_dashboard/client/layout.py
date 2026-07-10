@@ -29,6 +29,7 @@ _PROVIDER_ORDER: list[Provider] = [
     Provider.CLAUDE,
     Provider.ZAI,
     Provider.OLLAMA,
+    Provider.CODEX,
     Provider.UMANS,
 ]
 
@@ -109,10 +110,15 @@ def _bars_for(
     muted: bool = False,
 ) -> list[BarSpec]:
     bars: list[BarSpec] = []
-    for label, pct, reset in (
+    windows: list[tuple[str, float | None, datetime | None]] = [
         ("Session", reading.session_percent, reading.session_resets_at),
         ("Weekly", reading.weekly_percent, reading.weekly_resets_at),
-    ):
+    ]
+    # Per-model scoped windows (e.g. Fable) render as extra bars after the
+    # aggregate two; the label is the model name so the tile stays legible.
+    for sl in reading.scoped_limits or []:
+        windows.append((sl.name, sl.percent, sl.resets_at))
+    for label, pct, reset in windows:
         reset_text, highlight = fmt.format_countdown(reset, now=now)
         bars.append(
             BarSpec(
@@ -229,7 +235,9 @@ def build_main_layout(
     status_h = max(18, round(height * 0.10))
     grid_h = height - status_h - margin
 
-    # Single-column vertical stack.
+    # Single-column vertical stack. (A side-by-side pairing of z.ai/ollama to
+    # save room is deferred: mixed tile widths break the GUI's shared bar-track
+    # alignment and the half-width track needs on-panel verification.)
     cols, rows = (1, max(len(tile_plan), 1))
     cell_w = (width - margin * (cols + 1)) // cols
     cell_h = (grid_h - margin * (rows + 1)) // max(rows, 1)
@@ -433,6 +441,13 @@ def _detail_lines(reading: Reading, now: datetime | None) -> list[DetailLine]:
         )
         if w_reset:
             lines.append(DetailLine("  resets in", w_reset, fmt.GRAY))
+    for sl in reading.scoped_limits or []:
+        lines.append(
+            DetailLine(sl.name, fmt.percent_text(sl.percent), fmt.bar_color(sl.percent))
+        )
+        sl_reset, _ = fmt.format_countdown(sl.resets_at, now=now)
+        if sl_reset:
+            lines.append(DetailLine("  resets in", sl_reset, fmt.GRAY))
     if reading.detail:
         lines.append(DetailLine("Detail", reading.detail, fmt.TEXT))
     if reading.models:
