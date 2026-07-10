@@ -452,7 +452,9 @@ class DashboardGui:
 
             if bar.reset_text:
                 rc = fmt.YELLOW if bar.reset_highlight else fmt.GRAY
-                reset = self._font.render(f"resets {bar.reset_text}", True, rc)
+                # No "resets" prefix — a bare countdown next to a usage bar is
+                # unambiguous, and it frees width on the narrow paired tiles.
+                reset = self._font.render(bar.reset_text, True, rc)
                 # Left-aligned at a fixed x just past the bar, so resets line up.
                 self._screen.blit(reset, (reset_x, cy - reset.get_height() // 2))
 

@@ -240,7 +240,9 @@ def build_main_layout(
             footer_note = f"UMANS {umans.detail}".strip() if umans.detail else "UMANS"
 
     margin = max(4, round(width * 0.02))
-    status_h = max(18, round(height * 0.10))
+    # A slim status band leaves more height for the tiles (the Claude tile in
+    # particular needs room for its third bar).
+    status_h = max(16, round(height * 0.085))
     grid_h = height - status_h - margin
 
     # Pack tiles into rows: two consecutive PAIRED providers share a row
@@ -258,20 +260,18 @@ def build_main_layout(
             idx += 1
 
     n_rows = max(len(rows_plan), 1)
-    cell_h = (grid_h - margin * (n_rows + 1)) // n_rows
 
-    tiles: list[TileSpec] = []
-    for row_idx, row_tiles in enumerate(rows_plan):
-        ncols = len(row_tiles)
-        cell_w = (width - margin * (ncols + 1)) // ncols
-        y = margin + row_idx * (cell_h + margin)
-        for col_idx, (provider, reading) in enumerate(row_tiles):
-            rect = Rect(
-                x=margin + col_idx * (cell_w + margin),
-                y=y,
-                w=cell_w,
-                h=cell_h,
-            )
+    # Build each tile's content first so rows can be sized by bar count: a tile
+    # with more bars (Claude, with its extra Fable window) gets a proportionally
+    # taller row, so every bar renders at the same height regardless of how many
+    # bars its tile has.
+    BuiltTile = tuple[Provider, "Reading", list[BarSpec], "str | None", str, str]
+    built_rows: list[list[BuiltTile]] = []
+    row_weights: list[int] = []
+    for row_tiles in rows_plan:
+        built: list[BuiltTile] = []
+        weight = 1
+        for provider, reading in row_tiles:
             # umans has no percentages — show its detail string instead of bars.
             is_quotaless = (
                 reading.session_percent is None and reading.weekly_percent is None
@@ -282,12 +282,39 @@ def build_main_layout(
             else:
                 bars = [] if is_quotaless else _bars_for(reading, now)
                 detail = reading.detail if is_quotaless else None
-            # Build the title: provider name + status. Model breakdown goes in
-            # subtitle (right-aligned by the GUI), not in the title string.
+            # Provider name + status; model breakdown goes in the subtitle.
             title = provider.value.upper() + fmt.status_suffix(reading)
-            subtitle = ""
-            if provider is Provider.OLLAMA:
-                subtitle = _model_subtitle(reading.models)
+            subtitle = _model_subtitle(reading.models) if provider is Provider.OLLAMA else ""
+            built.append((provider, reading, bars, detail, title, subtitle))
+            weight = max(weight, len(bars))
+        built_rows.append(built)
+        row_weights.append(weight)
+
+    total_weight = sum(row_weights)
+    avail = grid_h - margin * (n_rows + 1)
+    row_heights: list[int] = []
+    used = 0
+    for idx, weight in enumerate(row_weights):
+        if idx == n_rows - 1:
+            row_heights.append(avail - used)  # last row absorbs the remainder
+        else:
+            h = avail * weight // total_weight
+            used += h
+            row_heights.append(h)
+
+    tiles: list[TileSpec] = []
+    y = margin
+    for row_idx, built in enumerate(built_rows):
+        cell_h = row_heights[row_idx]
+        ncols = len(built)
+        cell_w = (width - margin * (ncols + 1)) // ncols
+        for col_idx, (provider, reading, bars, detail, title, subtitle) in enumerate(built):
+            rect = Rect(
+                x=margin + col_idx * (cell_w + margin),
+                y=y,
+                w=cell_w,
+                h=cell_h,
+            )
             tiles.append(
                 TileSpec(
                     provider=provider,
@@ -299,6 +326,7 @@ def build_main_layout(
                     subtitle=subtitle,
                 )
             )
+        y += cell_h + margin
 
     status_rect = Rect(x=0, y=height - status_h, w=width, h=status_h)
     return MainLayout(
