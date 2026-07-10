@@ -124,12 +124,12 @@ def test_detail_for_absent_provider_falls_back_to_main(gui) -> None:
     assert gui._state.detail_provider is None
 
 
-def test_bars_share_one_track_across_tiles() -> None:
-    # Every provider tile must place its bar track at the same x and run the same
-    # length, so the bars read as aligned columns regardless of per-tile label
-    # widths (percent digit-count, the folded Claude work account). This is the
-    # worst case: Claude folds in a wide "work" account and z.ai sits at 100%
-    # while the others are low — exactly when the old per-tile column drifted.
+def test_bars_align_within_a_column() -> None:
+    # With the paired-row layout, full-width tiles (Claude, Codex) form one
+    # column and must share an identical bar track so they read as aligned rows;
+    # the half-width paired tiles (z.ai, ollama) can't share that track but must
+    # match each other in track *length*. Worst case: Claude folds in a wide
+    # "work" account and z.ai sits at 100% while others are low.
     pygame.display.init()
     pygame.font.init()
     size = (1280, 720)  # the units run the 5" panel rotated to landscape
@@ -144,18 +144,30 @@ def test_bars_share_one_track_across_tiles() -> None:
             )
         readings = [
             r(Provider.CLAUDE, 9, 9), r(Provider.CLAUDE_WORK, 100, 100),
+            r(Provider.CODEX, 50, 50),
             r(Provider.ZAI, 100, 100), r(Provider.OLLAMA, 7, 5),
         ]
         gui = DashboardGui(_FakeFetcher(readings), size)  # type: ignore[arg-type]
         layout = build_main_layout(readings, size)
-        assert len(layout.tiles) >= 2  # guard: an empty/1-tile layout would pass vacuously
         label_col_w = gui._label_col_width(layout.tiles)
-        tracks = {
-            tile.provider: gui._bar_track(tile.rect, label_col_w)
-            for tile in layout.tiles
+        max_w = max(t.rect.w for t in layout.tiles)
+
+        # Full-width tiles (Claude, Codex) share one exact track.
+        full_tracks = {
+            gui._bar_track(t.rect, label_col_w)
+            for t in layout.tiles if t.rect.w == max_w
         }
-        # Identical (track_x, track_right) — hence identical width — everywhere.
-        assert len(set(tracks.values())) == 1, tracks
+        assert len(full_tracks) == 1, full_tracks
+
+        # The half-width paired tiles have equal-length (positive) tracks.
+        half = [t for t in layout.tiles if t.rect.w < max_w]
+        assert len(half) == 2  # z.ai + ollama
+        half_widths = set()
+        for t in half:
+            tx, tr = gui._bar_track(t.rect, label_col_w)
+            assert tr - tx > 20, (t.provider, tx, tr)  # track stays drawable
+            half_widths.add(tr - tx)
+        assert len(half_widths) == 1, half_widths
     finally:
         pygame.display.quit()
 

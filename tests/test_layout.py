@@ -61,22 +61,33 @@ class TestMainLayout:
             Provider.CLAUDE, Provider.ZAI, Provider.OLLAMA,
         ]
 
-    def test_single_column_stack(self) -> None:
+    def test_zai_ollama_share_a_row_claude_full_width(self) -> None:
         layout = build_main_layout(_all_four(), _SIZE, now=_NOW)
-        # All tiles share the same x/width (one column) and stack downward.
-        xs = {t.rect.x for t in layout.tiles}
-        ws = {t.rect.w for t in layout.tiles}
-        assert len(xs) == 1 and len(ws) == 1
-        ys = [t.rect.y for t in layout.tiles]
-        assert ys == sorted(ys)
+        by = {t.provider: t for t in layout.tiles}
+        claude, zai, ollama = by[Provider.CLAUDE], by[Provider.ZAI], by[Provider.OLLAMA]
+        # Claude spans a full-width row above the pair.
+        assert claude.rect.w > zai.rect.w
+        assert claude.rect.y < zai.rect.y
+        # zai and ollama share one row: same y, side by side, no overlap.
+        assert zai.rect.y == ollama.rect.y
+        assert zai.rect.x < ollama.rect.x
+        assert zai.rect.x + zai.rect.w <= ollama.rect.x
 
-    def test_codex_appears_as_stacked_tile_in_order(self) -> None:
+    def test_codex_after_claude_full_width(self) -> None:
         readings = _all_four() + [_reading(Provider.CODEX)]
         layout = build_main_layout(readings, _SIZE, now=_NOW)
-        # Codex slots in after ollama (umans stays in the footer, not a tile).
-        assert [t.provider for t in layout.tiles] == [
-            Provider.CLAUDE, Provider.ZAI, Provider.OLLAMA, Provider.CODEX,
+        order = [t.provider for t in layout.tiles]
+        assert order == [
+            Provider.CLAUDE, Provider.CODEX, Provider.ZAI, Provider.OLLAMA,
         ]
+        by = {t.provider: t for t in layout.tiles}
+        # Claude and Codex stack full-width; zai/ollama share the row below them.
+        assert by[Provider.CODEX].rect.w == by[Provider.CLAUDE].rect.w
+        assert (
+            by[Provider.CLAUDE].rect.y
+            < by[Provider.CODEX].rect.y
+            < by[Provider.ZAI].rect.y
+        )
 
     def test_tiles_within_bounds_and_nonoverlapping(self) -> None:
         layout = build_main_layout(_all_four(), _SIZE, now=_NOW)
@@ -117,14 +128,14 @@ class TestMainLayout:
         )
         layout = build_main_layout([claude], _SIZE, now=_NOW)
         bars = layout.tiles[0].bars
-        assert [b.label for b in bars] == ["Session", "Weekly", "Fable"]
+        assert [b.label for b in bars] == ["S", "W", "Fable"]
         assert bars[2].fraction == 0.13
         assert bars[2].color == fmt.GREEN  # 13%
 
     def test_no_scoped_bars_for_providers_without_limits(self) -> None:
         # zai/ollama readings carry no scoped_limits, so no extra bars appear.
         layout = build_main_layout([_reading(Provider.ZAI)], _SIZE, now=_NOW)
-        assert [b.label for b in layout.tiles[0].bars] == ["Session", "Weekly"]
+        assert [b.label for b in layout.tiles[0].bars] == ["S", "W"]
 
     def test_quotaless_provider_in_footer_not_a_tile(self) -> None:
         layout = build_main_layout(_all_four(), _SIZE, now=_NOW)

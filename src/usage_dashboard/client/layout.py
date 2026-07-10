@@ -27,11 +27,16 @@ from usage_dashboard.shared.models import (
 # the CLAUDE tile as a second, muted set of bars.
 _PROVIDER_ORDER: list[Provider] = [
     Provider.CLAUDE,
+    Provider.CODEX,
     Provider.ZAI,
     Provider.OLLAMA,
-    Provider.CODEX,
     Provider.UMANS,
 ]
+
+# Providers rendered half-width so two consecutive ones share a row, freeing
+# vertical space. Claude/Codex stay full-width (Claude carries an extra Fable
+# bar and can fold in a work account); z.ai + ollama pair up beneath them.
+_PAIRED_PROVIDERS: frozenset[Provider] = frozenset({Provider.ZAI, Provider.OLLAMA})
 
 Color = tuple[int, int, int]
 
@@ -110,9 +115,12 @@ def _bars_for(
     muted: bool = False,
 ) -> list[BarSpec]:
     bars: list[BarSpec] = []
+    # Abbreviated labels (S/W) keep the tile's global label column narrow, which
+    # matters most for the half-width paired tiles. The detail view spells them
+    # out in full.
     windows: list[tuple[str, float | None, datetime | None]] = [
-        ("Session", reading.session_percent, reading.session_resets_at),
-        ("Weekly", reading.weekly_percent, reading.weekly_resets_at),
+        ("S", reading.session_percent, reading.session_resets_at),
+        ("W", reading.weekly_percent, reading.weekly_resets_at),
     ]
     # Per-model scoped windows (e.g. Fable) render as extra bars after the
     # aggregate two; the label is the model name so the tile stays legible.
@@ -235,50 +243,62 @@ def build_main_layout(
     status_h = max(18, round(height * 0.10))
     grid_h = height - status_h - margin
 
-    # Single-column vertical stack. (A side-by-side pairing of z.ai/ollama to
-    # save room is deferred: mixed tile widths break the GUI's shared bar-track
-    # alignment and the half-width track needs on-panel verification.)
-    cols, rows = (1, max(len(tile_plan), 1))
-    cell_w = (width - margin * (cols + 1)) // cols
-    cell_h = (grid_h - margin * (rows + 1)) // max(rows, 1)
+    # Pack tiles into rows: two consecutive PAIRED providers share a row
+    # (half-width each); everything else spans the full width on its own row.
+    rows_plan: list[list[tuple[Provider, Reading]]] = []
+    idx = 0
+    while idx < len(tile_plan):
+        provider = tile_plan[idx][0]
+        nxt = tile_plan[idx + 1][0] if idx + 1 < len(tile_plan) else None
+        if provider in _PAIRED_PROVIDERS and nxt in _PAIRED_PROVIDERS:
+            rows_plan.append([tile_plan[idx], tile_plan[idx + 1]])
+            idx += 2
+        else:
+            rows_plan.append([tile_plan[idx]])
+            idx += 1
+
+    n_rows = max(len(rows_plan), 1)
+    cell_h = (grid_h - margin * (n_rows + 1)) // n_rows
 
     tiles: list[TileSpec] = []
-    for idx, (provider, reading) in enumerate(tile_plan):
-        col = idx % cols
-        row = idx // cols
-        rect = Rect(
-            x=margin + col * (cell_w + margin),
-            y=margin + row * (cell_h + margin),
-            w=cell_w,
-            h=cell_h,
-        )
-        # umans has no percentages — show its detail string instead of bars.
-        is_quotaless = (
-            reading.session_percent is None and reading.weekly_percent is None
-        )
-        if provider is Provider.CLAUDE:
-            bars = _claude_tile_bars(by_provider, now)
-            detail = None
-        else:
-            bars = [] if is_quotaless else _bars_for(reading, now)
-            detail = reading.detail if is_quotaless else None
-        # Build the title: provider name + status. Model breakdown goes in
-        # subtitle (right-aligned by the GUI), not in the title string.
-        title = provider.value.upper() + fmt.status_suffix(reading)
-        subtitle = ""
-        if provider is Provider.OLLAMA:
-            subtitle = _model_subtitle(reading.models)
-        tiles.append(
-            TileSpec(
-                provider=provider,
-                title=title,
-                rect=rect,
-                bars=bars,
-                detail=detail,
-                accent=_accent(bars, detail),
-                subtitle=subtitle,
+    for row_idx, row_tiles in enumerate(rows_plan):
+        ncols = len(row_tiles)
+        cell_w = (width - margin * (ncols + 1)) // ncols
+        y = margin + row_idx * (cell_h + margin)
+        for col_idx, (provider, reading) in enumerate(row_tiles):
+            rect = Rect(
+                x=margin + col_idx * (cell_w + margin),
+                y=y,
+                w=cell_w,
+                h=cell_h,
             )
-        )
+            # umans has no percentages — show its detail string instead of bars.
+            is_quotaless = (
+                reading.session_percent is None and reading.weekly_percent is None
+            )
+            if provider is Provider.CLAUDE:
+                bars = _claude_tile_bars(by_provider, now)
+                detail = None
+            else:
+                bars = [] if is_quotaless else _bars_for(reading, now)
+                detail = reading.detail if is_quotaless else None
+            # Build the title: provider name + status. Model breakdown goes in
+            # subtitle (right-aligned by the GUI), not in the title string.
+            title = provider.value.upper() + fmt.status_suffix(reading)
+            subtitle = ""
+            if provider is Provider.OLLAMA:
+                subtitle = _model_subtitle(reading.models)
+            tiles.append(
+                TileSpec(
+                    provider=provider,
+                    title=title,
+                    rect=rect,
+                    bars=bars,
+                    detail=detail,
+                    accent=_accent(bars, detail),
+                    subtitle=subtitle,
+                )
+            )
 
     status_rect = Rect(x=0, y=height - status_h, w=width, h=status_h)
     return MainLayout(
