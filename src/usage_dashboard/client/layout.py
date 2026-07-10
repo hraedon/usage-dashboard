@@ -73,6 +73,7 @@ class TileSpec:
     detail: str | None   # quota-less providers (umans) show this instead of bars
     accent: Color        # worst-of bar colours, for a status edge
     subtitle: str = ""   # right-aligned model breakdown for the tile header
+    compact: bool = False  # half-width paired tile: S/W labels, bare countdown
 
 
 @dataclass(frozen=True)
@@ -113,14 +114,16 @@ def _bars_for(
     now: datetime | None,
     account: str = "",
     muted: bool = False,
+    compact: bool = False,
 ) -> list[BarSpec]:
     bars: list[BarSpec] = []
-    # Abbreviated labels (S/W) keep the tile's global label column narrow, which
-    # matters most for the half-width paired tiles. The detail view spells them
-    # out in full.
+    # Full-width tiles spell out "Session"/"Weekly"; the compact S/W
+    # abbreviations are reserved for the narrow half-width paired tiles,
+    # where the freed label width directly extends the bar.
+    s_label, w_label = ("S", "W") if compact else ("Session", "Weekly")
     windows: list[tuple[str, float | None, datetime | None]] = [
-        ("S", reading.session_percent, reading.session_resets_at),
-        ("W", reading.weekly_percent, reading.weekly_resets_at),
+        (s_label, reading.session_percent, reading.session_resets_at),
+        (w_label, reading.weekly_percent, reading.weekly_resets_at),
     ]
     # Per-model scoped windows (e.g. Fable) render as extra bars after the
     # aggregate two; the label is the model name so the tile stays legible.
@@ -146,7 +149,8 @@ def _bars_for(
 
 
 def _claude_tile_bars(
-    by_provider: dict[Provider, Reading], now: datetime | None
+    by_provider: dict[Provider, Reading], now: datetime | None,
+    compact: bool = False,
 ) -> list[BarSpec]:
     """Bars for the Claude tile, merging the personal and (optional) work
     accounts. With only one account the bars are untagged and unmuted — i.e.
@@ -159,12 +163,12 @@ def _claude_tile_bars(
     if len(present) <= 1:
         # Single account: no tag, no muting (unchanged from the original look).
         provider = present[0][0] if present else Provider.CLAUDE
-        return _bars_for(by_provider[provider], now)
+        return _bars_for(by_provider[provider], now, compact=compact)
     bars: list[BarSpec] = []
     for provider, label in present:
         bars.extend(
             _bars_for(by_provider[provider], now, account=label,
-                      muted=(provider is Provider.CLAUDE_WORK))
+                      muted=(provider is Provider.CLAUDE_WORK), compact=compact)
         )
     return bars
 
@@ -265,27 +269,35 @@ def build_main_layout(
     # with more bars (Claude, with its extra Fable window) gets a proportionally
     # taller row, so every bar renders at the same height regardless of how many
     # bars its tile has.
-    BuiltTile = tuple[Provider, "Reading", list[BarSpec], "str | None", str, str]
+    BuiltTile = tuple[Provider, "Reading", list[BarSpec], "str | None", str, str, bool]
     built_rows: list[list[BuiltTile]] = []
     row_weights: list[int] = []
     for row_tiles in rows_plan:
         built: list[BuiltTile] = []
         weight = 1
+        is_paired = len(row_tiles) > 1
         for provider, reading in row_tiles:
             # umans has no percentages — show its detail string instead of bars.
             is_quotaless = (
                 reading.session_percent is None and reading.weekly_percent is None
             )
             if provider is Provider.CLAUDE:
-                bars = _claude_tile_bars(by_provider, now)
+                bars = _claude_tile_bars(by_provider, now, compact=is_paired)
                 detail = None
             else:
-                bars = [] if is_quotaless else _bars_for(reading, now)
+                bars = [] if is_quotaless else _bars_for(
+                    reading, now, compact=is_paired
+                )
                 detail = reading.detail if is_quotaless else None
-            # Provider name + status; model breakdown goes in the subtitle.
+            # Provider name + status; model breakdown goes in the subtitle,
+            # but only on full-width tiles — the narrow paired tile is too
+            # tight for a model breakdown next to the title.
             title = provider.value.upper() + fmt.status_suffix(reading)
-            subtitle = _model_subtitle(reading.models) if provider is Provider.OLLAMA else ""
-            built.append((provider, reading, bars, detail, title, subtitle))
+            if provider is Provider.OLLAMA and not is_paired:
+                subtitle = _model_subtitle(reading.models)
+            else:
+                subtitle = ""
+            built.append((provider, reading, bars, detail, title, subtitle, is_paired))
             weight = max(weight, len(bars))
         built_rows.append(built)
         row_weights.append(weight)
@@ -308,7 +320,8 @@ def build_main_layout(
         cell_h = row_heights[row_idx]
         ncols = len(built)
         cell_w = (width - margin * (ncols + 1)) // ncols
-        for col_idx, (provider, reading, bars, detail, title, subtitle) in enumerate(built):
+        for col_idx, built_tile in enumerate(built):
+            provider, reading, bars, detail, title, subtitle, compact = built_tile
             rect = Rect(
                 x=margin + col_idx * (cell_w + margin),
                 y=y,
@@ -324,6 +337,7 @@ def build_main_layout(
                     detail=detail,
                     accent=_accent(bars, detail),
                     subtitle=subtitle,
+                    compact=compact,
                 )
             )
         y += cell_h + margin

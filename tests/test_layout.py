@@ -112,6 +112,38 @@ class TestMainLayout:
         assert weekly.fraction == 0.9
         assert weekly.color == fmt.RED     # 90%
 
+    def test_full_width_tile_uses_full_labels(self) -> None:
+        layout = build_main_layout([_reading(Provider.CLAUDE)], _SIZE, now=_NOW)
+        labels = [b.label for b in layout.tiles[0].bars]
+        assert labels == ["Session", "Weekly"]
+        assert layout.tiles[0].compact is False
+
+    def test_paired_tiles_use_compact_labels(self) -> None:
+        layout = build_main_layout(_all_four(), _SIZE, now=_NOW)
+        by = {t.provider: t for t in layout.tiles}
+        assert [b.label for b in by[Provider.ZAI].bars] == ["S", "W"]
+        assert [b.label for b in by[Provider.OLLAMA].bars] == ["S", "W"]
+        assert by[Provider.ZAI].compact is True
+        assert by[Provider.OLLAMA].compact is True
+
+    def test_ollama_subtitle_hidden_when_paired(self) -> None:
+        reading = _reading(Provider.OLLAMA, models=[
+            ModelUsage(name="minimax-m3", requests=100, share_percent=80.0),
+        ])
+        layout = build_main_layout([_reading(Provider.ZAI), reading], _SIZE, now=_NOW)
+        ollama = next(t for t in layout.tiles if t.provider is Provider.OLLAMA)
+        assert ollama.subtitle == ""
+        assert ollama.compact is True
+
+    def test_ollama_subtitle_shown_when_full_width(self) -> None:
+        reading = _reading(Provider.OLLAMA, models=[
+            ModelUsage(name="minimax-m3", requests=100, share_percent=80.0),
+        ])
+        layout = build_main_layout([reading], _SIZE, now=_NOW)
+        ollama = layout.tiles[0]
+        assert "minimax-m3" in ollama.subtitle
+        assert ollama.compact is False
+
     def test_scoped_limit_renders_extra_claude_bar(self) -> None:
         # A Fable-scoped weekly limit becomes a third bar on the Claude tile,
         # after Session and Weekly, labelled by the model name.
@@ -128,14 +160,14 @@ class TestMainLayout:
         )
         layout = build_main_layout([claude], _SIZE, now=_NOW)
         bars = layout.tiles[0].bars
-        assert [b.label for b in bars] == ["S", "W", "Fable"]
+        assert [b.label for b in bars] == ["Session", "Weekly", "Fable"]
         assert bars[2].fraction == 0.13
         assert bars[2].color == fmt.GREEN  # 13%
 
     def test_no_scoped_bars_for_providers_without_limits(self) -> None:
         # zai/ollama readings carry no scoped_limits, so no extra bars appear.
         layout = build_main_layout([_reading(Provider.ZAI)], _SIZE, now=_NOW)
-        assert [b.label for b in layout.tiles[0].bars] == ["S", "W"]
+        assert [b.label for b in layout.tiles[0].bars] == ["Session", "Weekly"]
 
     def test_quotaless_provider_in_footer_not_a_tile(self) -> None:
         layout = build_main_layout(_all_four(), _SIZE, now=_NOW)

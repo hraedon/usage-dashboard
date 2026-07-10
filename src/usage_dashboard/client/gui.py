@@ -175,8 +175,11 @@ class DashboardGui:
         self._font_big = pygame.font.Font(None, unit * 2)
         # Fixed width reserved on the right of every bar row for the reset text,
         # sized to a worst-case countdown so the bar track always ends at the
-        # same x and never bleeds into "resets …".
+        # same x and never bleeds into the countdown. Full-width tiles show
+        # "resets 23d 23h"; compact (paired) tiles show a bare "23d 23h", so
+        # their column is narrower and the bar track extends further.
         self._reset_col_w = self._font.size("resets 23d 23h")[0]
+        self._compact_reset_col_w = self._font.size("23d 23h")[0]
 
     # -- event loop ---------------------------------------------------------
 
@@ -350,36 +353,34 @@ class DashboardGui:
             f"{bar.label} {bar.percent_text}"
         )
 
-    def _label_col_width(self, tiles: list[TileSpec]) -> int:
-        """Widest bar label across *all* tiles.
+    def _label_col_widths(self, tiles: list[TileSpec]) -> dict[bool, int]:
+        """Widest bar label per tile group (compact vs full-width).
 
-        Computing this fleet-wide (rather than per tile) is what makes every
-        tile's bar track start at the same x and run the same length, so the
-        bars read as aligned columns regardless of per-tile label widths
-        (percent digit-count, the folded Claude work account). The reset column
-        is already a global sentinel width; this gives the label column the same
-        treatment. The trade is uniform bars at the cost of a little length —
-        the single widest label anywhere sets the column for all."""
-        return max(
-            (self._font.size(self._bar_label(bar))[0]
-             for tile in tiles for bar in tile.bars),
-            default=0,
-        )
+        Full-width tiles (Session/Weekly) and compact tiles (S/W) are sized
+        independently so each group's bars start at the same x without the
+        wide labels stealing space from the narrow paired tiles."""
+        widths: dict[bool, int] = {False: 0, True: 0}
+        for tile in tiles:
+            for bar in tile.bars:
+                w = self._font.size(self._bar_label(bar))[0]
+                if w > widths[tile.compact]:
+                    widths[tile.compact] = w
+        return widths
 
-    def _bar_track(self, rect: Rect, label_col_w: int) -> tuple[int, int]:
-        """``(track_x, track_right)`` for a tile's bars given the global label
-        column width. Both edges depend only on tile geometry and the two global
-        column widths, so every tile in the single-column stack yields the same
-        pair."""
+    def _bar_track(self, rect: Rect, label_col_w: int, compact: bool = False) -> tuple[int, int]:
+        """``(track_x, track_right)`` for a tile's bars given the label column
+        width. Compact tiles use a narrower reset column (bare countdown, no
+        "resets" prefix) so the bar track extends further."""
         pad = max(8, min(rect.w, rect.h) // 12)
+        reset_w = self._compact_reset_col_w if compact else self._reset_col_w
         track_x = rect.x + pad + label_col_w + pad
-        track_right = rect.x + rect.w - pad - self._reset_col_w - pad
+        track_right = rect.x + rect.w - pad - reset_w - pad
         return track_x, track_right
 
     def _draw_main(self, layout: MainLayout) -> None:
-        label_col_w = self._label_col_width(layout.tiles)
+        label_cols = self._label_col_widths(layout.tiles)
         for tile in layout.tiles:
-            self._draw_tile(tile, label_col_w)
+            self._draw_tile(tile, label_cols[tile.compact])
         sr = layout.status_rect
         status = self._font_small.render(layout.status_text, True, fmt.GRAY)
         self._screen.blit(status, (sr.x + 8, sr.y + (sr.h - status.get_height()) // 2))
@@ -427,7 +428,7 @@ class DashboardGui:
             self._font.render(self._bar_label(bar), True, fmt.TEXT)
             for bar in tile.bars
         ]
-        track_x, track_right = self._bar_track(r, label_col_w)
+        track_x, track_right = self._bar_track(r, label_col_w, compact=tile.compact)
         # The reset text starts a gap past the bar end, so every reset lines up.
         reset_x = track_right + pad
         track_w = track_right - track_x
@@ -452,9 +453,8 @@ class DashboardGui:
 
             if bar.reset_text:
                 rc = fmt.YELLOW if bar.reset_highlight else fmt.GRAY
-                # No "resets" prefix — a bare countdown next to a usage bar is
-                # unambiguous, and it frees width on the narrow paired tiles.
-                reset = self._font.render(bar.reset_text, True, rc)
+                text = bar.reset_text if tile.compact else f"resets {bar.reset_text}"
+                reset = self._font.render(text, True, rc)
                 # Left-aligned at a fixed x just past the bar, so resets line up.
                 self._screen.blit(reset, (reset_x, cy - reset.get_height() // 2))
 
