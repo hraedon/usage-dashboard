@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 from usage_dashboard.server.db import Database
 from usage_dashboard.shared.models import (
@@ -315,8 +315,9 @@ class TestPruneOldReadings:
     def test_prune_old_readings_deletes_old(self, tmp_path):
         db = Database(str(tmp_path / "test.db"))
         db.initialize()
-        old = _make_reading(fetched_at=datetime(2026, 1, 1, 12, 0, 0))
-        recent = _make_reading(fetched_at=datetime(2026, 7, 4, 12, 0, 0))
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        old = _make_reading(fetched_at=now - timedelta(days=30))
+        recent = _make_reading(fetched_at=now - timedelta(days=1))
         db.store_reading(old)
         db.store_reading(recent)
         deleted = db.prune_old_readings(7)
@@ -328,8 +329,9 @@ class TestPruneOldReadings:
     def test_prune_old_readings_keeps_all_within_retention(self, tmp_path):
         db = Database(str(tmp_path / "test.db"))
         db.initialize()
-        r1 = _make_reading(fetched_at=datetime(2026, 7, 3, 12, 0, 0))
-        r2 = _make_reading(fetched_at=datetime(2026, 7, 4, 12, 0, 0))
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        r1 = _make_reading(fetched_at=now - timedelta(days=3))
+        r2 = _make_reading(fetched_at=now - timedelta(days=1))
         db.store_reading(r1)
         db.store_reading(r2)
         deleted = db.prune_old_readings(7)
@@ -341,8 +343,9 @@ class TestPruneOldReadings:
     def test_prune_keeps_latest_even_when_all_old(self, tmp_path):
         db = Database(str(tmp_path / "test.db"))
         db.initialize()
-        old1 = _make_reading(fetched_at=datetime(2026, 1, 1, 12, 0, 0))
-        old2 = _make_reading(fetched_at=datetime(2026, 1, 2, 12, 0, 0))
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        old1 = _make_reading(fetched_at=now - timedelta(days=30))
+        old2 = _make_reading(fetched_at=now - timedelta(days=29))
         db.store_reading(old1)
         db.store_reading(old2)
         deleted = db.prune_old_readings(7)
