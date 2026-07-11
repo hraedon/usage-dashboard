@@ -7,7 +7,7 @@ when the optional ``gui`` extra (pygame) isn't installed.
 from __future__ import annotations
 
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -31,6 +31,7 @@ from usage_dashboard.shared.models import (  # noqa: E402
     Provider,
     Reading,
     ReadingStatus,
+    ScopedLimit,
 )
 
 _NOW = datetime(2026, 1, 10, 12, 0, 0)
@@ -148,7 +149,9 @@ def test_bars_align_within_a_column() -> None:
             r(Provider.ZAI, 100, 100), r(Provider.OLLAMA, 7, 5),
         ]
         gui = DashboardGui(_FakeFetcher(readings), size)  # type: ignore[arg-type]
-        layout = build_main_layout(readings, size)
+        layout = build_main_layout(
+            readings, size, tile_overhead=gui._tile_overhead,
+        )
         label_cols = gui._label_col_widths(layout.tiles)
 
         # Side-by-side tiles of the same size (z.ai | ollama) must share an
@@ -168,6 +171,82 @@ def test_bars_align_within_a_column() -> None:
         assert paired, "expected a paired same-size group (z.ai | ollama)"
         for rels in paired:
             assert len(set(rels)) == 1, rels
+    finally:
+        pygame.display.quit()
+
+
+def _bottom_pad(tile, gui) -> int:
+    """Distance from the last bar's bottom edge to the tile's bottom inner
+    edge, computed with the same geometry as ``_draw_tile``."""
+    pad = gui._tile_pad
+    title_h = gui._font_title.get_height()
+    content_top = tile.rect.y + pad + title_h + pad // 2
+    bottom = tile.rect.y + tile.rect.h - pad
+    n = max(len(tile.bars), 1)
+    row_h = (bottom - content_top) // n
+    bar_h = max(8, row_h // 3)
+    cy_last = content_top + (n - 1) * row_h + row_h // 2
+    bar_bottom = cy_last + bar_h // 2
+    return bottom - bar_bottom
+
+
+def test_equal_bottom_padding_across_bar_counts() -> None:
+    # The 2-bar tile (Codex) and 3-bar tile (Claude+Fable) must have equal
+    # padding from the last bar to the bottom of their cells.  Before the
+    # overhead-aware row distribution, the 3-bar tile got excess bottom padding
+    # and the 2-bar tile's bars were squished to minimum height.
+    pygame.display.init()
+    pygame.font.init()
+    size = (1280, 720)
+    pygame.display.set_mode(size)
+    try:
+        reset = _NOW.replace(tzinfo=timezone.utc) + timedelta(days=3)
+        claude = Reading(
+            provider=Provider.CLAUDE, status=ReadingStatus.CURRENT,
+            session_percent=50.0, session_resets_at=reset,
+            weekly_percent=90.0, weekly_resets_at=reset,
+            fetched_at=_NOW, stale=False,
+            scoped_limits=[ScopedLimit(
+                name="Fable", percent=13.0, resets_at=reset, is_active=False,
+            )],
+        )
+        codex = Reading(
+            provider=Provider.CODEX, status=ReadingStatus.CURRENT,
+            session_percent=60.0, session_resets_at=reset,
+            weekly_percent=40.0, weekly_resets_at=reset,
+            fetched_at=_NOW, stale=False,
+        )
+        readings = [claude, codex]
+        gui = DashboardGui(_FakeFetcher(readings), size)  # type: ignore[arg-type]
+        layout = build_main_layout(
+            readings, size, tile_overhead=gui._tile_overhead,
+        )
+        by = {t.provider: t for t in layout.tiles}
+        claude_tile = by[Provider.CLAUDE]
+        codex_tile = by[Provider.CODEX]
+        assert len(claude_tile.bars) == 3  # Session, Weekly, Fable
+        assert len(codex_tile.bars) == 2
+
+        pad_claude = _bottom_pad(claude_tile, gui)
+        pad_codex = _bottom_pad(codex_tile, gui)
+        assert abs(pad_claude - pad_codex) <= 1, (
+            f"bottom padding differs: Claude={pad_claude}, Codex={pad_codex}"
+        )
+
+        # The 2-bar tile's bars must not be squished to minimum height —
+        # the row height should match the 3-bar tile's (within 1px for
+        # integer division).
+        def row_h(tile) -> int:
+            pad = gui._tile_pad
+            t_h = gui._font_title.get_height()
+            ct = tile.rect.y + pad + t_h + pad // 2
+            bt = tile.rect.y + tile.rect.h - pad
+            return (bt - ct) // max(len(tile.bars), 1)
+
+        assert abs(row_h(claude_tile) - row_h(codex_tile)) <= 1, (
+            f"row heights differ: Claude={row_h(claude_tile)}, "
+            f"Codex={row_h(codex_tile)}"
+        )
     finally:
         pygame.display.quit()
 

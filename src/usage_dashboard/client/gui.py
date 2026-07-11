@@ -184,6 +184,16 @@ class DashboardGui:
         # 3-bar tile gets the same padding as a 2-bar tile — the taller row
         # accommodates the extra bar, not extra padding.
         self._tile_pad = max(8, min(self._width, self._height) // 40)
+        # Exact per-tile overhead (title + padding) passed to the layout so
+        # row heights distribute with the real font height, not an estimate.
+        # This is what makes 2-bar and 3-bar tiles get equal row heights and
+        # equal bottom padding.
+        self._tile_overhead = (
+            self._tile_pad
+            + self._font_title.get_height()
+            + self._tile_pad // 2
+            + self._tile_pad
+        )
 
     # -- event loop ---------------------------------------------------------
 
@@ -330,6 +340,7 @@ class DashboardGui:
             layout = build_main_layout(
                 readings, (self._width, self._height),
                 refresh_interval=self._fetcher.current_interval,
+                tile_overhead=self._tile_overhead,
             )
             # While dark, a tap wakes (sets _wake_until) instead of navigating.
             self._handle_events(layout, swallow_wake=dark, now=now)
