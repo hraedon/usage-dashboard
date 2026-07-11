@@ -192,13 +192,35 @@ def _model_subtitle(models: list[ModelUsage] | None, top_n: int = 2) -> str:
     return " · ".join(f"{m.name} {m.share_percent:.0f}%" for m in top)
 
 
+def _estimate_tile_overhead(size: tuple[int, int]) -> int:
+    """Estimate the fixed per-tile vertical overhead (title + padding) the GUI
+    subtracts before drawing bars.  Mirrors the font/pad sizing in
+    :class:`DashboardGui` so tile heights give every bar the same row height.
+    The GUI passes the *exact* overhead (from the rendered font height); this
+    fallback is used by layout-only tests and when no GUI is involved."""
+    w, h = size
+    pad = max(8, min(w, h) // 40)
+    unit = max(18, h // 15)
+    title_h = unit * 5 // 4
+    # top: pad + title + pad//2;  bottom: pad
+    return pad + title_h + pad // 2 + pad
+
+
 def build_main_layout(
     readings: list[Reading],
     size: tuple[int, int],
     now: datetime | None = None,
     refresh_interval: int | None = None,
+    tile_overhead: int | None = None,
 ) -> MainLayout:
-    """Lay out provider tiles in a grid plus a bottom status bar."""
+    """Lay out provider tiles in a grid plus a bottom status bar.
+
+    *tile_overhead* is the fixed vertical cost per tile (title + padding) that
+    the GUI subtracts before drawing bars.  When provided (by the GUI, which
+    knows the real font height), row heights are distributed so that every
+    tile's bars get the same row height regardless of bar count.  When None,
+    an estimate from the screen size is used.
+    """
     width, height = size
     by_provider = {r.provider: r for r in readings}
 
@@ -303,16 +325,26 @@ def build_main_layout(
         row_weights.append(weight)
 
     total_weight = sum(row_weights)
+
+    if tile_overhead is None:
+        tile_overhead = _estimate_tile_overhead((width, height))
+
     avail = grid_h - margin * (n_rows + 1)
+    # Subtract the fixed per-tile overhead before proportional distribution so
+    # every tile's bars get the same row height.  Without this the overhead
+    # eats a disproportionate share of the shorter tiles (e.g. 2-bar Codex),
+    # squishing their bars to the minimum height while the 3-bar Claude tile
+    # gets excess bottom padding.
+    usable = max(0, avail - tile_overhead * n_rows)
     row_heights: list[int] = []
     used = 0
     for idx, weight in enumerate(row_weights):
         if idx == n_rows - 1:
-            row_heights.append(avail - used)  # last row absorbs the remainder
+            row_heights.append(usable - used + tile_overhead)  # last absorbs remainder
         else:
-            h = avail * weight // total_weight
+            h = usable * weight // total_weight
             used += h
-            row_heights.append(h)
+            row_heights.append(h + tile_overhead)
 
     tiles: list[TileSpec] = []
     y = margin

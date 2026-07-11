@@ -89,6 +89,36 @@ class TestMainLayout:
             < by[Provider.ZAI].rect.y
         )
 
+    def test_overhead_gives_equal_row_heights(self) -> None:
+        # With tile_overhead specified, a 3-bar tile and a 2-bar tile get
+        # equal row heights: (tile_h - overhead) / n_bars is the same.
+        # Without the overhead-aware distribution, the 2-bar tile's bars are
+        # squished and the 3-bar tile gets excess bottom padding.
+        claude = _reading(
+            Provider.CLAUDE,
+            scoped_limits=[ScopedLimit(
+                name="Fable", percent=13.0,
+                resets_at=_NOW + timedelta(days=3), is_active=False,
+            )],
+        )
+        readings = [claude, _reading(Provider.CODEX)]
+        overhead = 80  # arbitrary; the invariant holds for any value
+        layout = build_main_layout(
+            readings, _SIZE, now=_NOW, tile_overhead=overhead,
+        )
+        by = {t.provider: t for t in layout.tiles}
+        claude_h = by[Provider.CLAUDE].rect.h
+        codex_h = by[Provider.CODEX].rect.h
+        assert len(by[Provider.CLAUDE].bars) == 3
+        assert len(by[Provider.CODEX].bars) == 2
+        # (tile_h - overhead) / n_bars should be equal (within 1px for
+        # integer division).
+        claude_row = (claude_h - overhead) // 3
+        codex_row = (codex_h - overhead) // 2
+        assert abs(claude_row - codex_row) <= 1, (
+            f"row heights differ: Claude={claude_row}, Codex={codex_row}"
+        )
+
     def test_tiles_within_bounds_and_nonoverlapping(self) -> None:
         layout = build_main_layout(_all_four(), _SIZE, now=_NOW)
         w, h = _SIZE
