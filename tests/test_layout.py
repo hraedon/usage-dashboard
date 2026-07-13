@@ -199,6 +199,30 @@ class TestMainLayout:
         layout = build_main_layout([_reading(Provider.ZAI)], _SIZE, now=_NOW)
         assert [b.label for b in layout.tiles[0].bars] == ["Session", "Weekly"]
 
+    def test_codex_weekly_only_single_bar(self) -> None:
+        # Weekly-only mode: Codex with session_percent=None should render
+        # only the Weekly bar, not a grayed "N/A" Session bar.
+        codex = _reading(
+            Provider.CODEX,
+            session_percent=None, session_resets_at=None,
+        )
+        layout = build_main_layout([codex], _SIZE, now=_NOW)
+        bars = layout.tiles[0].bars
+        assert len(bars) == 1
+        assert bars[0].label == "Weekly"
+        assert bars[0].fraction == 0.9  # 90% from _reading default
+
+    def test_detail_weekly_only_omits_session(self) -> None:
+        # Detail view for weekly-only Codex should not show a Session line.
+        codex = _reading(
+            Provider.CODEX,
+            session_percent=None, session_resets_at=None,
+        )
+        detail = build_detail_layout(codex, now=_NOW)
+        labels = [line.label for line in detail.lines]
+        assert "Session" not in labels
+        assert "Weekly" in labels
+
     def test_quotaless_provider_in_footer_not_a_tile(self) -> None:
         layout = build_main_layout(_all_four(), _SIZE, now=_NOW)
         assert Provider.UMANS not in [t.provider for t in layout.tiles]

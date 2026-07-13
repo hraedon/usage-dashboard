@@ -76,11 +76,15 @@ def _bar_row(label: str, percent: float | None, resets_at: datetime | None, now:
 
 def _account_rows(reading: Reading, now: datetime, label: str = "") -> str:
     prefix = f"{label} " if label else ""
-    rows = _bar_row(
-        f"{prefix}Session", reading.session_percent, reading.session_resets_at, now
-    ) + _bar_row(
-        f"{prefix}Weekly", reading.weekly_percent, reading.weekly_resets_at, now
-    )
+    rows = ""
+    if reading.session_percent is not None:
+        rows += _bar_row(
+            f"{prefix}Session", reading.session_percent, reading.session_resets_at, now
+        )
+    if reading.weekly_percent is not None:
+        rows += _bar_row(
+            f"{prefix}Weekly", reading.weekly_percent, reading.weekly_resets_at, now
+        )
     for sl in reading.scoped_limits or []:
         rows += _bar_row(f"{prefix}{sl.name}", sl.percent, sl.resets_at, now)
     return rows
