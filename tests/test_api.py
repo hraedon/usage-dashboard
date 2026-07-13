@@ -300,6 +300,30 @@ class TestDashboardEndpoint:
 
         asyncio.run(_test())
 
+    def test_dashboard_skips_none_percent_bars(self, tmp_path):
+        # Weekly-only Codex (session_percent=None) should show only the
+        # Weekly bar on the dashboard, not a grayed "N/A" Session bar.
+        app, db = _create_app_with_db(
+            tmp_path, configured_providers=[Provider.CODEX]
+        )
+        db.store_reading(
+            _make_reading(
+                provider=Provider.CODEX,
+                session_percent=None,
+                session_resets_at=None,
+                weekly_percent=55.0,
+            )
+        )
+
+        async def _test():
+            async with _client(app) as client:
+                response = await client.get("/dashboard")
+            assert "Weekly" in response.text
+            assert "55%" in response.text
+            assert "Session" not in response.text
+
+        asyncio.run(_test())
+
     def test_dashboard_escapes_detail_content(self, tmp_path):
         app, db = _create_app_with_db(tmp_path)
         db.store_reading(

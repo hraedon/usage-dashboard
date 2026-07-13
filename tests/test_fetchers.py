@@ -399,6 +399,92 @@ class TestFetchCodex:
         with pytest.raises(FetchError):
             fetch_codex_usage("test-token")
 
+    @patch("usage_dashboard.server.fetch_codex.httpx.Client")
+    def test_fetch_codex_weekly_only_no_primary(self, mock_client_cls):
+        # Weekly-only mode: primary_window is null, only secondary_window
+        # (weekly) is present. session_percent should be None.
+        data = {
+            "plan_type": "plus",
+            "rate_limit": {
+                "allowed": True,
+                "limit_reached": False,
+                "primary_window": None,
+                "secondary_window": {
+                    "used_percent": 55,
+                    "limit_window_seconds": 604800,
+                    "reset_after_seconds": 400000,
+                    "reset_at": 1778400000,
+                },
+            },
+        }
+        self._mock_get(mock_client_cls, data)
+        reading = fetch_codex_usage("test-token")
+        assert reading.session_percent is None
+        assert reading.session_resets_at is None
+        assert reading.weekly_percent == 55.0
+        assert reading.weekly_resets_at == datetime(2026, 5, 10, 8, 0, 0)
+
+    @patch("usage_dashboard.server.fetch_codex.httpx.Client")
+    def test_fetch_codex_weekly_in_primary_window(self, mock_client_cls):
+        # Weekly-only mode variant: the sole window is in primary_window but
+        # its limit_window_seconds (604800) identifies it as weekly.
+        data = {
+            "plan_type": "plus",
+            "rate_limit": {
+                "allowed": True,
+                "limit_reached": False,
+                "primary_window": {
+                    "used_percent": 33,
+                    "limit_window_seconds": 604800,
+                    "reset_after_seconds": 400000,
+                    "reset_at": 1778400000,
+                },
+            },
+        }
+        self._mock_get(mock_client_cls, data)
+        reading = fetch_codex_usage("test-token")
+        assert reading.session_percent is None
+        assert reading.weekly_percent == 33.0
+
+    @patch("usage_dashboard.server.fetch_codex.httpx.Client")
+    def test_fetch_codex_session_only_in_secondary_window(self, mock_client_cls):
+        # Edge case: the sole window is in secondary_window but its
+        # limit_window_seconds (18000) identifies it as a session window.
+        data = {
+            "plan_type": "plus",
+            "rate_limit": {
+                "allowed": True,
+                "limit_reached": False,
+                "secondary_window": {
+                    "used_percent": 80,
+                    "limit_window_seconds": 18000,
+                    "reset_after_seconds": 12000,
+                    "reset_at": 1778000000,
+                },
+            },
+        }
+        self._mock_get(mock_client_cls, data)
+        reading = fetch_codex_usage("test-token")
+        assert reading.session_percent == 80.0
+        assert reading.weekly_percent is None
+
+    @patch("usage_dashboard.server.fetch_codex.httpx.Client")
+    def test_fetch_codex_both_windows_absent(self, mock_client_cls):
+        # Both windows absent/null — the rate_limit object exists but has
+        # no window data. Should not raise; produces a reading with both
+        # percents None (rendered as offline-like by the client).
+        data = {
+            "plan_type": "plus",
+            "rate_limit": {
+                "allowed": True,
+                "limit_reached": False,
+            },
+        }
+        self._mock_get(mock_client_cls, data)
+        reading = fetch_codex_usage("test-token")
+        assert reading.session_percent is None
+        assert reading.weekly_percent is None
+
 
 class TestFetchZai:
     @patch("usage_dashboard.server.fetch_zai.httpx.Client")

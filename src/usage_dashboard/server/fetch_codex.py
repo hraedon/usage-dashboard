@@ -17,6 +17,13 @@ approach Plan 001 used for Claude — don't trust them from memory):
   captured from a real ChatGPT-plan account (2026-07-10); it differs from the
   streaming/header struct in the source (``rate_limits.{primary,secondary}``
   with ``resets_at``), which the parser also tolerates as a fallback.
+
+**Weekly-only mode:** OpenAI periodically drops the session (5h) window,
+leaving only the weekly limit. When only one window is present, the parser
+classifies it by ``limit_window_seconds`` (weekly ≈ 604 800 s; session ≈
+18 000 s) rather than by slot name, so a lone weekly window in the
+``primary_window`` slot is still mapped to ``weekly_percent``. Both formats
+(session+weekly and weekly-only) are handled transparently.
 """
 from __future__ import annotations
 
@@ -42,6 +49,11 @@ _CODEX_SCOPES = "openid profile email offline_access"
 _CODEX_ORIGINATOR = "codex_cli_rs"
 _USER_AGENT = "usage-dashboard-codex/1.0"
 _TIMEOUT = 30.0
+
+# Windows with limit_window_seconds at or above this are weekly, not session.
+# Session ≈ 18 000 s (5 h); weekly ≈ 604 800 s (7 d) — any threshold well
+# above 18 000 but well below 604 800 works.
+_WEEKLY_MIN_SECONDS = 100_000
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +84,14 @@ def _extract_window(block: object) -> tuple[float | None, datetime | None]:
     if reset is None:
         reset = block.get("resets_at")
     return percent, _epoch_to_naive_utc(reset)
+
+
+def _window_seconds(block: object) -> float | None:
+    """Pull ``limit_window_seconds`` from a rate-limit window block."""
+    if not isinstance(block, dict):
+        return None
+    seconds = block.get("limit_window_seconds")
+    return float(seconds) if isinstance(seconds, (int, float)) else None
 
 
 def _rate_limit_object(data: dict[str, Any]) -> dict[str, Any] | None:
@@ -186,15 +206,27 @@ def fetch_codex_usage(
     if rl is None:
         raise FetchError("Codex usage response parse error: no rate_limit")
     try:
-        # primary = ~5h session window, secondary = weekly window.
-        session_percent, session_resets_at = _extract_window(
-            _window(rl, "primary_window", "primary")
-        )
-        weekly_percent, weekly_resets_at = _extract_window(
-            _window(rl, "secondary_window", "secondary")
-        )
+        primary_block = _window(rl, "primary_window", "primary")
+        secondary_block = _window(rl, "secondary_window", "secondary")
+        session_percent, session_resets_at = _extract_window(primary_block)
+        weekly_percent, weekly_resets_at = _extract_window(secondary_block)
     except (ValueError, TypeError) as exc:
         raise FetchError(f"Codex usage response parse error: {type(exc).__name__}") from exc
+
+    # Weekly-only mode: OpenAI may drop the session (primary) window, leaving
+    # only the weekly limit. When only one window is present, classify it by
+    # limit_window_seconds rather than slot name, so a weekly window in the
+    # primary slot is still mapped to weekly_percent.
+    if weekly_percent is None and session_percent is not None:
+        seconds = _window_seconds(primary_block)
+        if seconds is not None and seconds >= _WEEKLY_MIN_SECONDS:
+            weekly_percent, weekly_resets_at = session_percent, session_resets_at
+            session_percent, session_resets_at = None, None
+    elif session_percent is None and weekly_percent is not None:
+        seconds = _window_seconds(secondary_block)
+        if seconds is not None and seconds < _WEEKLY_MIN_SECONDS:
+            session_percent, session_resets_at = weekly_percent, weekly_resets_at
+            weekly_percent, weekly_resets_at = None, None
 
     return Reading(
         provider=Provider.CODEX,

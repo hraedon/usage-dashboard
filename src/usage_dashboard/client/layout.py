@@ -129,6 +129,9 @@ def _bars_for(
     # aggregate two; the label is the model name so the tile stays legible.
     for sl in reading.scoped_limits or []:
         windows.append((sl.name, sl.percent, sl.resets_at))
+    # Skip windows with no data (e.g. Codex weekly-only mode has no session
+    # limit; showing a grayed "N/A" bar is misleading).
+    windows = [(lbl, pct, rst) for lbl, pct, rst in windows if pct is not None]
     for label, pct, reset in windows:
         reset_text, highlight = fmt.format_countdown(reset, now=now)
         bars.append(
@@ -520,15 +523,16 @@ def tap_transition(
 
 def _detail_lines(reading: Reading, now: datetime | None) -> list[DetailLine]:
     lines: list[DetailLine] = []
-    if reading.session_percent is not None or reading.weekly_percent is not None:
+    if reading.session_percent is not None:
         s_reset, _ = fmt.format_countdown(reading.session_resets_at, now=now)
-        w_reset, _ = fmt.format_countdown(reading.weekly_resets_at, now=now)
         lines.append(
             DetailLine("Session", fmt.percent_text(reading.session_percent),
                        fmt.bar_color(reading.session_percent))
         )
         if s_reset:
             lines.append(DetailLine("  resets in", s_reset, fmt.GRAY))
+    if reading.weekly_percent is not None:
+        w_reset, _ = fmt.format_countdown(reading.weekly_resets_at, now=now)
         lines.append(
             DetailLine("Weekly", fmt.percent_text(reading.weekly_percent),
                        fmt.bar_color(reading.weekly_percent))
