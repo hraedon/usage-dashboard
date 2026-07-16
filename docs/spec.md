@@ -18,8 +18,14 @@ original providers) was delivered, then extended well past the original scope.
 for the planned pieces):
 
 - **umans** as a 4th provider — quota-less, rendered via `Reading.detail`, with
-  a `throttle` severity (none/low/rate_limited/boxed) that colours its line and
-  shows a penalty-box countdown. *(No spec/plan entry — added directly.)*
+  a `throttle` severity (none/low/low_interactivity/rate_limited/boxed) that
+  colours its line and shows a penalty-box countdown. *(No spec/plan entry —
+  added directly.)* Extended 2026-07-16: the detail line now reports
+  trailing-24h requests+tokens from `/v1/usage/history` (fallback: current
+  window), a `Reading.alert` volume cue with env-tunable thresholds
+  (`UMANS_HISTORY_HOURS`/`UMANS_TOKENS_WARN`/`UMANS_TOKENS_CRIT`), and
+  low-interactivity mode renders blue with an interactive-again countdown.
+  *(Tracked as an agent-notes work item.)*
 - **Second Claude account** (work login) — merged into the Claude tile as a
   muted second set of bars. *(No spec/plan entry.)*
 - **Dedicated Claude OAuth login** replacing the `~/.claude/.credentials.json`

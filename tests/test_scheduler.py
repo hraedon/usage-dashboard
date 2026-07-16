@@ -9,6 +9,9 @@ from usage_dashboard.server.scheduler import FetchScheduler
 from usage_dashboard.server.token_store import TokenStore
 from usage_dashboard.shared.models import (
     THROTTLE_BOXED,
+    THROTTLE_LOW,
+    THROTTLE_LOW_INTERACTIVITY,
+    THROTTLE_NONE,
     Provider,
     Reading,
     ReadingStatus,
@@ -515,6 +518,42 @@ class TestIdleLadder:
         # idle ladder applied; instead it stays pinned at the 300s floor.
         for _ in range(3):
             scheduler._fetch_one(Provider.UMANS, MagicMock(return_value=boxed))
+        assert _interval(scheduler, Provider.UMANS) == 300
+
+    def test_low_interactivity_reading_stays_at_floor(self, tmp_path):
+        # Same rationale as boxed: an idle account in low-interactivity mode
+        # moves no counters, so only the floor pin catches the mode clearing
+        # promptly.
+        db = Database(str(tmp_path / "sched.db"))
+        db.initialize()
+        scheduler = FetchScheduler(db, umans_key="key", interval_seconds=300)
+        low_interactivity = _make_reading(
+            provider=Provider.UMANS, session_percent=None, weekly_percent=None,
+            session_resets_at=datetime(2026, 1, 14, 17, 0, 0), weekly_resets_at=None,
+            detail="24h req 10 tok 1M", throttle=THROTTLE_LOW_INTERACTIVITY,
+        )
+        for _ in range(3):
+            scheduler._fetch_one(
+                Provider.UMANS, MagicMock(return_value=low_interactivity)
+            )
+        assert _interval(scheduler, Provider.UMANS) == 300
+
+    def test_throttle_change_snaps_back_to_floor(self, tmp_path):
+        # A throttle flip with otherwise-identical fields is a real state
+        # change and must reset the idle ladder.
+        db = Database(str(tmp_path / "sched.db"))
+        db.initialize()
+        scheduler = FetchScheduler(db, umans_key="key", interval_seconds=300)
+        base = dict(
+            provider=Provider.UMANS, session_percent=None, weekly_percent=None,
+            session_resets_at=None, weekly_resets_at=None, detail="24h req 10 tok 1M",
+        )
+        normal = _make_reading(**base, throttle=THROTTLE_NONE)
+        for _ in range(3):
+            scheduler._fetch_one(Provider.UMANS, MagicMock(return_value=normal))
+        assert _interval(scheduler, Provider.UMANS) > 300
+        low = _make_reading(**base, throttle=THROTTLE_LOW)
+        scheduler._fetch_one(Provider.UMANS, MagicMock(return_value=low))
         assert _interval(scheduler, Provider.UMANS) == 300
 
 

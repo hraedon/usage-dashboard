@@ -1,13 +1,19 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+import logging
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 
 import httpx
 
 from usage_dashboard.server.fetch_types import FetchError
 from usage_dashboard.shared.models import (
+    ALERT_CRIT,
+    ALERT_NONE,
+    ALERT_WARN,
     THROTTLE_BOXED,
     THROTTLE_LOW,
+    THROTTLE_LOW_INTERACTIVITY,
     THROTTLE_NONE,
     THROTTLE_RATE_LIMITED,
     Provider,
@@ -15,8 +21,27 @@ from usage_dashboard.shared.models import (
     ReadingStatus,
 )
 
+logger = logging.getLogger(__name__)
+
 _UMANS_USAGE_URL = "https://api.code.umans.ai/v1/usage"
+_UMANS_HISTORY_URL = "https://api.code.umans.ai/v1/usage/history"
 _TIMEOUT = 30.0
+
+# The trailing window the detail line reports, and the token thresholds that
+# colour it. umans' heavy-usage penalty (low-interactivity mode) keys off an
+# undisclosed trailing-day volume, so the thresholds are empirical guesses —
+# tune via UMANS_HISTORY_HOURS / UMANS_TOKENS_WARN / UMANS_TOKENS_CRIT rather
+# than editing these. Defaults match sluice's dashboard tiers (warn 250M,
+# crit 350M in+out).
+DEFAULT_HISTORY_HOURS = 24
+DEFAULT_TOKENS_WARN = 250_000_000
+DEFAULT_TOKENS_CRIT = 350_000_000
+
+
+@dataclass(frozen=True, slots=True)
+class _HistorySums:
+    requests: int
+    tokens: int  # tokens_in + tokens_out
 
 
 def _format_tokens(count: int) -> str:
@@ -35,7 +60,51 @@ def _to_naive_utc(dt: datetime) -> datetime:
     return dt.replace(tzinfo=None)
 
 
-def fetch_umans_usage(api_key: str) -> Reading:
+def _fetch_history_sums(
+    client: httpx.Client, headers: dict[str, str], hours: int
+) -> _HistorySums | None:
+    """Sum requests + tokens over the trailing *hours* from /v1/usage/history.
+
+    The endpoint returns hourly buckets ({requests, tokens_in, tokens_out});
+    the sum is a ~window approximation (partial current hour, oldest bucket
+    straddles the boundary). Telemetry, not truth path: any failure returns
+    None and the caller falls back to the current-window counters.
+    """
+    now = datetime.now(timezone.utc)
+    params = {
+        "from": (now - timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "to": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "granularity": "hour",
+    }
+    try:
+        response = client.get(_UMANS_HISTORY_URL, headers=headers, params=params)
+        response.raise_for_status()
+        buckets = response.json().get("buckets")
+        if not isinstance(buckets, list):
+            raise ValueError("history response has no buckets list")
+        requests = 0
+        tokens = 0
+        for bucket in buckets:
+            if not isinstance(bucket, dict):
+                continue
+            requests += int(bucket.get("requests") or 0)
+            tokens += int(bucket.get("tokens_in") or 0)
+            tokens += int(bucket.get("tokens_out") or 0)
+        return _HistorySums(requests=requests, tokens=tokens)
+    except (httpx.HTTPError, ValueError, TypeError) as exc:
+        logger.warning(
+            "umans usage history fetch failed (%s); falling back to window counters",
+            type(exc).__name__,
+        )
+        return None
+
+
+def fetch_umans_usage(
+    api_key: str,
+    history_hours: int = DEFAULT_HISTORY_HOURS,
+    tokens_warn: int = DEFAULT_TOKENS_WARN,
+    tokens_crit: int = DEFAULT_TOKENS_CRIT,
+) -> Reading:
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Accept": "application/json",
@@ -43,8 +112,11 @@ def fetch_umans_usage(api_key: str) -> Reading:
     try:
         with httpx.Client(timeout=_TIMEOUT) as client:
             response = client.get(_UMANS_USAGE_URL, headers=headers)
-        response.raise_for_status()
-        data = response.json()
+            response.raise_for_status()
+            data = response.json()
+            # Trailing-window totals are the actionable signal for the opaque
+            # heavy-day penalty; the per-window counters remain the fallback.
+            sums = _fetch_history_sums(client, headers, history_hours)
     except httpx.HTTPError as exc:
         raise FetchError(f"umans usage request failed: {type(exc).__name__}") from exc
 
@@ -74,6 +146,18 @@ def fetch_umans_usage(api_key: str) -> Reading:
             if boxed_until_raw is not None
             else None
         )
+        # service_mode is the heavy-day penalty (distinct from priority/boxed):
+        # {current: "low_interactivity", resets_at: ISO} while requests queue
+        # behind interactive sessions. Like boxed_until, only an unexpired
+        # resets_at counts — don't latch on a stale timestamp.
+        service_mode = usage.get("service_mode") or {}
+        service_mode = service_mode if isinstance(service_mode, dict) else {}
+        sm_resets_raw = service_mode.get("resets_at")
+        sm_resets_at = (
+            _to_naive_utc(datetime.fromisoformat(str(sm_resets_raw)))
+            if sm_resets_raw is not None
+            else None
+        )
         # Only an *unexpired* boxed_until means the account is actually boxed.
         # umans keeps returning the timestamp after the box lifts (notably after
         # a self-reactivation), so a boxed_until in the past must NOT latch us as
@@ -94,6 +178,13 @@ def fetch_umans_usage(api_key: str) -> Reading:
             # surface boxed_until as the reading's reset; the client shows a
             # live countdown.
             resets_at = boxed_until
+        elif service_mode.get("current") == "low_interactivity" and (
+            sm_resets_at is None or sm_resets_at > now
+        ):
+            throttle = THROTTLE_LOW_INTERACTIVITY
+            # interactive-again is the actionable reset; the client counts down.
+            if sm_resets_at is not None:
+                resets_at = sm_resets_at
         elif priority.get("low"):
             throttle = THROTTLE_LOW
         else:
@@ -101,7 +192,15 @@ def fetch_umans_usage(api_key: str) -> Reading:
     except (KeyError, ValueError, TypeError, AttributeError) as exc:
         raise FetchError(f"umans usage response parse error: {type(exc).__name__}") from exc
 
-    detail = f"req {requests_in_window}  tok {_format_tokens(tokens_total)}"
+    alert = ALERT_NONE
+    if sums is not None:
+        detail = f"{history_hours}h req {sums.requests}  tok {_format_tokens(sums.tokens)}"
+        if sums.tokens >= tokens_crit:
+            alert = ALERT_CRIT
+        elif sums.tokens >= tokens_warn:
+            alert = ALERT_WARN
+    else:
+        detail = f"req {requests_in_window}  tok {_format_tokens(tokens_total)}"
 
     return Reading(
         provider=Provider.UMANS,
@@ -114,4 +213,5 @@ def fetch_umans_usage(api_key: str) -> Reading:
         stale=False,
         detail=detail,
         throttle=throttle,
+        alert=alert,
     )

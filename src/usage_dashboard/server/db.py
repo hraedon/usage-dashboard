@@ -53,6 +53,10 @@ class Database:
                         self._conn.execute(
                             "ALTER TABLE readings ADD COLUMN scoped_limits TEXT"
                         )
+                    if "alert" not in cols:
+                        self._conn.execute(
+                            "ALTER TABLE readings ADD COLUMN alert TEXT NOT NULL DEFAULT 'none'"
+                        )
                     self._ensure_indexes()
                 self._conn.commit()
                 return
@@ -71,7 +75,8 @@ class Database:
                     detail TEXT,
                     models TEXT,
                     throttle TEXT NOT NULL DEFAULT 'none',
-                    scoped_limits TEXT
+                    scoped_limits TEXT,
+                    alert TEXT NOT NULL DEFAULT 'none'
                 )
                 """
             )
@@ -116,7 +121,8 @@ class Database:
                 detail TEXT,
                 models TEXT,
                 throttle TEXT NOT NULL DEFAULT 'none',
-                scoped_limits TEXT
+                scoped_limits TEXT,
+                alert TEXT NOT NULL DEFAULT 'none'
             )
             """
         )
@@ -134,6 +140,7 @@ class Database:
             "models",
             "throttle",
             "scoped_limits",
+            "alert",
         ]
         present = [c for c in all_cols if c in cols]
         select_list = ", ".join(present)
@@ -153,6 +160,8 @@ class Database:
                     values.append("none")
                 elif c == "scoped_limits":
                     values.append(None)
+                elif c == "alert":
+                    values.append("none")
             insert_list = ", ".join(all_cols)
             placeholders = ", ".join(["?"] * len(all_cols))
             self._conn.execute(
@@ -200,8 +209,8 @@ class Database:
                 """
                 INSERT INTO readings (provider, status, session_percent, session_resets_at,
                                       weekly_percent, weekly_resets_at, fetched_at, stale,
-                                      detail, models, throttle, scoped_limits)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                      detail, models, throttle, scoped_limits, alert)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     reading.provider.value,
@@ -216,6 +225,7 @@ class Database:
                     models_json,
                     reading.throttle,
                     scoped_json,
+                    reading.alert,
                 ),
             )
             self._conn.commit()
@@ -250,6 +260,7 @@ class Database:
                     if "scoped_limits" in row.keys() and row["scoped_limits"]
                     else None
                 ),
+                "alert": row["alert"] if "alert" in row.keys() else None,
             }
             reading = Reading.from_dict(data)
             result[reading.provider] = reading

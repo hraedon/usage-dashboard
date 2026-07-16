@@ -17,8 +17,12 @@ from usage_dashboard.server.fetch_types import (
 from usage_dashboard.server.fetch_umans import _format_tokens, fetch_umans_usage
 from usage_dashboard.server.fetch_zai import fetch_zai_usage
 from usage_dashboard.shared.models import (
+    ALERT_CRIT,
+    ALERT_NONE,
+    ALERT_WARN,
     THROTTLE_BOXED,
     THROTTLE_LOW,
+    THROTTLE_LOW_INTERACTIVITY,
     THROTTLE_NONE,
     THROTTLE_RATE_LIMITED,
     Provider,
@@ -876,13 +880,43 @@ def _umans_response_data():
     }
 
 
-def _mock_umans_client(mock_client_cls, data):
-    mock_response = MagicMock()
-    mock_response.json.return_value = data
-    mock_response.raise_for_status = MagicMock()
+def _umans_history_data():
+    # Hourly /v1/usage/history buckets summing to req 3000 / tok 153.0M —
+    # the trailing-window totals the detail line reports.
+    return {
+        "buckets": [
+            {"requests": 1000, "tokens_in": 50_000_000, "tokens_out": 1_000_000},
+            {"requests": 2000, "tokens_in": 100_000_000, "tokens_out": 2_000_000},
+        ]
+    }
+
+
+def _mock_umans_client(mock_client_cls, data, history_data=None, history_error=False):
+    """Mock the two umans GETs: /v1/usage (*data*) and /v1/usage/history.
+
+    *history_data* defaults to :func:`_umans_history_data`; *history_error*
+    makes only the history call fail (the fallback-to-window-counters path).
+    """
+    usage_response = MagicMock()
+    usage_response.json.return_value = data
+    usage_response.raise_for_status = MagicMock()
+    history_response = MagicMock()
+    history_response.json.return_value = (
+        history_data if history_data is not None else _umans_history_data()
+    )
+    history_response.raise_for_status = MagicMock()
+
+    def _get(url, **kwargs):
+        if url.endswith("/history"):
+            if history_error:
+                raise httpx.ConnectError("history down")
+            return history_response
+        return usage_response
+
     mock_client = MagicMock()
-    mock_client.get.return_value = mock_response
+    mock_client.get.side_effect = _get
     mock_client_cls.return_value.__enter__.return_value = mock_client
+    return mock_client
 
 
 class TestFetchUmans:
@@ -897,7 +931,7 @@ class TestFetchUmans:
         assert reading.session_percent is None
         assert reading.weekly_percent is None
         assert reading.session_resets_at == datetime(2026, 6, 13, 0, 29, 48, 490451)
-        assert reading.detail == "req 161  tok 63.9M"
+        assert reading.detail == "24h req 3000  tok 153.0M"
 
     @patch("usage_dashboard.server.fetch_umans.httpx.Client")
     def test_missing_resets_at_yields_none(self, mock_client_cls):
@@ -908,7 +942,7 @@ class TestFetchUmans:
         reading = fetch_umans_usage("test-key")
 
         assert reading.session_resets_at is None
-        assert reading.detail == "req 161  tok 63.9M"
+        assert reading.detail == "24h req 3000  tok 153.0M"
 
     @patch("usage_dashboard.server.fetch_umans.httpx.Client")
     def test_null_window_does_not_crash(self, mock_client_cls):
@@ -919,7 +953,7 @@ class TestFetchUmans:
         reading = fetch_umans_usage("test-key")
 
         assert reading.session_resets_at is None
-        assert reading.detail == "req 161  tok 63.9M"
+        assert reading.detail == "24h req 3000  tok 153.0M"
 
     @patch("usage_dashboard.server.fetch_umans.httpx.Client")
     def test_throttle_none_by_default(self, mock_client_cls):
@@ -1049,6 +1083,160 @@ class TestFetchUmans:
         reading = fetch_umans_usage("test-key")
 
         assert reading.throttle == THROTTLE_BOXED
+
+    @patch("usage_dashboard.server.fetch_umans.httpx.Client")
+    def test_history_failure_falls_back_to_window_counters(self, mock_client_cls):
+        # History is telemetry: its failure must not fail the reading, just
+        # degrade the detail to the current-window counters (old format).
+        _mock_umans_client(mock_client_cls, _umans_response_data(), history_error=True)
+
+        reading = fetch_umans_usage("test-key")
+
+        assert reading.status == ReadingStatus.CURRENT
+        assert reading.detail == "req 161  tok 63.9M"
+        assert reading.alert == ALERT_NONE
+
+    @patch("usage_dashboard.server.fetch_umans.httpx.Client")
+    def test_history_without_buckets_falls_back(self, mock_client_cls):
+        _mock_umans_client(
+            mock_client_cls, _umans_response_data(), history_data={"unexpected": True}
+        )
+
+        reading = fetch_umans_usage("test-key")
+
+        assert reading.detail == "req 161  tok 63.9M"
+
+    @patch("usage_dashboard.server.fetch_umans.httpx.Client")
+    def test_history_request_covers_trailing_window(self, mock_client_cls):
+        mock_client = _mock_umans_client(mock_client_cls, _umans_response_data())
+
+        fetch_umans_usage("test-key", history_hours=12)
+
+        history_calls = [
+            c for c in mock_client.get.call_args_list if c.args[0].endswith("/history")
+        ]
+        assert len(history_calls) == 1
+        params = history_calls[0].kwargs["params"]
+        assert params["granularity"] == "hour"
+        span = datetime.fromisoformat(
+            params["to"].replace("Z", "+00:00")
+        ) - datetime.fromisoformat(params["from"].replace("Z", "+00:00"))
+        assert span == timedelta(hours=12)
+
+    @patch("usage_dashboard.server.fetch_umans.httpx.Client")
+    def test_custom_history_hours_labels_detail(self, mock_client_cls):
+        _mock_umans_client(mock_client_cls, _umans_response_data())
+
+        reading = fetch_umans_usage("test-key", history_hours=12)
+
+        assert reading.detail == "12h req 3000  tok 153.0M"
+
+    @patch("usage_dashboard.server.fetch_umans.httpx.Client")
+    def test_alert_none_below_warn_threshold(self, mock_client_cls):
+        # Default fixture sums to 153M, below the default 250M warn tier.
+        _mock_umans_client(mock_client_cls, _umans_response_data())
+
+        reading = fetch_umans_usage("test-key")
+
+        assert reading.alert == ALERT_NONE
+
+    @patch("usage_dashboard.server.fetch_umans.httpx.Client")
+    def test_alert_warn_at_threshold(self, mock_client_cls):
+        _mock_umans_client(mock_client_cls, _umans_response_data())
+
+        reading = fetch_umans_usage("test-key", tokens_warn=153_000_000)
+
+        assert reading.alert == ALERT_WARN
+
+    @patch("usage_dashboard.server.fetch_umans.httpx.Client")
+    def test_alert_crit_wins_over_warn(self, mock_client_cls):
+        _mock_umans_client(mock_client_cls, _umans_response_data())
+
+        reading = fetch_umans_usage(
+            "test-key", tokens_warn=100_000_000, tokens_crit=153_000_000
+        )
+
+        assert reading.alert == ALERT_CRIT
+
+    @patch("usage_dashboard.server.fetch_umans.httpx.Client")
+    def test_low_interactivity_mode_sets_throttle_and_reset(self, mock_client_cls):
+        # usage.service_mode = low_interactivity (distinct from priority/boxed,
+        # observed live 2026-07-14): requests queue behind interactive sessions
+        # until resets_at, which becomes the reading's countdown target.
+        resets = datetime.now(timezone.utc) + timedelta(hours=3)
+        data = _umans_response_data()
+        data["usage"]["service_mode"] = {
+            "current": "low_interactivity",
+            "resets_at": resets.isoformat(),
+        }
+        _mock_umans_client(mock_client_cls, data)
+
+        reading = fetch_umans_usage("test-key")
+
+        assert reading.throttle == THROTTLE_LOW_INTERACTIVITY
+        assert reading.session_resets_at == resets.replace(tzinfo=None)
+
+    @patch("usage_dashboard.server.fetch_umans.httpx.Client")
+    def test_expired_low_interactivity_is_not_latched(self, mock_client_cls):
+        # Mirror the boxed_until anti-latch rule: a service_mode whose
+        # resets_at has passed must not keep reporting low-interactivity.
+        past = datetime.now(timezone.utc) - timedelta(hours=2)
+        data = _umans_response_data()
+        data["usage"]["service_mode"] = {
+            "current": "low_interactivity",
+            "resets_at": past.isoformat(),
+        }
+        _mock_umans_client(mock_client_cls, data)
+
+        reading = fetch_umans_usage("test-key")
+
+        assert reading.throttle == THROTTLE_NONE
+        assert reading.session_resets_at == datetime(2026, 6, 13, 0, 29, 48, 490451)
+
+    @patch("usage_dashboard.server.fetch_umans.httpx.Client")
+    def test_interactive_service_mode_is_not_throttled(self, mock_client_cls):
+        data = _umans_response_data()
+        data["usage"]["service_mode"] = {"current": "interactive", "resets_at": None}
+        _mock_umans_client(mock_client_cls, data)
+
+        reading = fetch_umans_usage("test-key")
+
+        assert reading.throttle == THROTTLE_NONE
+
+    @patch("usage_dashboard.server.fetch_umans.httpx.Client")
+    def test_boxed_wins_over_low_interactivity(self, mock_client_cls):
+        # Both penalties at once -> the worse state (boxed) and its reset.
+        boxed_until = datetime.now(timezone.utc) + timedelta(hours=1)
+        data = _umans_response_data()
+        data["usage"]["priority"] = {
+            "low": False,
+            "boxed_until": boxed_until.isoformat(),
+            "reason": None,
+        }
+        data["usage"]["service_mode"] = {
+            "current": "low_interactivity",
+            "resets_at": (datetime.now(timezone.utc) + timedelta(hours=9)).isoformat(),
+        }
+        _mock_umans_client(mock_client_cls, data)
+
+        reading = fetch_umans_usage("test-key")
+
+        assert reading.throttle == THROTTLE_BOXED
+        assert reading.session_resets_at == boxed_until.replace(tzinfo=None)
+
+    @patch("usage_dashboard.server.fetch_umans.httpx.Client")
+    def test_low_interactivity_wins_over_low(self, mock_client_cls):
+        data = _umans_response_data()
+        data["usage"]["priority"] = {"low": True, "boxed_until": None, "reason": None}
+        data["usage"]["service_mode"] = {
+            "current": "low_interactivity",
+            "resets_at": (datetime.now(timezone.utc) + timedelta(hours=3)).isoformat(),
+        }
+        _mock_umans_client(mock_client_cls, data)
+
+        reading = fetch_umans_usage("test-key")
+
+        assert reading.throttle == THROTTLE_LOW_INTERACTIVITY
 
     @patch("usage_dashboard.server.fetch_umans.httpx.Client")
     def test_http_error_raises_fetch_error(self, mock_client_cls):

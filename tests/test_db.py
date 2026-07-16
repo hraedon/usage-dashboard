@@ -4,6 +4,8 @@ from datetime import datetime, timedelta, timezone
 
 from usage_dashboard.server.db import Database
 from usage_dashboard.shared.models import (
+    ALERT_NONE,
+    ALERT_WARN,
     ModelUsage,
     Provider,
     Reading,
@@ -266,6 +268,50 @@ class TestModelsColumn:
         result = db.get_latest_readings()[Provider.CLAUDE]
         assert result.scoped_limits is not None
         assert result.scoped_limits[0].name == "Fable"
+
+    def test_alert_stored_and_retrieved(self, tmp_path):
+        db = Database(str(tmp_path / "test.db"))
+        db.initialize()
+        reading = _make_reading(provider=Provider.UMANS, alert=ALERT_WARN)
+        db.store_reading(reading)
+        result = db.get_latest_readings()[Provider.UMANS]
+        assert result.alert == ALERT_WARN
+
+    def test_alert_column_added_to_existing_db(self, tmp_path):
+        # A pre-alert append-only DB must gain the column on init and
+        # round-trip alerts afterwards (the live-prod upgrade path).
+        import sqlite3
+
+        path = str(tmp_path / "old.db")
+        conn = sqlite3.connect(path)
+        conn.execute(
+            """
+            CREATE TABLE readings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                provider TEXT NOT NULL, status TEXT NOT NULL,
+                session_percent REAL, session_resets_at TEXT,
+                weekly_percent REAL, weekly_resets_at TEXT,
+                fetched_at TEXT NOT NULL, stale INTEGER NOT NULL DEFAULT 0,
+                detail TEXT, models TEXT, throttle TEXT NOT NULL DEFAULT 'none',
+                scoped_limits TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO readings (provider, status, fetched_at, stale)
+            VALUES ('umans', 'current', '2026-01-14T12:00:00', 0)
+            """
+        )
+        conn.commit()
+        conn.close()
+
+        db = Database(path)
+        db.initialize()  # should ALTER TABLE ADD COLUMN alert
+        # The pre-existing row reads back with the default alert.
+        assert db.get_latest_readings()[Provider.UMANS].alert == ALERT_NONE
+        db.store_reading(_make_reading(provider=Provider.UMANS, alert=ALERT_WARN))
+        assert db.get_latest_readings()[Provider.UMANS].alert == ALERT_WARN
 
     def test_none_models_stored_and_retrieved(self, tmp_path):
         db = Database(str(tmp_path / "test.db"))

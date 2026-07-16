@@ -21,6 +21,7 @@ from usage_dashboard.server.fetch_zai import fetch_zai_usage
 from usage_dashboard.server.token_store import TokenStore
 from usage_dashboard.shared.models import (
     THROTTLE_BOXED,
+    THROTTLE_LOW_INTERACTIVITY,
     Provider,
     Reading,
     ReadingStatus,
@@ -68,6 +69,9 @@ class FetchScheduler:
         codex_client_id: str | None = None,
         codex_account_id: str | None = None,
         umans_key: str | None = None,
+        umans_history_hours: int | None = None,
+        umans_tokens_warn: int | None = None,
+        umans_tokens_crit: int | None = None,
         interval_seconds: int = 300,
         offline_threshold: int = 24,
         rate_limit_default_seconds: int = 300,
@@ -92,6 +96,16 @@ class FetchScheduler:
         self._codex_client_id = codex_client_id
         self._codex_account_id = codex_account_id
         self._umans_key = umans_key
+        # None = use the fetcher's defaults; set only what the env overrides.
+        self._umans_overrides: dict[str, int] = {
+            name: value
+            for name, value in (
+                ("history_hours", umans_history_hours),
+                ("tokens_warn", umans_tokens_warn),
+                ("tokens_crit", umans_tokens_crit),
+            )
+            if value is not None
+        }
         self._offline_threshold = offline_threshold
         self._rate_limit_default_seconds = rate_limit_default_seconds
         # The idle ladder widens the poll gap when a provider's reading is not
@@ -165,6 +179,8 @@ class FetchScheduler:
             return True
         if (prev.detail or "") != (new.detail or ""):
             return True
+        if prev.throttle != new.throttle:
+            return True
         pairs = (
             (prev.session_percent, new.session_percent),
             (prev.weekly_percent, new.weekly_percent),
@@ -185,13 +201,15 @@ class FetchScheduler:
     ) -> None:
         sched = self._schedule(provider)
         recovered = previous is None or previous.stale
-        if reading.throttle == THROTTLE_BOXED:
-            # While the account is in the penalty box the reading is unchanged
-            # poll-to-poll (boxed_until is fixed), which would let the idle
-            # ladder widen the gap to ~30m. Pin to the floor instead so the box
-            # clearing is caught on the next scan and the metrics return promptly.
+        if reading.throttle in (THROTTLE_BOXED, THROTTLE_LOW_INTERACTIVITY):
+            # While the account is in the penalty box (or low-interactivity
+            # mode) the reading can be unchanged poll-to-poll (the reset time
+            # is fixed and an idle account moves no counters), which would let
+            # the idle ladder widen the gap to ~30m. Pin to the floor instead
+            # so the state clearing is caught on the next scan and the normal
+            # display returns promptly.
             new_interval = self._poll_floor
-            reason = "boxed"
+            reason = reading.throttle
         elif recovered or self._reading_changed(previous, reading):  # type: ignore[arg-type]
             new_interval = self._poll_floor
             reason = "recovered" if recovered else "changed"
@@ -250,7 +268,10 @@ class FetchScheduler:
             )
         if self._umans_key is not None:
             tasks.append(
-                (Provider.UMANS, partial(fetch_umans_usage, self._umans_key))
+                (
+                    Provider.UMANS,
+                    partial(fetch_umans_usage, self._umans_key, **self._umans_overrides),
+                )
             )
         return tasks
 

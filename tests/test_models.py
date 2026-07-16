@@ -3,6 +3,8 @@ from __future__ import annotations
 from datetime import datetime
 
 from usage_dashboard.shared.models import (
+    ALERT_NONE,
+    ALERT_WARN,
     ModelUsage,
     Provider,
     Reading,
@@ -165,6 +167,25 @@ def test_reading_from_dict_tolerates_missing_detail_key():
     del data["detail"]
     reading = Reading.from_dict(data)
     assert reading.detail is None
+
+
+def test_reading_alert_defaults_to_none_level():
+    assert _make_reading().alert == ALERT_NONE
+
+
+def test_reading_alert_round_trip():
+    reading = _make_reading(provider=Provider.UMANS, alert=ALERT_WARN)
+    restored = Reading.from_dict(reading.to_dict())
+    assert restored.alert == ALERT_WARN
+    assert restored == reading
+
+
+def test_reading_from_dict_tolerates_missing_alert_key():
+    # Older server rows / API payloads predate the alert field.
+    data = _make_reading().to_dict()
+    del data["alert"]
+    reading = Reading.from_dict(data)
+    assert reading.alert == ALERT_NONE
 
 
 def test_model_usage_round_trip():
