@@ -12,8 +12,11 @@ from usage_dashboard.client.layout import (
     tap_transition,
 )
 from usage_dashboard.shared.models import (
+    ALERT_CRIT,
+    ALERT_WARN,
     THROTTLE_BOXED,
     THROTTLE_LOW,
+    THROTTLE_LOW_INTERACTIVITY,
     THROTTLE_RATE_LIMITED,
     ModelUsage,
     Provider,
@@ -260,6 +263,56 @@ class TestMainLayout:
         layout = build_main_layout(readings, _SIZE, now=_NOW)
         assert layout.footer_color == fmt.ORANGE
         assert layout.footer_note == "UMANS rate-limited 4h 30m"
+
+    def test_footer_blue_countdown_when_low_interactivity(self) -> None:
+        # Heavy-day queueing: blue (matching umans' own banner) with an h/m
+        # countdown to interactive-again in the metrics' spot.
+        readings = _all_four()
+        readings[-1] = _reading(
+            Provider.UMANS, session_percent=None, weekly_percent=None,
+            session_resets_at=_NOW + timedelta(hours=2, minutes=14),
+            weekly_resets_at=None, detail="24h req 5 tok 1M",
+            throttle=THROTTLE_LOW_INTERACTIVITY,
+        )
+        layout = build_main_layout(readings, _SIZE, now=_NOW)
+        assert layout.footer_color == fmt.BLUE
+        assert layout.footer_note == "UMANS low-interactivity 2h 14m"
+        assert "req" not in layout.footer_note
+
+    def test_footer_alert_warn_colors_metrics_orange(self) -> None:
+        readings = _all_four()
+        readings[-1] = _reading(
+            Provider.UMANS, session_percent=None, weekly_percent=None,
+            session_resets_at=None, weekly_resets_at=None,
+            detail="24h req 5 tok 260M", alert=ALERT_WARN,
+        )
+        layout = build_main_layout(readings, _SIZE, now=_NOW)
+        # Alert colours the line but keeps the metrics visible.
+        assert layout.footer_note == "UMANS 24h req 5 tok 260M"
+        assert layout.footer_color == fmt.ORANGE
+
+    def test_footer_alert_crit_colors_metrics_red(self) -> None:
+        readings = _all_four()
+        readings[-1] = _reading(
+            Provider.UMANS, session_percent=None, weekly_percent=None,
+            session_resets_at=None, weekly_resets_at=None,
+            detail="24h req 5 tok 400M", alert=ALERT_CRIT,
+        )
+        layout = build_main_layout(readings, _SIZE, now=_NOW)
+        assert layout.footer_color == fmt.RED
+
+    def test_footer_throttle_outranks_alert(self) -> None:
+        # A throttle state is the provider's own signal; the advisory volume
+        # alert must not repaint it.
+        readings = _all_four()
+        readings[-1] = _reading(
+            Provider.UMANS, session_percent=None, weekly_percent=None,
+            session_resets_at=_NOW + timedelta(hours=3),
+            weekly_resets_at=None, detail="24h req 5 tok 400M",
+            throttle=THROTTLE_LOW_INTERACTIVITY, alert=ALERT_CRIT,
+        )
+        layout = build_main_layout(readings, _SIZE, now=_NOW)
+        assert layout.footer_color == fmt.BLUE
 
     def test_footer_boxed_shows_countdown_not_metrics(self) -> None:
         readings = _all_four()

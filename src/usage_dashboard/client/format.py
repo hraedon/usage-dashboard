@@ -18,6 +18,9 @@ GREEN = (0x22, 0xC5, 0x5E)
 ORANGE = (0xF9, 0x73, 0x16)
 RED = (0xEF, 0x44, 0x44)
 YELLOW = (0xEA, 0xB3, 0x08)
+# Indigo matching umans' own low-interactivity banner, so the footer reads as
+# the same signal the provider's UI shows.
+BLUE = (0x81, 0x8C, 0xF8)
 BAR_BG = (50, 50, 50)
 
 _THREE_DAYS_SECONDS = 3 * 24 * 3600

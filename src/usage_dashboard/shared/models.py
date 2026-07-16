@@ -35,17 +35,31 @@ class ReadingStatus(Enum):
 
 # Throttle severity for quota-less providers (umans), which have no percentage
 # to colour by. "low" = deprioritised routing (e.g. exceeded the concurrency
-# threshold); "rate_limited" = a limit hit set boxed_until with
-# priority.reason="rate_limited" — the account KEEPS SERVING at low priority
-# for the window (proven live 2026-07-03, sluice
+# threshold); "low_interactivity" = umans' service_mode penalty for a heavy
+# trailing day — requests queue behind interactive sessions until
+# service_mode.resets_at (a distinct, softer state than the priority/boxed
+# ladder; observed live 2026-07-14, sluice
+# samples/service-mode-capture-2026-07-14.md); "rate_limited" = a limit hit set
+# boxed_until with priority.reason="rate_limited" — the account KEEPS SERVING
+# at low priority for the window (proven live 2026-07-03, sluice
 # docs/wi-024-429-capture-2026-07-03.md); "boxed" = penalty box, the account
 # is locked for the window. Worse states win, so a provider that is both low
 # and boxed reports "boxed"; an unexpired boxed_until without the known-soft
 # rate_limited reason is always "boxed" (fail safe).
 THROTTLE_NONE = "none"
 THROTTLE_LOW = "low"
+THROTTLE_LOW_INTERACTIVITY = "low_interactivity"
 THROTTLE_RATE_LIMITED = "rate_limited"
 THROTTLE_BOXED = "boxed"
+
+# Volume alert for quota-less providers: how close the trailing-window token
+# total is to the (opaque, empirically-guessed) heavy-usage threshold that
+# triggers low-interactivity mode. Computed server-side from configurable
+# thresholds (UMANS_TOKENS_WARN/UMANS_TOKENS_CRIT) so the display isn't locked
+# into today's guesses. Advisory only — throttle states always outrank it.
+ALERT_NONE = "none"
+ALERT_WARN = "warn"
+ALERT_CRIT = "crit"
 
 
 @dataclass(frozen=True, slots=True)
@@ -149,6 +163,9 @@ class Reading:
     # Throttle severity (THROTTLE_NONE/LOW/BOXED). Quota-less providers use this
     # as their only severity signal, since they have no percentage to colour by.
     throttle: str = THROTTLE_NONE
+    # Volume alert (ALERT_NONE/WARN/CRIT): trailing-window token total vs the
+    # configured heavy-usage thresholds. Advisory colour cue; throttle wins.
+    alert: str = ALERT_NONE
     # Extra per-model usage windows (Claude ``limits[]`` weekly_scoped entries,
     # e.g. Fable). Rendered as additional bars; None/absent for providers that
     # don't report scoped limits.
@@ -167,6 +184,7 @@ class Reading:
             "detail": self.detail,
             "models": [m.to_dict() for m in self.models] if self.models else None,
             "throttle": self.throttle,
+            "alert": self.alert,
             "scoped_limits": (
                 [s.to_dict() for s in self.scoped_limits] if self.scoped_limits else None
             ),
@@ -190,6 +208,7 @@ class Reading:
                 else None
             ),
             throttle=data.get("throttle", THROTTLE_NONE) or THROTTLE_NONE,
+            alert=data.get("alert", ALERT_NONE) or ALERT_NONE,
             scoped_limits=(
                 [ScopedLimit.from_dict(s) for s in data["scoped_limits"]]
                 if data.get("scoped_limits")

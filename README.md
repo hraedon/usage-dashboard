@@ -1,6 +1,6 @@
 # usage-dashboard
 
-A two-component system for monitoring AI usage across [Claude](https://claude.ai), [z.ai](https://z.ai), [Ollama](https://ollama.com), and [umans](https://umans.ai). A server fetches usage data from all configured providers, normalizes it into a unified format, stores in SQLite, and serves it via an authenticated API. A client polls the server and renders usage as color-coded progress bars — a fullscreen touch GUI for a **Raspberry Pi 4B + Touch Display 2** (with optional scheduled backlight-sleep + tap-to-wake, and a tap-the-status-line overlay for unit diagnostics + brightness). umans (whose plan has no percentage quotas) renders as a single text line of requests and tokens, color-coded if the account is throttled. The server also serves a mobile-friendly HTML view at `/dashboard`.
+A two-component system for monitoring AI usage across [Claude](https://claude.ai), [z.ai](https://z.ai), [Ollama](https://ollama.com), and [umans](https://umans.ai). A server fetches usage data from all configured providers, normalizes it into a unified format, stores in SQLite, and serves it via an authenticated API. A client polls the server and renders usage as color-coded progress bars — a fullscreen touch GUI for a **Raspberry Pi 4B + Touch Display 2** (with optional scheduled backlight-sleep + tap-to-wake, and a tap-the-status-line overlay for unit diagnostics + brightness). umans (whose plan has no percentage quotas) renders as a single text line of requests and tokens over the trailing 24h, color-coded if the account is throttled or the token volume nears the heavy-usage threshold. The server also serves a mobile-friendly HTML view at `/dashboard`.
 
 ## Architecture
 
@@ -55,27 +55,42 @@ SQLite storage.
   "stale": false,
   "detail": null,
   "models": null,
-  "throttle": "none"
+  "throttle": "none",
+  "alert": "none"
 }
 ```
 
 Status values: `current` | `stale` | `offline`
 
 `detail` is an optional pre-formatted text line for providers that don't fit
-the percentage model; umans uses it (e.g. `"req 161  tok 63.9M"`).
+the percentage model; umans uses it for its trailing-window totals summed from
+`/v1/usage/history` (e.g. `"24h req 4382  tok 156.3M"`). If the history fetch
+fails, it degrades to the current 5h-window counters (`"req 161  tok 63.9M"` —
+the missing window prefix marks the fallback).
 
 `models` is an optional per-model breakdown (Ollama's weekly segments, z.ai's
 tool calls), sorted by share — the clients show the top two on the tile title
 and the top several in the detail view.
 
 `throttle` is a severity signal for quota-less providers (umans): `none`,
-`low` (deprioritised — over the concurrency threshold), `rate_limited` (a
+`low` (deprioritised — over the concurrency threshold), `low_interactivity`
+(umans' heavy-day penalty via `usage.service_mode` — requests queue behind
+interactive sessions until `service_mode.resets_at`), `rate_limited` (a
 limit hit set `boxed_until` with `priority.reason = "rate_limited"` — the
 account keeps serving at low priority for the window), or `boxed` (penalty
 box, account locked for the window; any unexpired `boxed_until` *without* the
 known-soft `rate_limited` reason). The clients colour the umans line
-yellow/orange/red accordingly, and on `rate_limited`/`boxed` replace its
-metrics with a countdown to when the window clears.
+yellow/blue/orange/red accordingly, and on `low_interactivity`/
+`rate_limited`/`boxed` replace its metrics with a countdown to when the
+state clears (blue matches umans' own low-interactivity banner).
+
+`alert` is an advisory volume cue (`none`/`warn`/`crit`) for how close the
+umans trailing-window token total is to the (opaque) heavy-usage threshold
+that triggers low-interactivity mode; when the account isn't throttled the
+clients colour the metrics orange (`warn`) or red (`crit`). All three knobs
+are server env vars so the guesses stay tunable: `UMANS_HISTORY_HOURS`
+(default 24), `UMANS_TOKENS_WARN` (default 250000000), `UMANS_TOKENS_CRIT`
+(default 350000000).
 
 ## Clients
 

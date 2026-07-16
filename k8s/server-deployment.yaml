@@ -112,6 +112,15 @@ spec:
                   optional: true
             - name: FETCH_INTERVAL
               value: "300"
+            # Optional umans trailing-window knobs (defaults: 24h window,
+            # warn at 250M / crit at 350M tokens in+out). The heavy-usage
+            # threshold is opaque on umans' side — tune here, not in code.
+            # - name: UMANS_HISTORY_HOURS
+            #   value: "24"
+            # - name: UMANS_TOKENS_WARN
+            #   value: "250000000"
+            # - name: UMANS_TOKENS_CRIT
+            #   value: "350000000"
             - name: PORT
               value: "8080"
             - name: SCHEDULES_DIR
