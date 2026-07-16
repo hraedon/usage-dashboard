@@ -14,8 +14,11 @@ from datetime import datetime
 
 from usage_dashboard.client import format as fmt
 from usage_dashboard.shared.models import (
+    ALERT_CRIT,
+    ALERT_WARN,
     THROTTLE_BOXED,
     THROTTLE_LOW,
+    THROTTLE_LOW_INTERACTIVITY,
     THROTTLE_RATE_LIMITED,
     ModelUsage,
     Provider,
@@ -249,7 +252,9 @@ def build_main_layout(
     if umans is not None:
         # umans has no quota to colour by; throttle severity is its signal.
         # boxed (account locked) = red, rate_limited (deprioritized window,
-        # still serving) = orange, low priority = yellow, else default.
+        # still serving) = orange, low-interactivity (heavy-day queueing) =
+        # blue matching umans' own banner, low priority = yellow, else the
+        # token-volume alert (crit red / warn orange) or default.
         if umans.throttle == THROTTLE_BOXED:
             # Replace the (now-moot) req/tok metrics with a countdown to when
             # the penalty box clears.
@@ -262,11 +267,23 @@ def build_main_layout(
             text, _ = fmt.format_countdown(umans.session_resets_at, now)
             footer_note = f"UMANS rate-limited {text}".strip()
             footer_color = fmt.ORANGE
+        elif umans.throttle == THROTTLE_LOW_INTERACTIVITY:
+            # Heavy-day queueing: interactive-again is the actionable signal,
+            # so the countdown takes the metrics' spot.
+            text, _ = fmt.format_countdown(umans.session_resets_at, now)
+            footer_note = f"UMANS low-interactivity {text}".strip()
+            footer_color = fmt.BLUE
         elif umans.throttle == THROTTLE_LOW:
             footer_note = f"UMANS {umans.detail}".strip() if umans.detail else "UMANS"
             footer_color = fmt.YELLOW
         else:
             footer_note = f"UMANS {umans.detail}".strip() if umans.detail else "UMANS"
+            # Unthrottled: the trailing-window token volume is the early
+            # warning for the (opaque) heavy-usage penalty.
+            if umans.alert == ALERT_CRIT:
+                footer_color = fmt.RED
+            elif umans.alert == ALERT_WARN:
+                footer_color = fmt.ORANGE
 
     margin = max(4, round(width * 0.02))
     # A slim status band leaves more height for the tiles (the Claude tile in
