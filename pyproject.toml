@@ -15,7 +15,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=8.3",
-    "ruff>=0.7",
+    "ruff>=0.16",
     "mypy>=1.13",
 ]
 # Touch GUI client for the Pi 4B + 5" display. Not pulled by the server image.
