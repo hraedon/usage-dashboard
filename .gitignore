@@ -25,3 +25,6 @@ OPEN_BREADCRUMBS.txt
 
 # never commit the local denylist (identifier gate)
 .identifiers-denylist.local
+
+# local samples may contain work-domain identifiers — never commit
+samples/

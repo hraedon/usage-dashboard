@@ -1,12 +1,38 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import threading
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from usage_dashboard.shared.models import Provider, Reading
+
+logger = logging.getLogger(__name__)
+
+
+def _reading_dict_from_row(row: sqlite3.Row) -> dict[str, Any]:
+    """Map a ``readings`` table row to the dict shape Reading.from_dict takes."""
+    return {
+        "provider": row["provider"],
+        "status": row["status"],
+        "session_percent": row["session_percent"],
+        "session_resets_at": row["session_resets_at"],
+        "weekly_percent": row["weekly_percent"],
+        "weekly_resets_at": row["weekly_resets_at"],
+        "fetched_at": row["fetched_at"],
+        "stale": bool(row["stale"]),
+        "detail": row["detail"],
+        "models": json.loads(row["models"]) if row["models"] else None,
+        "throttle": row["throttle"],
+        "scoped_limits": (
+            json.loads(row["scoped_limits"])
+            if "scoped_limits" in row.keys() and row["scoped_limits"]
+            else None
+        ),
+        "alert": row["alert"] if "alert" in row.keys() else None,
+    }
 
 
 class Database:
@@ -243,27 +269,41 @@ class Database:
 
         result: dict[Provider, Reading] = {}
         for row in rows:
-            data: dict[str, Any] = {
-                "provider": row["provider"],
-                "status": row["status"],
-                "session_percent": row["session_percent"],
-                "session_resets_at": row["session_resets_at"],
-                "weekly_percent": row["weekly_percent"],
-                "weekly_resets_at": row["weekly_resets_at"],
-                "fetched_at": row["fetched_at"],
-                "stale": bool(row["stale"]),
-                "detail": row["detail"],
-                "models": json.loads(row["models"]) if row["models"] else None,
-                "throttle": row["throttle"],
-                "scoped_limits": (
-                    json.loads(row["scoped_limits"])
-                    if "scoped_limits" in row.keys() and row["scoped_limits"]
-                    else None
-                ),
-                "alert": row["alert"] if "alert" in row.keys() else None,
-            }
-            reading = Reading.from_dict(data)
+            reading = Reading.from_dict(_reading_dict_from_row(row))
             result[reading.provider] = reading
+        return result
+
+    def get_readings_since(self, provider: Provider, since: datetime) -> list[Reading]:
+        """Readings for *provider* with ``fetched_at >= since``, oldest first.
+
+        ``fetched_at`` values are naive-UTC ISO strings, so the ISO cutoff
+        compares correctly as text (same pattern as prune_old_readings).
+        Corrupt rows are skipped with a warning rather than poisoning the
+        whole range.
+        """
+        cutoff = since.isoformat()
+        with self._lock:
+            cursor = self._conn.execute(
+                """
+                SELECT * FROM readings
+                WHERE provider = ? AND fetched_at >= ?
+                ORDER BY fetched_at ASC
+                """,
+                (provider.value, cutoff),
+            )
+            rows = cursor.fetchall()
+
+        result: list[Reading] = []
+        for row in rows:
+            try:
+                result.append(Reading.from_dict(_reading_dict_from_row(row)))
+            except (ValueError, TypeError, KeyError) as exc:
+                logger.warning(
+                    "skipping corrupt readings row id=%s: %s: %s",
+                    row["id"] if "id" in row.keys() else "?",
+                    type(exc).__name__,
+                    exc,
+                )
         return result
 
     def get_consecutive_failures(self, provider: Provider) -> int:

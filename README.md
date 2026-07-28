@@ -37,6 +37,7 @@ SQLite storage.
 | Endpoint | Auth | Description |
 |----------|------|-------------|
 | `GET /readings` | Bearer token | Returns latest reading per provider as JSON |
+| `GET /history` | Bearer token | Returns stored readings for one provider over a trailing window (`?provider=<name>&hours=<1..168>`, default 24), oldest first |
 | `GET /schedule` | Bearer token | Returns the backlight sleep-schedule spec for the requesting unit (`?unit=<UNIT_ID>`, falling back to the `default` entry), or `null`. See *Backlight sleep schedule* |
 | `GET /dashboard` | None | Mobile-friendly HTML view of the same readings (intended for private networks; exposes usage stats only, never credentials) |
 | `GET /health` | None | Health check |

@@ -43,10 +43,12 @@ for the planned pieces):
 **Reading schema** now also carries `detail`, `models`, and `throttle` (the §6
 schema shows only the original fields).
 
-**Not built:** history/trends (Phase 2). Storage is **append-only** — the
-`readings` table has an autoincrement `id` and each fetch appends a row; a
-prune job honors `RETENTION_DAYS` (default 7). The data model no longer
-precludes historical analysis. Trends UI is still Phase 2. The
+**History API:** `GET /history?provider=<name>&hours=<1..168>` (bearer auth,
+same as `/readings`) returns stored readings for one provider over a
+trailing window, oldest first — built for switchboard/operator trend
+queries. Storage is **append-only** — the `readings` table has an
+autoincrement `id` and each fetch appends a row; a prune job honors
+`RETENTION_DAYS` (default 7). A trends UI is still Phase 2. The
 `login claude` browser flow is also currently broken
 (agent-notes WI-013); the workaround is a manual login elsewhere.
 

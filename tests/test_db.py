@@ -455,3 +455,68 @@ class TestSchemaMigration:
         db.store_reading(reading)
         result = db.get_latest_readings()
         assert result[Provider.CLAUDE] == reading
+
+
+class TestGetReadingsSince:
+    def test_returns_readings_in_window_oldest_first(self, tmp_path):
+        db = Database(str(tmp_path / "test.db"))
+        db.initialize()
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        old = _make_reading(session_percent=30.0, fetched_at=now - timedelta(hours=3))
+        mid = _make_reading(session_percent=50.0, fetched_at=now - timedelta(hours=2))
+        new = _make_reading(session_percent=70.0, fetched_at=now - timedelta(hours=1))
+        # Store out of order to prove the query sorts.
+        db.store_reading(new)
+        db.store_reading(old)
+        db.store_reading(mid)
+
+        result = db.get_readings_since(Provider.CLAUDE, now - timedelta(hours=4))
+        assert [r.session_percent for r in result] == [30.0, 50.0, 70.0]
+
+    def test_excludes_readings_before_cutoff(self, tmp_path):
+        db = Database(str(tmp_path / "test.db"))
+        db.initialize()
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        db.store_reading(_make_reading(fetched_at=now - timedelta(hours=48)))
+        db.store_reading(_make_reading(fetched_at=now - timedelta(hours=1)))
+
+        result = db.get_readings_since(Provider.CLAUDE, now - timedelta(hours=24))
+        assert len(result) == 1
+        assert result[0].fetched_at > now - timedelta(hours=2)
+
+    def test_excludes_other_providers(self, tmp_path):
+        db = Database(str(tmp_path / "test.db"))
+        db.initialize()
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        db.store_reading(_make_reading(fetched_at=now - timedelta(hours=1)))
+        db.store_reading(
+            _make_reading(provider=Provider.UMANS, fetched_at=now - timedelta(hours=1))
+        )
+
+        result = db.get_readings_since(Provider.CLAUDE, now - timedelta(hours=24))
+        assert len(result) == 1
+        assert result[0].provider == Provider.CLAUDE
+
+    def test_empty_result(self, tmp_path):
+        db = Database(str(tmp_path / "test.db"))
+        db.initialize()
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        assert db.get_readings_since(Provider.CLAUDE, now - timedelta(hours=24)) == []
+
+    def test_corrupt_rows_are_skipped(self, tmp_path):
+        db = Database(str(tmp_path / "test.db"))
+        db.initialize()
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        db.store_reading(_make_reading(session_percent=50.0, fetched_at=now - timedelta(hours=1)))
+        with db._lock:
+            db._conn.execute(
+                "INSERT INTO readings"
+                " (provider, status, fetched_at, stale, models, throttle, alert)"
+                " VALUES ('claude', 'current', ?, 0, '{not-json', 'none', 'none')",
+                ((now - timedelta(minutes=30)).isoformat(),),
+            )
+            db._conn.commit()
+
+        result = db.get_readings_since(Provider.CLAUDE, now - timedelta(hours=24))
+        assert len(result) == 1
+        assert result[0].session_percent == 50.0

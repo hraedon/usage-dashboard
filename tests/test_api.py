@@ -389,3 +389,121 @@ class TestDashboardEndpoint:
             assert API_KEY not in response.text
 
         asyncio.run(_test())
+
+
+class TestHistoryEndpoint:
+    def _store_recent(self, db, **overrides):
+        from datetime import datetime, timedelta, timezone
+
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        overrides.setdefault("fetched_at", now - timedelta(hours=1))
+        reading = _make_reading(**overrides)
+        db.store_reading(reading)
+        return reading
+
+    def test_history_with_valid_api_key_returns_200(self, tmp_path):
+        app, db = _create_app_with_db(tmp_path)
+        self._store_recent(db)
+
+        async def _test():
+            async with _client(app) as client:
+                response = await client.get(
+                    "/history?provider=claude",
+                    headers={"Authorization": f"Bearer {API_KEY}"},
+                )
+            assert response.status_code == 200
+            data = response.json()
+            assert data["provider"] == "claude"
+            assert data["hours"] == 24.0
+            assert len(data["readings"]) == 1
+            assert data["readings"][0]["provider"] == "claude"
+
+        asyncio.run(_test())
+
+    def test_history_oldest_first(self, tmp_path):
+        from datetime import datetime, timedelta, timezone
+
+        app, db = _create_app_with_db(tmp_path)
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        self._store_recent(db, session_percent=70.0, fetched_at=now - timedelta(hours=1))
+        self._store_recent(db, session_percent=30.0, fetched_at=now - timedelta(hours=3))
+
+        async def _test():
+            async with _client(app) as client:
+                response = await client.get(
+                    "/history?provider=claude&hours=24",
+                    headers={"Authorization": f"Bearer {API_KEY}"},
+                )
+            data = response.json()
+            assert [r["session_percent"] for r in data["readings"]] == [30.0, 70.0]
+
+        asyncio.run(_test())
+
+    def test_history_without_auth_returns_401(self, tmp_path):
+        app, _ = _create_app_with_db(tmp_path)
+
+        async def _test():
+            async with _client(app) as client:
+                response = await client.get("/history?provider=claude")
+            assert response.status_code == 401
+
+        asyncio.run(_test())
+
+    def test_history_unknown_provider_returns_400(self, tmp_path):
+        app, _ = _create_app_with_db(tmp_path)
+
+        async def _test():
+            async with _client(app) as client:
+                response = await client.get(
+                    "/history?provider=nosuch",
+                    headers={"Authorization": f"Bearer {API_KEY}"},
+                )
+            assert response.status_code == 400
+
+        asyncio.run(_test())
+
+    def test_history_missing_provider_returns_422(self, tmp_path):
+        app, _ = _create_app_with_db(tmp_path)
+
+        async def _test():
+            async with _client(app) as client:
+                response = await client.get(
+                    "/history",
+                    headers={"Authorization": f"Bearer {API_KEY}"},
+                )
+            assert response.status_code == 422
+
+        asyncio.run(_test())
+
+    def test_history_hours_out_of_range_returns_400(self, tmp_path):
+        app, _ = _create_app_with_db(tmp_path)
+
+        async def _test():
+            async with _client(app) as client:
+                for bad in ("0", "-5", "10000"):
+                    response = await client.get(
+                        f"/history?provider=claude&hours={bad}",
+                        headers={"Authorization": f"Bearer {API_KEY}"},
+                    )
+                    assert response.status_code == 400, bad
+
+        asyncio.run(_test())
+
+    def test_history_excludes_readings_outside_window(self, tmp_path):
+        from datetime import datetime, timedelta, timezone
+
+        app, db = _create_app_with_db(tmp_path)
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        self._store_recent(db, fetched_at=now - timedelta(hours=1))
+        self._store_recent(db, fetched_at=now - timedelta(hours=72))
+
+        async def _test():
+            async with _client(app) as client:
+                response = await client.get(
+                    "/history?provider=claude&hours=24",
+                    headers={"Authorization": f"Bearer {API_KEY}"},
+                )
+            data = response.json()
+            assert len(data["readings"]) == 1
+
+        asyncio.run(_test())

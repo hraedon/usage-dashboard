@@ -3,7 +3,7 @@ from __future__ import annotations
 import hmac
 import html
 from collections.abc import Callable, Iterable
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException
@@ -20,6 +20,11 @@ from usage_dashboard.shared.models import (
 )
 
 _bearer_scheme = HTTPBearer(auto_error=False)
+
+# Upper bound for /history windows — matches the default 7-day retention
+# (RETENTION_DAYS). Larger windows are accepted up to this cap; rows older
+# than retention simply won't exist.
+_MAX_HISTORY_HOURS = 24 * 7
 
 # Same thresholds as the Pi client's bar_color (client/format.py)
 _CSS_GREEN = "#22c55e"
@@ -204,6 +209,36 @@ def create_app(
         _user: str = Depends(auth),
     ) -> list[dict[str, Any]]:
         return [reading.to_dict() for reading in _reported_readings()]
+
+    @app.get("/history")
+    async def get_history(
+        provider: str,
+        hours: float = 24.0,
+        _user: str = Depends(auth),
+    ) -> dict[str, Any]:
+        # Stored readings for one provider over a trailing window, oldest
+        # first — for switchboard/operator trend queries. Authenticated like
+        # /readings (unlike /dashboard, which is deliberately open).
+        try:
+            prov = Provider(provider)
+        except ValueError:
+            valid = ", ".join(sorted(p.value for p in Provider))
+            raise HTTPException(
+                status_code=400,
+                detail=f"unknown provider {provider!r} (valid: {valid})",
+            ) from None
+        if not 0 < hours <= _MAX_HISTORY_HOURS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"hours must be in (0, {_MAX_HISTORY_HOURS}]",
+            )
+        since = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=hours)
+        readings = db.get_readings_since(prov, since)
+        return {
+            "provider": prov.value,
+            "hours": hours,
+            "readings": [r.to_dict() for r in readings],
+        }
 
     @app.get("/")
     async def root() -> RedirectResponse:
