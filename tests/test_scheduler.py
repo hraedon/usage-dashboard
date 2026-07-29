@@ -252,6 +252,18 @@ class TestClaudeWorkAccount:
         assert stored[Provider.CLAUDE_WORK].session_percent == 12.0
         assert Provider.CLAUDE not in stored  # personal untouched
 
+    def test_work_fetch_task_passes_claude_work_provider(self, tmp_path):
+        db = Database(str(tmp_path / "sched.db"))
+        db.initialize()
+        scheduler = FetchScheduler(db, claude_work_token="work")
+        tasks = scheduler._get_fetch_tasks()
+        assert len(tasks) == 1
+        provider, fetch_fn = tasks[0]
+        assert provider is Provider.CLAUDE_WORK
+        # The partial should bind Provider.CLAUDE_WORK as the provider arg
+        # (second positional after the token).
+        assert fetch_fn.args == ("work", Provider.CLAUDE_WORK)
+
     def test_work_refresh_persists_under_claude_work_key(self, tmp_path):
         from unittest.mock import patch
 

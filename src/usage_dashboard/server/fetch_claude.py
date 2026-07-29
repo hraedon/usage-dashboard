@@ -126,7 +126,9 @@ def refresh_claude_token(
         ) from exc
 
 
-def fetch_claude_usage(access_token: str) -> Reading:
+def fetch_claude_usage(
+    access_token: str, provider: Provider = Provider.CLAUDE
+) -> Reading:
     headers = {
         "Authorization": f"Bearer {access_token}",
         "anthropic-beta": "oauth-2025-04-20",
@@ -177,7 +179,7 @@ def fetch_claude_usage(access_token: str) -> Reading:
     scoped_limits = _extract_scoped_limits(data.get("limits"))
 
     return Reading(
-        provider=Provider.CLAUDE,
+        provider=provider,
         status=ReadingStatus.CURRENT,
         session_percent=session_percent,
         session_resets_at=session_resets_at,

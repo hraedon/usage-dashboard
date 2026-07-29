@@ -245,7 +245,10 @@ class FetchScheduler:
             )
         if self._claude_work_token is not None:
             tasks.append(
-                (Provider.CLAUDE_WORK, partial(fetch_claude_usage, self._claude_work_token))
+                (
+                    Provider.CLAUDE_WORK,
+                    partial(fetch_claude_usage, self._claude_work_token, Provider.CLAUDE_WORK),
+                )
             )
         if self._zai_key is not None:
             tasks.append(
@@ -387,7 +390,7 @@ class FetchScheduler:
         success (reading stored, schedule advanced), False to fall through to
         the normal failure path."""
         try:
-            reading = fetch_claude_usage(token or "")
+            reading = fetch_claude_usage(token or "", provider)
         except FetchError:
             return False
         self._db.store_reading(reading)

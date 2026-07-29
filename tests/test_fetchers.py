@@ -193,6 +193,20 @@ class TestFetchClaude:
         assert reading.stale is False
 
     @patch("usage_dashboard.server.fetch_claude.httpx.Client")
+    def test_fetch_claude_usage_accepts_claude_work_provider(self, mock_client_cls):
+        mock_response = MagicMock()
+        mock_response.json.return_value = _claude_response_data()
+        mock_response.raise_for_status = MagicMock()
+        mock_client = MagicMock()
+        mock_client.get.return_value = mock_response
+        mock_client.__enter__ = MagicMock(return_value=mock_client)
+        mock_client.__exit__ = MagicMock(return_value=False)
+        mock_client_cls.return_value = mock_client
+
+        reading = fetch_claude_usage("test-token", Provider.CLAUDE_WORK)
+        assert reading.provider is Provider.CLAUDE_WORK
+
+    @patch("usage_dashboard.server.fetch_claude.httpx.Client")
     def test_fetch_claude_extracts_fable_scoped_limit(self, mock_client_cls):
         mock_response = MagicMock()
         mock_response.json.return_value = _claude_response_data()
