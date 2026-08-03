@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import httpx
 
@@ -24,6 +24,11 @@ _ZAI_USAGE_URL = "https://api.z.ai/api/monitor/usage/quota/limit"
 # window). Discovered from the subscription page's own bundle 2026-08-03:
 # params are startTime/endTime in "YYYY-MM-DD HH:MM:SS" plus granularity.
 _ZAI_MODEL_USAGE_URL = "https://api.z.ai/api/monitor/usage/model-usage"
+# The model-usage endpoint speaks UTC+8 wall clock (probed live 2026-08-03).
+_ZAI_API_UTC_OFFSET = timedelta(hours=8)
+# Length of the weekly quota window, used to derive its start from the reported
+# next reset time.
+_WEEKLY_WINDOW = timedelta(days=7)
 _TIMEOUT = 30.0
 
 # Observed live response (2026-06-12): the payload is wrapped in a
@@ -62,6 +67,11 @@ def _format_tokens(count: int) -> str:
     return str(count)
 
 
+def _to_api_clock(moment: datetime) -> str:
+    """Format a naive-UTC *moment* on the model-usage endpoint's own clock."""
+    return (moment + _ZAI_API_UTC_OFFSET).strftime("%Y-%m-%d %H:%M:%S")
+
+
 def _from_epoch_ms(value: object) -> datetime | None:
     if value is None:
         return None
@@ -76,18 +86,33 @@ def _fetch_weekly_sums(
     start: datetime,
     end: datetime,
 ) -> _WindowSums | None:
-    """Sum requests + tokens over [start, end] via /api/monitor/usage/model-usage.
+    """Requests + tokens over [start, end] via /api/monitor/usage/model-usage.
 
-    The endpoint returns one bucket per day (or per hour with
-    ``granularity=hour``); summing ``tokensUsage`` / ``modelCallCount`` over the
-    range gives the weekly-window totals. Follows the retired umans history
-    pattern (a second GET whose failure degrades the reading rather than
-    failing it): any error returns None and the token line is omitted — the
-    percentage bars remain the truth path.
+    *start* and *end* are naive UTC; they are converted to UTC+8 for the wire.
+    Live probe 2026-08-03: the endpoint's clock is UTC+8 — an ``endTime`` of
+    05:44 UTC came back with a last bucket labelled 13:00 — and it clamps
+    ``endTime`` to its own "now" (sending now+9h changed nothing). Sending
+    naive UTC therefore shifts the window boundary 8h earlier than intended.
+
+    Totals come from ``data.totalUsage`` rather than summing the per-bucket
+    arrays: the same probe showed ``granularity=day`` is **ignored** (the
+    response came back ``hourly``), so bucket semantics are not something to
+    depend on. The arrays are summed only as a fallback; both agreed exactly
+    when checked. Follows the retired umans history pattern (a second GET
+    whose failure degrades the reading rather than failing it): any error
+    returns None and the token line is omitted — the percentage bars remain
+    the truth path.
     """
+    if start >= end:
+        logger.warning(
+            "z.ai model-usage window is empty or inverted (%s -> %s); skipping",
+            start,
+            end,
+        )
+        return None
     params = {
-        "startTime": start.strftime("%Y-%m-%d %H:%M:%S"),
-        "endTime": end.strftime("%Y-%m-%d %H:%M:%S"),
+        "startTime": _to_api_clock(start),
+        "endTime": _to_api_clock(end),
         "granularity": "day",
     }
     try:
@@ -95,6 +120,12 @@ def _fetch_weekly_sums(
         response.raise_for_status()
         payload = response.json()
         data = payload["data"] if isinstance(payload.get("data"), dict) else payload
+        totals = data.get("totalUsage")
+        if isinstance(totals, dict) and "totalTokensUsage" in totals:
+            return _WindowSums(
+                requests=int(totals.get("totalModelCallCount") or 0),
+                tokens=int(totals["totalTokensUsage"] or 0),
+            )
         tokens_raw = data["tokensUsage"]
         calls_raw = data["modelCallCount"]
         if not isinstance(tokens_raw, list) or not isinstance(calls_raw, list):
@@ -179,10 +210,16 @@ def fetch_zai_usage(
             # quota window (weekly_resets_at -> now); telemetry, so a failure
             # leaves detail None rather than failing the reading.
             if weekly_resets_at is not None:
+                # nextResetTime is when the weekly quota NEXT resets — a future
+                # instant — so the window that is currently accruing STARTED one
+                # window-length before it. Passing the reset time itself as the
+                # start inverts the range: probed live, that returns HTTP 200
+                # with tokensUsage=None, which the guard below turns into "no
+                # line at all", so the feature silently never worked.
                 sums = _fetch_weekly_sums(
                     client,
                     headers,
-                    weekly_resets_at,
+                    weekly_resets_at - _WEEKLY_WINDOW,
                     datetime.now(timezone.utc).replace(tzinfo=None),
                 )
     except httpx.HTTPStatusError as exc:

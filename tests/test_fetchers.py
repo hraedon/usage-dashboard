@@ -692,7 +692,19 @@ class TestFetchZaiWeeklyTokens:
 
     @patch("usage_dashboard.server.fetch_zai.httpx.Client")
     def test_model_usage_request_covers_weekly_window(self, mock_client_cls):
-        mock_client = _mock_zai_client(mock_client_cls, _zai_response_data())
+        # nextResetTime is always in the FUTURE in production, so the fixture
+        # must be future-dated too: the first cut of this test used a stale
+        # 2026-06 timestamp, which made an inverted (start > end) range look
+        # like a valid one and hid the bug that the window started at the
+        # reset instant rather than one window before it.
+        reset = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(days=2)
+        data = _zai_response_data()
+        weekly = [
+            e for e in data["data"]["limits"]
+            if e["type"] == "TOKENS_LIMIT" and e["unit"] == 6
+        ][0]
+        weekly["nextResetTime"] = int(reset.timestamp() * 1000)
+        mock_client = _mock_zai_client(mock_client_cls, data)
 
         fetch_zai_usage("test-key")
 
@@ -702,10 +714,56 @@ class TestFetchZaiWeeklyTokens:
         assert len(model_calls) == 1
         params = model_calls[0].kwargs["params"]
         assert params["granularity"] == "day"
-        weekly_reset = datetime.fromtimestamp(
-            1781663372979 / 1000, tz=timezone.utc
-        ).replace(tzinfo=None)
-        assert params["startTime"] == weekly_reset.strftime("%Y-%m-%d %H:%M:%S")
+        # The window that is currently accruing began one week before the next
+        # reset, expressed on the endpoint's UTC+8 clock.
+        expected_start = reset - timedelta(days=7) + timedelta(hours=8)
+        assert params["startTime"] == expected_start.strftime("%Y-%m-%d %H:%M:%S")
+        assert params["startTime"] < params["endTime"], "window must not be inverted"
+
+    @patch("usage_dashboard.server.fetch_zai.httpx.Client")
+    def test_model_usage_window_is_never_inverted(self, mock_client_cls):
+        # Guard the actual production failure: a future reset time used as the
+        # window start returns HTTP 200 with tokensUsage=None, so the line just
+        # never appeared. Assert we never issue such a request.
+        reset = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(days=6)
+        data = _zai_response_data()
+        weekly = [
+            e for e in data["data"]["limits"]
+            if e["type"] == "TOKENS_LIMIT" and e["unit"] == 6
+        ][0]
+        weekly["nextResetTime"] = int(reset.timestamp() * 1000)
+        mock_client = _mock_zai_client(mock_client_cls, data)
+
+        reading = fetch_zai_usage("test-key")
+
+        params = [
+            c for c in mock_client.get.call_args_list
+            if c.args[0].endswith("/model-usage")
+        ][0].kwargs["params"]
+        assert params["startTime"] < params["endTime"]
+        assert reading.detail is not None, "the weekly token line must be present"
+
+    @patch("usage_dashboard.server.fetch_zai.httpx.Client")
+    def test_model_usage_prefers_the_api_totals(self, mock_client_cls):
+        # granularity=day is ignored by the endpoint (it answers hourly), so the
+        # API's own totalUsage is the trustworthy figure, not the bucket arrays.
+        _mock_zai_client(
+            mock_client_cls,
+            _zai_response_data(),
+            model_data={
+                "granularity": "hourly",
+                "tokensUsage": [1, 1],
+                "modelCallCount": [1, 1],
+                "totalUsage": {
+                    "totalTokensUsage": 283_816_766,
+                    "totalModelCallCount": 2273,
+                },
+            },
+        )
+
+        reading = fetch_zai_usage("test-key")
+
+        assert reading.detail == "week req 2273  tok 283.8M"
 
     @patch("usage_dashboard.server.fetch_zai.httpx.Client")
     def test_model_usage_failure_omits_token_line(self, mock_client_cls):
