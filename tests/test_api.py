@@ -7,7 +7,7 @@ import httpx
 
 from usage_dashboard.server.api import create_app
 from usage_dashboard.server.db import Database
-from usage_dashboard.shared.models import Provider, Reading, ReadingStatus
+from usage_dashboard.shared.models import ALERT_CRIT, ALERT_WARN, Provider, Reading, ReadingStatus
 
 API_KEY = "test-secret-key"
 
@@ -229,6 +229,44 @@ class TestDashboardEndpoint:
             async with _client(app) as client:
                 response = await client.get("/dashboard")
             assert "req 161  tok 63.9M" in response.text
+
+        asyncio.run(_test())
+
+    def test_dashboard_shows_zai_weekly_token_line(self, tmp_path):
+        # z.ai's weekly-window token total renders under the percentage bars,
+        # coloured by the volume alert (warn = orange).
+        app, db = _create_app_with_db(tmp_path)
+        db.store_reading(
+            _make_reading(
+                provider=Provider.ZAI,
+                detail="week req 2273  tok 284.0M",
+                alert=ALERT_WARN,
+            )
+        )
+
+        async def _test():
+            async with _client(app) as client:
+                response = await client.get("/dashboard")
+            assert "week req 2273  tok 284.0M" in response.text
+            assert 'color:#f97316' in response.text  # warn orange
+
+        asyncio.run(_test())
+
+    def test_dashboard_zai_alert_crit_colors_detail_red(self, tmp_path):
+        app, db = _create_app_with_db(tmp_path)
+        db.store_reading(
+            _make_reading(
+                provider=Provider.ZAI,
+                detail="week req 2273  tok 290.0M",
+                alert=ALERT_CRIT,
+            )
+        )
+
+        async def _test():
+            async with _client(app) as client:
+                response = await client.get("/dashboard")
+            assert "week req 2273  tok 290.0M" in response.text
+            assert 'color:#ef4444' in response.text  # crit red
 
         asyncio.run(_test())
 

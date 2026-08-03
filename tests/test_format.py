@@ -10,6 +10,7 @@ from usage_dashboard.client.format import (
     RED,
     bar_color,
     format_countdown,
+    format_duration,
     format_interval,
     mute,
     percent_text,
@@ -69,6 +70,19 @@ class TestFormatCountdown:
         text, hl = format_countdown(target, now=self._NOW)
         assert text == "2d 3h"
         assert hl is True
+
+    def test_format_duration_minutes(self) -> None:
+        assert format_duration(45) == "1m"
+        assert format_duration(0) == "1m"
+        assert format_duration(-10) == "1m"
+        assert format_duration(3600) == "1h 0m"
+
+    def test_format_duration_hours_minutes(self) -> None:
+        # 12240 s = 3 h 24 m.
+        assert format_duration(12240) == "3h 24m"
+
+    def test_format_duration_days_hours(self) -> None:
+        assert format_duration(2 * 86400 + 3600) == "2d 1h"
 
     def test_beyond_three_days_not_highlighted(self) -> None:
         target = self._NOW + timedelta(days=5)

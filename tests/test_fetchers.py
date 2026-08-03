@@ -14,8 +14,11 @@ from usage_dashboard.server.fetch_types import (
     FetchError,
     FetchRateLimitError,
 )
-from usage_dashboard.server.fetch_zai import fetch_zai_usage
+from usage_dashboard.server.fetch_zai import _format_tokens, fetch_zai_usage
 from usage_dashboard.shared.models import (
+    ALERT_CRIT,
+    ALERT_NONE,
+    ALERT_WARN,
     Provider,
     ReadingStatus,
 )
@@ -627,6 +630,187 @@ class TestFetchZai:
 
         reading = fetch_zai_usage("test-key")
         assert reading.models is None
+
+
+def _zai_model_usage_data():
+    # Daily model-usage buckets (tokensUsage / modelCallCount) summing to
+    # req 2273 / tok 284.0M — the shape of the live /model-usage response
+    # observed 2026-08-03.
+    return {
+        "code": 200,
+        "data": {
+            "tokensUsage": [100_000_000, 50_000_000, 134_000_000],
+            "modelCallCount": [1000, 1000, 273],
+        },
+    }
+
+
+def _mock_zai_client(mock_client_cls, data, model_data=None, model_error=False):
+    """Mock the two z.ai GETs: /quota/limit (*data*) and /model-usage.
+
+    *model_data* defaults to :func:`_zai_model_usage_data`; *model_error*
+    makes only the model-usage call fail (the omit-token-line path). Mirror of
+    the retired umans history mock.
+    """
+    usage_response = MagicMock()
+    usage_response.json.return_value = data
+    usage_response.raise_for_status = MagicMock()
+    model_response = MagicMock()
+    model_response.json.return_value = (
+        model_data if model_data is not None else _zai_model_usage_data()
+    )
+    model_response.raise_for_status = MagicMock()
+
+    def _get(url, **kwargs):
+        if url.endswith("/model-usage"):
+            if model_error:
+                raise httpx.ConnectError("model-usage down")
+            return model_response
+        return usage_response
+
+    mock_client = MagicMock()
+    mock_client.get.side_effect = _get
+    mock_client_cls.return_value.__enter__.return_value = mock_client
+    return mock_client
+
+
+class TestFetchZaiWeeklyTokens:
+    # Weekly-window token tracking (following the retired umans history
+    # pattern): a second GET to /model-usage sums the current weekly quota
+    # window and the reading's detail + alert carry the result.
+
+    @patch("usage_dashboard.server.fetch_zai.httpx.Client")
+    def test_weekly_token_line_from_model_usage(self, mock_client_cls):
+        _mock_zai_client(mock_client_cls, _zai_response_data())
+
+        reading = fetch_zai_usage("test-key")
+
+        assert reading.status == ReadingStatus.CURRENT
+        assert reading.detail == "week req 2273  tok 284.0M"
+        # 284.0M >= the default 240M warn tier.
+        assert reading.alert == ALERT_WARN
+
+    @patch("usage_dashboard.server.fetch_zai.httpx.Client")
+    def test_model_usage_request_covers_weekly_window(self, mock_client_cls):
+        # nextResetTime is always in the FUTURE in production, so the fixture
+        # must be future-dated too: the first cut of this test used a stale
+        # 2026-06 timestamp, which made an inverted (start > end) range look
+        # like a valid one and hid the bug that the window started at the
+        # reset instant rather than one window before it.
+        reset = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(days=2)
+        data = _zai_response_data()
+        weekly = [
+            e for e in data["data"]["limits"]
+            if e["type"] == "TOKENS_LIMIT" and e["unit"] == 6
+        ][0]
+        weekly["nextResetTime"] = int(reset.timestamp() * 1000)
+        mock_client = _mock_zai_client(mock_client_cls, data)
+
+        fetch_zai_usage("test-key")
+
+        model_calls = [
+            c for c in mock_client.get.call_args_list if c.args[0].endswith("/model-usage")
+        ]
+        assert len(model_calls) == 1
+        params = model_calls[0].kwargs["params"]
+        assert params["granularity"] == "day"
+        # The window that is currently accruing began one week before the next
+        # reset, expressed on the endpoint's UTC+8 clock.
+        expected_start = reset - timedelta(days=7) + timedelta(hours=8)
+        assert params["startTime"] == expected_start.strftime("%Y-%m-%d %H:%M:%S")
+        assert params["startTime"] < params["endTime"], "window must not be inverted"
+
+    @patch("usage_dashboard.server.fetch_zai.httpx.Client")
+    def test_model_usage_window_is_never_inverted(self, mock_client_cls):
+        # Guard the actual production failure: a future reset time used as the
+        # window start returns HTTP 200 with tokensUsage=None, so the line just
+        # never appeared. Assert we never issue such a request.
+        reset = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(days=6)
+        data = _zai_response_data()
+        weekly = [
+            e for e in data["data"]["limits"]
+            if e["type"] == "TOKENS_LIMIT" and e["unit"] == 6
+        ][0]
+        weekly["nextResetTime"] = int(reset.timestamp() * 1000)
+        mock_client = _mock_zai_client(mock_client_cls, data)
+
+        reading = fetch_zai_usage("test-key")
+
+        params = [
+            c for c in mock_client.get.call_args_list
+            if c.args[0].endswith("/model-usage")
+        ][0].kwargs["params"]
+        assert params["startTime"] < params["endTime"]
+        assert reading.detail is not None, "the weekly token line must be present"
+
+    @patch("usage_dashboard.server.fetch_zai.httpx.Client")
+    def test_model_usage_prefers_the_api_totals(self, mock_client_cls):
+        # granularity=day is ignored by the endpoint (it answers hourly), so the
+        # API's own totalUsage is the trustworthy figure, not the bucket arrays.
+        _mock_zai_client(
+            mock_client_cls,
+            _zai_response_data(),
+            model_data={
+                "granularity": "hourly",
+                "tokensUsage": [1, 1],
+                "modelCallCount": [1, 1],
+                "totalUsage": {
+                    "totalTokensUsage": 283_816_766,
+                    "totalModelCallCount": 2273,
+                },
+            },
+        )
+
+        reading = fetch_zai_usage("test-key")
+
+        assert reading.detail == "week req 2273  tok 283.8M"
+
+    @patch("usage_dashboard.server.fetch_zai.httpx.Client")
+    def test_model_usage_failure_omits_token_line(self, mock_client_cls):
+        # History is telemetry: its failure must not fail the reading — the
+        # token line is omitted and the percentage bars remain.
+        _mock_zai_client(mock_client_cls, _zai_response_data(), model_error=True)
+
+        reading = fetch_zai_usage("test-key")
+
+        assert reading.status == ReadingStatus.CURRENT
+        assert reading.detail is None
+        assert reading.alert == ALERT_NONE
+
+    @patch("usage_dashboard.server.fetch_zai.httpx.Client")
+    def test_model_usage_without_lists_falls_back(self, mock_client_cls):
+        _mock_zai_client(
+            mock_client_cls, _zai_response_data(), model_data={"unexpected": True}
+        )
+
+        reading = fetch_zai_usage("test-key")
+
+        assert reading.detail is None
+        assert reading.alert == ALERT_NONE
+
+    @patch("usage_dashboard.server.fetch_zai.httpx.Client")
+    def test_weekly_alert_none_below_warn_threshold(self, mock_client_cls):
+        _mock_zai_client(mock_client_cls, _zai_response_data())
+
+        reading = fetch_zai_usage("test-key", tokens_warn=999_000_000)
+
+        assert reading.alert == ALERT_NONE
+
+    @patch("usage_dashboard.server.fetch_zai.httpx.Client")
+    def test_weekly_alert_crit_wins_over_warn(self, mock_client_cls):
+        _mock_zai_client(mock_client_cls, _zai_response_data())
+
+        reading = fetch_zai_usage(
+            "test-key", tokens_warn=100_000_000, tokens_crit=284_000_000
+        )
+
+        assert reading.alert == ALERT_CRIT
+
+    def test_format_tokens_scales(self):
+        assert _format_tokens(284_000_000) == "284.0M"
+        assert _format_tokens(1_500_000_000) == "1.5B"
+        assert _format_tokens(42_000) == "42.0k"
+        assert _format_tokens(999) == "999"
 
 
 class TestFetchOllama:

@@ -18,7 +18,7 @@ from usage_dashboard.shared.models import (
     Provider,
     Reading,
 )
-from usage_dashboard.shared.offpeak import qwen_is_offpeak, zai_is_peak
+from usage_dashboard.shared.offpeak import qwen_peak_countdown, zai_is_peak, zai_peak_countdown
 
 # Fixed tile order so a provider always lands in the same place frame to frame.
 # CLAUDE_WORK is intentionally absent: it has no tile of its own — it folds into
@@ -240,12 +240,16 @@ def build_main_layout(
         elif provider in by_provider:
             tile_plan.append((provider, by_provider[provider]))
 
-    # Display-only QWEN tag for the status-bar footer: no data source, just
-    # whether we're inside the Qwen token plan's off-peak window (22:00–08:00
-    # UTC+8), when credits consume much less. Replaces the retired umans slot.
-    qwen_offpeak = qwen_is_offpeak(now)
-    footer_note = "QWEN off-peak" if qwen_offpeak else "QWEN peak"
-    footer_color = fmt.GREEN if qwen_offpeak else fmt.ORANGE
+    # Peak-window countdown for the status-bar footer (QWEN token plan): how
+    # long until the next boundary — peak start when currently off-peak, peak
+    # end when in peak. Replaces the retired umans slot.
+    qwen = qwen_peak_countdown(now)
+    footer_note = (
+        f"QWEN peak in {fmt.format_duration(qwen.seconds_to_boundary)}"
+        if not qwen.in_peak
+        else f"QWEN ends in {fmt.format_duration(qwen.seconds_to_boundary)}"
+    )
+    footer_color = fmt.GREEN if not qwen.in_peak else fmt.ORANGE
 
     margin = max(4, round(width * 0.02))
     # A slim status band leaves more height for the tiles (the Claude tile in
@@ -295,10 +299,20 @@ def build_main_layout(
                 detail = reading.detail if is_quotaless else None
             # Provider name + status; model breakdown goes in the subtitle,
             # but only on full-width tiles — the narrow paired tile is too
-            # tight for a model breakdown next to the title.
+            # tight for a model breakdown next to the title. The z.ai tile's
+            # subtitle slot carries the peak-window countdown instead ("peak
+            # in 3h 24m" / "ends in 1h 24m") so the burn-price hint in the
+            # title colour gets a "when" attached.
             title = provider.value.upper() + fmt.status_suffix(reading)
             if provider is Provider.OLLAMA and not is_paired:
                 subtitle = _model_subtitle(reading.models)
+            elif provider is Provider.ZAI:
+                zai_peak = zai_peak_countdown(now)
+                subtitle = (
+                    f"peak in {fmt.format_duration(zai_peak.seconds_to_boundary)}"
+                    if not zai_peak.in_peak
+                    else f"ends in {fmt.format_duration(zai_peak.seconds_to_boundary)}"
+                )
             else:
                 subtitle = ""
             # z.ai's plan burns quota at a discount off-peak (peak = Mon–Fri

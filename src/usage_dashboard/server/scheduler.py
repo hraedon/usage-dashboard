@@ -62,6 +62,8 @@ class FetchScheduler:
         claude_work_refresh_token: str | None = None,
         claude_work_client_id: str | None = None,
         zai_key: str | None = None,
+        zai_tokens_warn: int | None = None,
+        zai_tokens_crit: int | None = None,
         ollama_cookie: str | None = None,
         codex_token: str | None = None,
         codex_refresh_token: str | None = None,
@@ -85,6 +87,15 @@ class FetchScheduler:
         self._claude_work_client_id = claude_work_client_id
         self._token_store = token_store
         self._zai_key = zai_key
+        # None = use the fetcher's defaults; set only what the env overrides.
+        self._zai_overrides: dict[str, int] = {
+            name: value
+            for name, value in (
+                ("tokens_warn", zai_tokens_warn),
+                ("tokens_crit", zai_tokens_crit),
+            )
+            if value is not None
+        }
         self._ollama_cookie = ollama_cookie
         self._codex_token = codex_token
         self._codex_refresh_token = codex_refresh_token
@@ -236,7 +247,7 @@ class FetchScheduler:
             )
         if self._zai_key is not None:
             tasks.append(
-                (Provider.ZAI, partial(fetch_zai_usage, self._zai_key))
+                (Provider.ZAI, partial(fetch_zai_usage, self._zai_key, **self._zai_overrides))
             )
         if self._ollama_cookie is not None:
             tasks.append(

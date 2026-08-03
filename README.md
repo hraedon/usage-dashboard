@@ -63,9 +63,9 @@ SQLite storage.
 
 Status values: `current` | `stale` | `offline`
 
-`detail` is an optional pre-formatted text line for providers that don't fit
-the percentage model (no quota-less provider is currently configured, so it is
-`null` today).
+`detail` is an optional pre-formatted text line shown under the percentage
+bars (z.ai's weekly-window token total, e.g. `week req 2,273  tok 284.0M`) or
+as the whole tile body for quota-less providers.
 
 `models` is an optional per-model breakdown (Ollama's weekly segments, z.ai's
 tool calls), sorted by share — the clients show the top two on the tile title
@@ -77,9 +77,15 @@ requests queue behind interactive sessions), `rate_limited` (a limit hit that
 keeps the account serving at low priority for the window), or `boxed` (penalty
 box, account locked for the window; any unexpired `boxed_until` *without* the
 known-soft `rate_limited` reason). `alert` is an advisory volume cue
-(`none`/`warn`/`crit`) for how close a quota-less provider's trailing-window
-token total is to the heavy-usage threshold. No configured provider currently
-produces either, so they stay `none`.
+(`none`/`warn`/`crit`) for how close a provider's window token total is to the
+heavy-usage threshold (z.ai's weekly window, tuned via `ZAI_WEEK_TOKENS_WARN` /
+`ZAI_WEEK_TOKENS_CRIT`); it colours the detail line orange/red. No quota-less
+provider is currently configured, so `throttle` stays `none`.
+
+Peak-window hints: the z.ai tile title tint (green off-peak / orange peak) is
+joined by a countdown in the tile's name bar (`peak in 3h 24m` while off-peak,
+`ends in 1h 24m` in peak), and the QWEN footer tag carries the same countdown
+for the Qwen token plan's window.
 
 ## Clients
 
