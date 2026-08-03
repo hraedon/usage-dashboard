@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from functools import partial
 from unittest.mock import MagicMock
 
 from usage_dashboard.server.db import Database
@@ -174,6 +175,27 @@ class TestFetchSchedulerNoProviders:
         tasks = scheduler._get_fetch_tasks()
         assert len(tasks) == 1
         assert tasks[0][0] is Provider.ZAI
+
+    def test_zai_threshold_overrides_flow_into_fetcher_task(self, tmp_path):
+        # Env knobs (ZAI_WEEK_TOKENS_WARN/CRIT) must reach the fetcher as
+        # partial kwargs; unset knobs are omitted so the fetcher defaults hold.
+        db = Database(str(tmp_path / "sched.db"))
+        db.initialize()
+        scheduler = FetchScheduler(db, zai_key="key", zai_tokens_warn=111, zai_tokens_crit=222)
+        tasks = scheduler._get_fetch_tasks()
+        zai_task = next(t for p, t in tasks if p is Provider.ZAI)
+        assert isinstance(zai_task, partial)
+        assert zai_task.args == ("key",)
+        assert zai_task.keywords == {"tokens_warn": 111, "tokens_crit": 222}
+
+    def test_zai_threshold_unset_keeps_defaults(self, tmp_path):
+        db = Database(str(tmp_path / "sched.db"))
+        db.initialize()
+        scheduler = FetchScheduler(db, zai_key="key")
+        tasks = scheduler._get_fetch_tasks()
+        zai_task = next(t for p, t in tasks if p is Provider.ZAI)
+        assert isinstance(zai_task, partial)
+        assert zai_task.keywords == {}
 
     def test_ollama_not_registered_without_cookie(self, tmp_path):
         db = Database(str(tmp_path / "sched.db"))

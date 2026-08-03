@@ -25,6 +25,11 @@ for the planned pieces):
   provider is no longer in use. `Reading.throttle`/`Reading.alert` remain in
   the schema for any future quota-less provider, and its status-bar slot is now
   a display-only off-peak tag for the Qwen token plan.
+- **z.ai weekly-window token tracking** — follows the retired umans pattern: a
+  second GET to `/model-usage` sums the current weekly quota window and the
+  reading's `detail` carries `week req N  tok X`, coloured by `alert`
+  (`ZAI_WEEK_TOKENS_WARN`/`CRIT`, defaults ~80%/95% of the Pro cap). The tile
+  name bar / QWEN footer now also count down to the next peak boundary.
 - **Second Claude account** (work login) — merged into the Claude tile as a
   muted second set of bars. *(No spec/plan entry.)*
 - **Dedicated Claude OAuth login** replacing the `~/.claude/.credentials.json`

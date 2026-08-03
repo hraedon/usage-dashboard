@@ -73,6 +73,12 @@ def _resolve_ollama_cookie(
     return persisted or env_cookie
 
 
+def _optional_int_env(name: str) -> int | None:
+    """Parse an optional integer env var; unset/empty means None (use defaults)."""
+    value = os.environ.get(name)
+    return int(value) if value else None
+
+
 def main() -> None:
     logging.basicConfig(
         level=logging.INFO,
@@ -94,6 +100,12 @@ def main() -> None:
     claude_work_refresh_token = os.environ.get("CLAUDE_WORK_REFRESH_TOKEN") or None
     claude_work_client_id = os.environ.get("CLAUDE_WORK_CLIENT_ID") or None
     zai_api_key = os.environ.get("ZAI_API_KEY") or None
+    # z.ai weekly-token thresholds (unset = the fetcher's defaults): the token
+    # totals that colour the weekly-window line warn/crit. The weekly cap is
+    # plan-dependent and empirically known, so these stay tunable without a
+    # code change (defaults ≈ 80% / 95% of the Pro cap).
+    zai_tokens_warn = _optional_int_env("ZAI_WEEK_TOKENS_WARN")
+    zai_tokens_crit = _optional_int_env("ZAI_WEEK_TOKENS_CRIT")
     ollama_cookie = os.environ.get("OLLAMA_COOKIE") or None
     # Optional OpenAI Codex (ChatGPT-plan) account, via a dedicated OAuth login.
     codex_token = os.environ.get("CODEX_TOKEN") or None
@@ -140,6 +152,8 @@ def main() -> None:
         claude_work_refresh_token=claude_work_refresh_token,
         claude_work_client_id=claude_work_client_id,
         zai_key=zai_api_key,
+        zai_tokens_warn=zai_tokens_warn,
+        zai_tokens_crit=zai_tokens_crit,
         ollama_cookie=ollama_cookie,
         codex_token=codex_token,
         codex_refresh_token=codex_refresh_token,

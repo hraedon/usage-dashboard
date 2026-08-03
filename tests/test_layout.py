@@ -216,18 +216,21 @@ class TestMainLayout:
         assert "Session" not in labels
         assert "Weekly" in labels
 
-    def test_footer_shows_qwen_offpeak_when_window_open(self) -> None:
+    def test_footer_shows_qwen_peak_countdown_when_in_peak(self) -> None:
         # _NOW = 2026-01-10 12:00 UTC = Sat 20:00 UTC+8 -> inside Qwen's peak
-        # (22:00–08:00 is the off-peak window), so the tag reads "peak".
+        # window (off-peak is 22:00–08:00 UTC+8), which ends at 22:00 UTC+8
+        # (= 14:00 UTC): "ends in 2h 0m".
         layout = build_main_layout(_all_configured(), _SIZE, now=_NOW)
-        assert layout.footer_note == "QWEN peak"
+        assert layout.footer_note == "QWEN ends in 2h 0m"
         assert layout.footer_color == fmt.ORANGE
 
-    def test_footer_shows_qwen_offpeak_when_window_closed(self) -> None:
-        # 2026-01-10 16:00 UTC = Sat 00:00 UTC+8 -> inside the off-peak window.
+    def test_footer_shows_qwen_peak_countdown_when_offpeak(self) -> None:
+        # 2026-01-10 16:00 UTC = Sat 00:00 UTC+8 -> inside the off-peak
+        # window; peak begins 08:00 UTC+8 (= 00:00 UTC next day): "peak in
+        # 8h 0m".
         offpeak = datetime(2026, 1, 10, 16, 0, 0, tzinfo=timezone.utc)
         layout = build_main_layout(_all_configured(), _SIZE, now=offpeak)
-        assert layout.footer_note == "QWEN off-peak"
+        assert layout.footer_note == "QWEN peak in 8h 0m"
         assert layout.footer_color == fmt.GREEN
 
     def test_zai_title_green_offpeak(self) -> None:
@@ -242,6 +245,21 @@ class TestMainLayout:
         layout = build_main_layout(_all_configured(), _SIZE, now=monday_peak)
         by = {t.provider: t for t in layout.tiles}
         assert by[Provider.ZAI].title_color == fmt.ORANGE
+
+    def test_zai_subtitle_counts_down_to_peak_start_when_offpeak(self) -> None:
+        # Sat 2026-01-10 (weekend, off-peak): next peak begins Mon 14:00 UTC+8
+        # (= Mon 06:00 UTC) -> 1d 18h from _NOW.
+        layout = build_main_layout(_all_configured(), _SIZE, now=_NOW)
+        by = {t.provider: t for t in layout.tiles}
+        assert by[Provider.ZAI].subtitle == "peak in 1d 18h"
+
+    def test_zai_subtitle_counts_down_to_peak_end_when_in_peak(self) -> None:
+        # Mon 2026-01-12 07:00 UTC = 15:00 UTC+8 (in peak); the window closes
+        # at 18:00 UTC+8 (= 10:00 UTC): "ends in 3h 0m".
+        monday_peak = datetime(2026, 1, 12, 7, 0, 0, tzinfo=timezone.utc)
+        layout = build_main_layout(_all_configured(), _SIZE, now=monday_peak)
+        by = {t.provider: t for t in layout.tiles}
+        assert by[Provider.ZAI].subtitle == "ends in 3h 0m"
 
     def test_other_tiles_keep_white_title(self) -> None:
         layout = build_main_layout(_all_configured(), _SIZE, now=_NOW)

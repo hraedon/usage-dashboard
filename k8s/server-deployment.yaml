@@ -74,6 +74,13 @@ spec:
                   name: server-secrets
                   key: zai-api-key
                   optional: true
+            # z.ai weekly-window token thresholds that colour the token line
+            # (warn/orange, crit/red). Unset = fetcher defaults (~80% / ~95%
+            # of the Pro weekly cap); set these if your plan tier differs.
+            # - name: ZAI_WEEK_TOKENS_WARN
+            #   value: "240000000"
+            # - name: ZAI_WEEK_TOKENS_CRIT
+            #   value: "285000000"
             - name: OLLAMA_COOKIE
               valueFrom:
                 secretKeyRef:

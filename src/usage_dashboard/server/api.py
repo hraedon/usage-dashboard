@@ -18,12 +18,14 @@ from usage_dashboard.server.db import Database
 from usage_dashboard.server.schedule_config import ScheduleConfig
 from usage_dashboard.server.scheduler import FetchScheduler
 from usage_dashboard.shared.models import (
+    ALERT_CRIT,
+    ALERT_WARN,
     Provider,
     Reading,
     ReadingStatus,
     make_offline_reading,
 )
-from usage_dashboard.shared.offpeak import qwen_is_offpeak, zai_is_offpeak
+from usage_dashboard.shared.offpeak import qwen_peak_countdown, zai_is_offpeak
 
 _bearer_scheme = HTTPBearer(auto_error=False)
 
@@ -54,6 +56,15 @@ def _bar_color_css(percent: float | None) -> str:
     return _CSS_GREEN
 
 
+def _alert_color_css(alert: str) -> str:
+    """Alert severity -> detail-line colour (warn/orange, crit/red)."""
+    if alert == ALERT_CRIT:
+        return _CSS_RED
+    if alert == ALERT_WARN:
+        return _CSS_ORANGE
+    return _CSS_GRAY
+
+
 def _countdown_text(resets_at: datetime | None, now: datetime) -> str:
     if resets_at is None:
         return ""
@@ -66,6 +77,19 @@ def _countdown_text(resets_at: datetime | None, now: datetime) -> str:
     if days > 0:
         return f"resets {days}d {hours}h"
     return f"resets {hours}h {minutes}m"
+
+
+def _countdown_short(total_seconds: float) -> str:
+    """Abbreviated countdown for window boundaries: 204 -> '3h 24m'."""
+    seconds = max(0, int(total_seconds))
+    days = seconds // 86400
+    hours = (seconds % 86400) // 3600
+    minutes = (seconds % 3600) // 60
+    if days > 0:
+        return f"{days}d {hours}h"
+    if hours > 0:
+        return f"{hours}h {minutes}m"
+    return f"{max(1, minutes)}m"
 
 
 def _status_badge(reading: Reading) -> str:
@@ -126,17 +150,28 @@ def _render_dashboard_html(readings: list[Reading], now: datetime) -> str:
             body = _account_rows(reading, now, "me") + _account_rows(work, now, "work")
         else:
             body = _account_rows(reading, now)
-            if not body and reading.detail:
-                # Quota-less provider: no percentage bars — show its detail line.
-                body = f'<div class="detail">{html.escape(reading.detail)}</div>'
+        if reading.detail:
+            # Detail lines render under the percentage bars (z.ai's weekly
+            # token total) or as the whole card body (quota-less providers).
+            # Coloured by the volume alert so "close to the wall" is glanceable.
+            detail_color = _alert_color_css(reading.alert)
+            body += (
+                f'<div class="detail" style="color:{detail_color}">'
+                f"{html.escape(reading.detail)}</div>"
+            )
         cards.append(f'<section class="card"><h2{header_style}>{name}</h2>{body}</section>')
 
     # Display-only QWEN tag: no data source, just whether we're inside the Qwen
     # token plan's off-peak window (22:00–08:00 UTC+8), when credits consume
-    # much less. Replaces the retired umans card.
-    qwen_offpeak = qwen_is_offpeak(now)
-    qwen_color = _CSS_GREEN if qwen_offpeak else _CSS_ORANGE
-    qwen_label = "off-peak (22:00\u201308:00 UTC+8)" if qwen_offpeak else "peak hours"
+    # much less — with a countdown to the next boundary. Replaces the retired
+    # umans card.
+    qwen = qwen_peak_countdown(now)
+    qwen_color = _CSS_GREEN if not qwen.in_peak else _CSS_ORANGE
+    qwen_label = (
+        f"peak in {_countdown_short(qwen.seconds_to_boundary)}"
+        if not qwen.in_peak
+        else f"peak ends in {_countdown_short(qwen.seconds_to_boundary)}"
+    )
     cards.append(
         f'<section class="card"><h2 style="color:{qwen_color}">QWEN</h2>'
         f'<div class="detail" style="color:{qwen_color}">{qwen_label}</div></section>'
