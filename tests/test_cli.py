@@ -107,6 +107,16 @@ class TestOAuthConstants:
         # The usage endpoint returns 403 without user:profile.
         assert "user:profile" in _CLAUDE_SCOPES.split()
 
+    def test_scopes_match_current_claude_code(self) -> None:
+        # Mirror the scope set the current Claude Code CLI requests, so the
+        # authorize server issues a code it will accept at exchange time.
+        assert _CLAUDE_SCOPES.split() == [
+            "user:inference",
+            "user:profile",
+            "user:sessions:claude_code",
+            "user:mcp_servers",
+        ]
+
 
 class TestExchangeIncludesClientAndState:
     @patch("usage_dashboard.cli.httpx.post")
@@ -131,6 +141,94 @@ class TestExchangeIncludesClientAndState:
         _exchange_code("code", "verifier", "http://localhost:9/callback")
         data = mock_post.call_args[1].get("data") or mock_post.call_args[0][1]
         assert "state" not in data
+
+
+class TestExchangeErrors:
+    @patch("usage_dashboard.cli.httpx.post")
+    def test_exchange_surfaces_oauth_error(self, mock_post: MagicMock) -> None:
+        # A rejected exchange must surface the server's error rather than
+        # crashing on a bare KeyError for the missing access_token.
+        mock_response = MagicMock()
+        mock_response.status_code = 400
+        mock_response.json.return_value = {
+            "error": "invalid_grant",
+            "error_description": "Invalid 'code' in request.",
+        }
+        mock_post.return_value = mock_response
+
+        with pytest.raises(httpx.HTTPError) as exc_info:
+            _exchange_code("code", "verifier", "http://localhost/callback")
+        assert "invalid_grant" in str(exc_info.value)
+        assert "Invalid 'code' in request." in str(exc_info.value)
+
+    @patch("usage_dashboard.cli.httpx.post")
+    def test_exchange_surfaces_oauth_error_dict(self, mock_post: MagicMock) -> None:
+        # Anthropic sometimes returns error as a nested object rather than a
+        # plain string; still surface it cleanly.
+        mock_response = MagicMock()
+        mock_response.status_code = 400
+        mock_response.json.return_value = {
+            "type": "error",
+            "error": {"type": "invalid_request_error", "message": "Invalid JSON body"},
+        }
+        mock_post.return_value = mock_response
+
+        with pytest.raises(httpx.HTTPError) as exc_info:
+            _exchange_code("code", "verifier", "http://localhost/callback")
+        assert "invalid_request_error" in str(exc_info.value)
+        assert "Invalid JSON body" in str(exc_info.value)
+
+    @patch("usage_dashboard.cli.httpx.post")
+    def test_exchange_surfaces_non_json_body(self, mock_post: MagicMock) -> None:
+        mock_response = MagicMock()
+        mock_response.status_code = 502
+        mock_response.json.side_effect = ValueError("not json")
+        mock_post.return_value = mock_response
+
+        with pytest.raises(httpx.HTTPError) as exc_info:
+            _exchange_code("code", "verifier", "http://localhost/callback")
+        assert "non-JSON" in str(exc_info.value)
+
+    @patch("usage_dashboard.cli.httpx.post")
+    def test_exchange_surfaces_missing_access_token(self, mock_post: MagicMock) -> None:
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"refresh_token": "r"}
+        mock_post.return_value = mock_response
+
+        with pytest.raises(httpx.HTTPError) as exc_info:
+            _exchange_code("code", "verifier", "http://localhost/callback")
+        assert "missing access_token" in str(exc_info.value)
+
+
+class TestAuthorizeUrl:
+    @patch("usage_dashboard.cli._wait_for_code")
+    @patch("usage_dashboard.cli.httpx.post")
+    @patch("usage_dashboard.cli.secrets.token_urlsafe", return_value="fixed-state")
+    def test_authorize_url_includes_code_true(
+        self,
+        mock_token: MagicMock,
+        mock_post: MagicMock,
+        mock_wait: MagicMock,
+        capsys,
+    ) -> None:
+        # Claude's authorize endpoint only issues a usable PKCE code when
+        # code=true is present (the real CLI always sends it first). Regression
+        # for WI-013: the login path omitted it and the exchange then failed.
+        mock_wait.return_value = ("auth-code", "fixed-state", None)
+        mock_response = MagicMock()
+        mock_response.json.return_value = {"access_token": "a", "refresh_token": "r"}
+        mock_post.return_value = mock_response
+
+        from usage_dashboard.cli import login_claude
+
+        login_claude(port=8765, no_browser=True)
+
+        out = capsys.readouterr().out
+        assert "code=true" in out
+        data = mock_post.call_args[1]["data"]
+        assert data["redirect_uri"] == "http://localhost:8765/callback"
+        assert data["code"] == "auth-code"
 
 
 class TestParsePastedInput:
