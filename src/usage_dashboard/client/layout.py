@@ -74,6 +74,12 @@ class TileSpec:
     subtitle: str = ""   # right-aligned model breakdown for the tile header
     compact: bool = False  # half-width paired tile: S/W labels, bare countdown
     title_color: Color = fmt.TEXT  # off-peak tint for plans with peak windows
+    # Subtitle tint. Defaults to gray (Ollama's model breakdown is neutral
+    # information), but the z.ai subtitle is the peak-window countdown — the
+    # same signal as title_color — so it matches the title rather than reading
+    # as unrelated grey text. Quota reset countdowns are deliberately NOT
+    # tinted this way: they answer a different question.
+    subtitle_color: Color = fmt.GRAY
 
 
 @dataclass(frozen=True)
@@ -375,6 +381,9 @@ def build_main_layout(
                     subtitle=subtitle,
                     compact=compact,
                     title_color=title_color,
+                    subtitle_color=(
+                        title_color if provider is Provider.ZAI else fmt.GRAY
+                    ),
                 )
             )
         y += cell_h + margin

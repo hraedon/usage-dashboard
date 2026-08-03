@@ -565,7 +565,7 @@ class DashboardGui:
         title_surf = self._font_title.render(tile.title, True, tile.title_color)
         self._screen.blit(title_surf, (r.x + pad, r.y + pad))
         if tile.subtitle:
-            sub_surf = self._font_small.render(tile.subtitle, True, fmt.GRAY)
+            sub_surf = self._font_small.render(tile.subtitle, True, tile.subtitle_color)
             self._screen.blit(
                 sub_surf,
                 (r.x + r.w - pad - sub_surf.get_width(),
