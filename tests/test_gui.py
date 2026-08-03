@@ -711,3 +711,77 @@ def test_refresh_button_does_not_steal_status_tap() -> None:
         assert fetcher.refreshes == 0
     finally:
         pygame.display.quit()
+
+
+def _is_tofu(font: "pygame.font.Font", ch: str) -> bool:
+    """True when *ch* renders as the font's .notdef box.
+
+    pygame reports metrics for missing glyphs rather than None, so the only
+    reliable detector is comparing against a codepoint the font certainly
+    lacks — U+E123 sits in the Private Use Area.
+    """
+    notdef = font.metrics("")
+    return font.metrics(ch) == notdef
+
+
+def test_ui_text_glyphs_exist_in_the_bundled_font() -> None:
+    """Every non-ASCII character the GUI renders as *text* must be drawable.
+
+    The refresh button originally used U+27F3 and shipped a tofu box to the
+    panel: pygame's bundled freesansbold.ttf has no rotation arrow, and the
+    metrics-based checks people reach for return .notdef rather than None.
+    The icon is drawn with primitives now; this guards the text that isn't.
+    """
+    pygame.font.init()
+    font = pygame.font.Font(None, 40)
+    # Sanity-check the detector itself against a glyph the font really lacks.
+    assert _is_tofu(font, "⟳"), "detector failed: U+27F3 should be missing"
+    for ch in ("·", "…", "-", "+"):  # middot, ellipsis, brightness +/-
+        assert not _is_tofu(font, ch), f"{ch!r} renders as tofu in the default font"
+
+
+def test_refresh_icon_draws_inside_the_button() -> None:
+    # The icon is drawn, not rendered from a font, so guard that it actually
+    # puts pixels down and keeps them within the button's bounds.
+    pygame.display.init()
+    pygame.font.init()
+    size = (1280, 720)
+    screen = pygame.display.set_mode(size)
+    try:
+        fetcher = _RefreshFetcher(_readings())
+        gui = DashboardGui(fetcher, size)  # type: ignore[arg-type]
+        layout = build_main_layout(_readings(), size)
+        rect = layout.refresh_rect
+        assert rect is not None
+        screen.fill((0, 0, 0))
+        gui._draw_refresh_icon(rect, (255, 255, 255))
+        area = pygame.Rect(rect.x, rect.y, rect.w, rect.h)
+        # get_bounding_rect only reports drawn content when a colorkey marks
+        # the background; without one it returns the whole surface.
+        snapshot = screen.copy()
+        snapshot.set_colorkey((0, 0, 0))
+        drawn = snapshot.get_bounding_rect()
+        assert drawn.width > 0, "icon drew nothing"
+        assert area.contains(drawn), f"icon drew outside the button: {drawn} vs {area}"
+    finally:
+        pygame.display.quit()
+
+
+def test_refresh_feedback_expires() -> None:
+    # The first cut set _refresh_feedback in four places and rendered it in
+    # none — dead state, so a tap reported nothing in words. Guard both that
+    # it is readable and that it doesn't stick around forever.
+    pygame.display.init()
+    pygame.font.init()
+    size = (480, 320)
+    pygame.display.set_mode(size)
+    try:
+        gui = DashboardGui(_RefreshFetcher(_readings()), size)  # type: ignore[arg-type]
+        gui._set_refresh_feedback("refreshed", hold_ms=10_000)
+        assert gui._current_refresh_feedback() == "refreshed"
+        # Expire it by moving the deadline into the past.
+        gui._refresh_feedback_until = pygame.time.get_ticks() - 1
+        assert gui._current_refresh_feedback() == ""
+        assert gui._refresh_feedback == ""  # cleared, not just hidden
+    finally:
+        pygame.display.quit()

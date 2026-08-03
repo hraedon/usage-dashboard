@@ -11,6 +11,7 @@ extra (``pip install 'usage-dashboard[gui]'``).
 from __future__ import annotations
 
 import logging
+import math
 import os
 import signal
 import sys
@@ -34,6 +35,7 @@ from usage_dashboard.client.fetcher import ClientFetcher
 from usage_dashboard.client.layout import (
     BarSpec,
     BrightnessOverlay,
+    Color,
     DetailLayout,
     MainLayout,
     Rect,
@@ -57,9 +59,8 @@ _OVERLAY_BG = (28, 28, 28)
 _BTN_BG = (45, 45, 45)
 # A refresh POST is in flight: fill the button so the user sees the tap landed.
 _REFRESH_PENDING_BG = (92, 72, 10)
-# Circular-arrow glyph for the refresh button; ASCII fallback if the default
-# font lacks it (mirrors the ASCII-only convention of the brightness buttons).
-_REFRESH_GLYPH = "\u27f3"  # ⟳
+# How long the refresh result ("refreshed"/"refresh failed") stays on screen.
+_REFRESH_FEEDBACK_MS = 6000
 
 
 def _env_int(name: str, default: int) -> int:
@@ -175,6 +176,10 @@ class DashboardGui:
         # while it's in flight so the tap reads as acknowledged.
         self._refresh_pending = False
         self._refresh_feedback = ""
+        # Wall-clock deadline (pygame ticks, ms) after which the feedback text
+        # clears itself, so "refreshed"/"refresh failed" doesn't sit there for
+        # the rest of the day.
+        self._refresh_feedback_until = 0
         self._refresh_thread: threading.Thread | None = None
         # While dark we tick slowly to save CPU but still pump touch events.
         self._sleep_fps = 4
@@ -260,20 +265,37 @@ class DashboardGui:
         if self._refresh_pending:
             return  # a refresh is already in flight
         self._refresh_pending = True
-        self._refresh_feedback = "refreshing\u2026"
+        self._set_refresh_feedback("refreshing\u2026", hold_ms=_REFRESH_FEEDBACK_MS)
         self._refresh_thread = threading.Thread(target=self._run_refresh, daemon=True)
         self._refresh_thread.start()
+
+    def _set_refresh_feedback(self, text: str, hold_ms: int) -> None:
+        self._refresh_feedback = text
+        self._refresh_feedback_until = pygame.time.get_ticks() + hold_ms
+
+    def _current_refresh_feedback(self) -> str:
+        """The feedback text if it hasn't aged out, else "" (drops it)."""
+        if self._refresh_feedback and (
+            self._refresh_pending
+            or pygame.time.get_ticks() < self._refresh_feedback_until
+        ):
+            return self._refresh_feedback
+        self._refresh_feedback = ""
+        return ""
 
     def _run_refresh(self) -> None:
         try:
             request = getattr(self._fetcher, "request_refresh", None)
             ok = request() if callable(request) else False
-            self._refresh_feedback = "refreshed" if ok else "refresh failed"
+            text = "refreshed" if ok else "refresh failed"
         except Exception as exc:  # never let a refresh crash the thread
             logger.warning("Refresh failed: %s", exc)
-            self._refresh_feedback = "refresh failed"
+            text = "refresh failed"
         finally:
             self._refresh_pending = False
+        # Set after clearing _refresh_pending so the hold window starts when the
+        # result actually lands, not while the request is still in flight.
+        self._set_refresh_feedback(text, hold_ms=_REFRESH_FEEDBACK_MS)
 
     def _handle_overlay_tap(self, pos: tuple[int, int]) -> None:
         """Route a tap while the status overlay is open: the right-column
@@ -448,6 +470,17 @@ class DashboardGui:
         sr = layout.status_rect
         status = self._font_small.render(layout.status_text, True, fmt.GRAY)
         self._screen.blit(status, (sr.x + 8, sr.y + (sr.h - status.get_height()) // 2))
+        # Refresh outcome rides alongside the status line for a few seconds, so
+        # a tap reports back in words rather than only via the button highlight.
+        feedback = self._current_refresh_feedback()
+        if feedback:
+            colour = fmt.RED if feedback == "refresh failed" else fmt.GRAY
+            fb = self._font_small.render(f"· {feedback}", True, colour)
+            self._screen.blit(
+                fb,
+                (sr.x + 8 + status.get_width() + 8,
+                 sr.y + (sr.h - fb.get_height()) // 2),
+            )
         # Off-peak status tag (QWEN) sits in the status bar, next to the timer.
         # With an on-demand refresh button at the right edge, the tag moves
         # left of it so the two never overlap.
@@ -466,8 +499,8 @@ class DashboardGui:
 
     def _draw_refresh_button(self, rect: Rect, pending: bool) -> None:
         """The status-bar on-demand refresh tap target: a rounded square with a
-        circular-arrow glyph, highlighted (and the glyph tinted) while a
-        refresh POST is in flight so the tap reads as acknowledged."""
+        circular-arrow icon, highlighted while a refresh POST is in flight so
+        the tap reads as acknowledged."""
         br = pygame.Rect(rect.x, rect.y, rect.w, rect.h)
         if pending:
             pygame.draw.rect(self._screen, _REFRESH_PENDING_BG, br, border_radius=8)
@@ -475,11 +508,49 @@ class DashboardGui:
         else:
             pygame.draw.rect(self._screen, _BTN_BG, br, border_radius=8)
             pygame.draw.rect(self._screen, fmt.GRAY, br, width=2, border_radius=8)
-        glyph = self._font_big.render(_REFRESH_GLYPH, True, fmt.TEXT)
-        self._screen.blit(
-            glyph,
-            (rect.x + (rect.w - glyph.get_width()) // 2,
-             rect.y + (rect.h - glyph.get_height()) // 2),
+        self._draw_refresh_icon(rect, fmt.TEXT)
+
+    def _draw_refresh_icon(self, rect: Rect, color: Color) -> None:
+        """Draw the circular-arrow icon with primitives instead of a glyph.
+
+        pygame's bundled freesansbold.ttf has no rotation arrow: U+27F3, U+21BB,
+        U+27F2 and U+293A all return .notdef metrics on the unit, so the first
+        cut of this button shipped a tofu box to the panel. The rest of the GUI
+        sticks to ASCII for exactly this reason (the brightness buttons use
+        "-"/"+"), and no Unicode arrow is available to switch to — so draw it.
+        """
+        cx = rect.x + rect.w / 2
+        cy = rect.y + rect.h / 2
+        radius = rect.w * 0.28
+        thickness = max(2, rect.w // 12)
+        box = pygame.Rect(
+            round(cx - radius), round(cy - radius), round(radius * 2), round(radius * 2)
+        )
+        # Leave a gap at the top-right for the arrowhead; pygame measures arc
+        # angles counterclockwise from east, so this sweeps from just past the
+        # head all the way round.
+        pygame.draw.arc(
+            self._screen, color, box, math.radians(78), math.radians(358), thickness
+        )
+        # Arrowhead at the arc's open end. Build it from the tangent/normal at
+        # that angle so it points along the stroke (clockwise) and stays
+        # correctly oriented at any button size, rather than from hand-tuned
+        # pixel offsets.
+        head_angle = math.radians(62)
+        hx = cx + radius * math.cos(head_angle)
+        hy = cy - radius * math.sin(head_angle)
+        # Screen y grows downward, so clockwise motion is +(sin, cos).
+        tx, ty = math.sin(head_angle), math.cos(head_angle)
+        nx, ny = math.cos(head_angle), -math.sin(head_angle)
+        size = max(4, rect.w // 6)
+        pygame.draw.polygon(
+            self._screen,
+            color,
+            [
+                (hx + tx * size * 1.3, hy + ty * size * 1.3),
+                (hx - tx * size * 0.4 + nx * size, hy - ty * size * 0.4 + ny * size),
+                (hx - tx * size * 0.4 - nx * size, hy - ty * size * 0.4 - ny * size),
+            ],
         )
 
     def _draw_tile(self, tile: TileSpec, label_col_w: int) -> None:
