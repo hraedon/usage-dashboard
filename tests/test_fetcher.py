@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from datetime import datetime
 from unittest.mock import MagicMock, patch
 
@@ -158,3 +159,76 @@ class TestSchedulePolling:
         mock_get.side_effect = httpx.ConnectError("down")
         f._poll_schedule()
         assert f.current_schedule_spec == "daily 00:00-08:00"  # not clobbered
+
+
+class TestRequestRefresh:
+    """On-demand refresh (WI-012): request_refresh() POSTs /refresh and pokes
+    the poll loop so fresh readings are fetched immediately."""
+
+    def _resp(self, status_code=200):
+        r = MagicMock()
+        r.status_code = status_code
+        r.raise_for_status = MagicMock()
+        return r
+
+    @patch("usage_dashboard.client.fetcher.httpx.post")
+    def test_posts_to_refresh_with_auth_and_pokes(self, mock_post):
+        mock_post.return_value = self._resp(200)
+        f = ClientFetcher("http://srv", "key")
+        assert f.request_refresh() is True
+        assert mock_post.call_args.args[0] == "http://srv/refresh"
+        assert mock_post.call_args.kwargs["headers"] == {
+            "Authorization": "Bearer key"
+        }
+        # The poke wakes the poll wait so the loop fetches right away.
+        assert f._wake_event.is_set()
+
+    @patch("usage_dashboard.client.fetcher.httpx.post")
+    def test_rate_limited_returns_false_without_poke(self, mock_post):
+        mock_post.return_value = self._resp(429)
+        f = ClientFetcher("http://srv", "key")
+        assert f.request_refresh() is False
+        assert not f._wake_event.is_set()
+
+    @patch("usage_dashboard.client.fetcher.httpx.post")
+    def test_network_error_returns_false(self, mock_post):
+        mock_post.side_effect = httpx.ConnectError("down")
+        f = ClientFetcher("http://srv", "key")
+        assert f.request_refresh() is False
+        assert not f._wake_event.is_set()
+
+    @patch("usage_dashboard.client.fetcher.httpx.post")
+    def test_other_status_returns_false(self, mock_post):
+        resp = self._resp(500)
+        request = MagicMock()
+        resp.raise_for_status.side_effect = httpx.HTTPStatusError(
+            "500", request=request, response=resp,
+        )
+        mock_post.return_value = resp
+        f = ClientFetcher("http://srv", "key")
+        assert f.request_refresh() is False
+
+
+class TestPokeWake:
+    def test_poke_wakes_poll_wait_early(self):
+        f = ClientFetcher("http://srv", "key", default_interval=300)
+        f._interval = 300
+        f._wake_event.set()  # a poke already arrived
+        start = time.monotonic()
+        f._wait_for_next_poll()
+        assert time.monotonic() - start < 2.0
+
+    def test_wait_blocks_until_timeout_without_poke(self):
+        f = ClientFetcher("http://srv", "key")
+        f._interval = 0.2
+        start = time.monotonic()
+        f._wait_for_next_poll()
+        assert time.monotonic() - start >= 0.15
+
+    def test_stop_event_interrupts_wait(self):
+        f = ClientFetcher("http://srv", "key")
+        f._interval = 300
+        f._stop_event.set()
+        start = time.monotonic()
+        f._wait_for_next_poll()
+        assert time.monotonic() - start < 2.0

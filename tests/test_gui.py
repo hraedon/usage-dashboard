@@ -7,6 +7,7 @@ when the optional ``gui`` extra (pygame) isn't installed.
 from __future__ import annotations
 
 import os
+import threading
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -56,8 +57,6 @@ def _readings() -> list[Reading]:
         r(Provider.CLAUDE),
         r(Provider.ZAI, status=ReadingStatus.STALE, stale=True),
         r(Provider.OLLAMA, session_percent=None, weekly_percent=None),
-        r(Provider.UMANS, session_percent=None, weekly_percent=None,
-          session_resets_at=None, weekly_resets_at=None, detail="req 5 tok 1M"),
     ]
 
 
@@ -115,7 +114,7 @@ def test_draw_detail_does_not_raise(gui) -> None:
 
 
 def test_draw_detail_quotaless_provider(gui) -> None:
-    gui._state = ViewState(detail_provider=Provider.UMANS)
+    gui._state = ViewState(detail_provider=Provider.OLLAMA)
     gui._draw_detail(_readings())
 
 
@@ -588,5 +587,127 @@ def test_tap_wakes_from_manual_sleep() -> None:
         gui._handle_events(layout, swallow_wake=True, now=_NOW)
         assert gui._manual_sleep is False
         assert gui._is_dark(_NOW) is False  # no schedule -> awake again
+    finally:
+        pygame.display.quit()
+
+
+# -- on-demand refresh (WI-012) ---------------------------------------------
+
+
+class _RefreshFetcher:
+    """_FakeFetcher plus a controllable request_refresh: the test holds the
+    thread open (via ``release``) so it can assert the in-flight state, then
+    lets it finish."""
+
+    def __init__(self, readings: list[Reading]) -> None:
+        self._readings = readings
+        self.refreshes = 0
+        self.release = threading.Event()
+        self.fail = False
+
+    def get_latest_readings(self) -> list[Reading]:
+        return self._readings
+
+    def request_refresh(self) -> bool:
+        self.refreshes += 1
+        self.release.wait(timeout=5)
+        return not self.fail
+
+
+def _refresh_pos(size: tuple[int, int]) -> tuple[int, int]:
+    """Centre of the on-demand refresh button for *size*."""
+    r = build_main_layout(_readings(), size).refresh_rect
+    assert r is not None
+    return r.x + r.w // 2, r.y + r.h // 2
+
+
+def test_refresh_button_tap_requests_refresh() -> None:
+    pygame.display.init()
+    pygame.font.init()
+    pygame.display.set_mode((480, 320))
+    try:
+        fetcher = _RefreshFetcher(_readings())
+        gui = DashboardGui(fetcher, (480, 320))  # type: ignore[arg-type]
+        layout = build_main_layout(_readings(), (480, 320))
+        _post_taps([_refresh_pos((480, 320))])
+        gui._handle_events(layout, swallow_wake=False, now=_NOW)
+        # The tap landed on the refresh button, not a tile or the overlay.
+        assert fetcher.refreshes == 1
+        assert gui._refresh_pending is True
+        assert gui._refresh_feedback == "refreshing\u2026"
+        assert gui._state.overlay is False
+        assert gui._state.detail_provider is None
+        # Let the request finish: feedback resolves, button unhighlights.
+        fetcher.release.set()
+        thread = gui._refresh_thread
+        assert thread is not None
+        thread.join(timeout=5)
+        assert gui._refresh_pending is False
+        assert gui._refresh_feedback == "refreshed"
+    finally:
+        pygame.display.quit()
+
+
+def test_refresh_button_failure_feedback() -> None:
+    pygame.display.init()
+    pygame.font.init()
+    pygame.display.set_mode((480, 320))
+    try:
+        fetcher = _RefreshFetcher(_readings())
+        fetcher.fail = True
+        gui = DashboardGui(fetcher, (480, 320))  # type: ignore[arg-type]
+        layout = build_main_layout(_readings(), (480, 320))
+        _post_taps([_refresh_pos((480, 320))])
+        gui._handle_events(layout, swallow_wake=False, now=_NOW)
+        fetcher.release.set()
+        thread = gui._refresh_thread
+        assert thread is not None
+        thread.join(timeout=5)
+        assert gui._refresh_feedback == "refresh failed"
+    finally:
+        pygame.display.quit()
+
+
+def test_start_refresh_ignored_while_pending() -> None:
+    pygame.display.init()
+    pygame.font.init()
+    pygame.display.set_mode((480, 320))
+    try:
+        fetcher = _RefreshFetcher(_readings())
+        gui = DashboardGui(fetcher, (480, 320))  # type: ignore[arg-type]
+        gui._start_refresh()
+        first = gui._refresh_thread
+        gui._start_refresh()  # already in flight: must not spawn a second
+        assert gui._refresh_thread is first
+        assert fetcher.refreshes == 1
+        fetcher.release.set()
+        assert first is not None
+        first.join(timeout=5)
+        assert gui._refresh_pending is False
+    finally:
+        pygame.display.quit()
+
+
+def test_refresh_button_does_not_steal_status_tap() -> None:
+    # The refresh button occupies the right edge of the status bar; a tap on
+    # the rest of the bar must still open the diagnostics overlay.
+    pygame.display.init()
+    pygame.font.init()
+    size = (480, 320)
+    pygame.display.set_mode(size)
+    try:
+        fetcher = _RefreshFetcher(_readings())
+        gui = DashboardGui(fetcher, size)  # type: ignore[arg-type]
+        layout = build_main_layout(_readings(), size)
+        sr = layout.status_rect
+        r = layout.refresh_rect
+        assert r is not None
+        # A point on the status bar far from the button (centre-left).
+        tap = (sr.x + sr.w // 3, sr.y + sr.h // 2)
+        assert not r.contains(*tap)
+        _post_taps([tap])
+        gui._handle_events(layout, swallow_wake=False, now=_NOW)
+        assert gui._state.overlay is True
+        assert fetcher.refreshes == 0
     finally:
         pygame.display.quit()

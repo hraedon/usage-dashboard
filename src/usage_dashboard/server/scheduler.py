@@ -16,7 +16,6 @@ from usage_dashboard.server.fetch_types import (
     FetchError,
     FetchRateLimitError,
 )
-from usage_dashboard.server.fetch_umans import fetch_umans_usage
 from usage_dashboard.server.fetch_zai import fetch_zai_usage
 from usage_dashboard.server.token_store import TokenStore
 from usage_dashboard.shared.models import (
@@ -68,10 +67,6 @@ class FetchScheduler:
         codex_refresh_token: str | None = None,
         codex_client_id: str | None = None,
         codex_account_id: str | None = None,
-        umans_key: str | None = None,
-        umans_history_hours: int | None = None,
-        umans_tokens_warn: int | None = None,
-        umans_tokens_crit: int | None = None,
         interval_seconds: int = 300,
         offline_threshold: int = 24,
         rate_limit_default_seconds: int = 300,
@@ -95,17 +90,6 @@ class FetchScheduler:
         self._codex_refresh_token = codex_refresh_token
         self._codex_client_id = codex_client_id
         self._codex_account_id = codex_account_id
-        self._umans_key = umans_key
-        # None = use the fetcher's defaults; set only what the env overrides.
-        self._umans_overrides: dict[str, int] = {
-            name: value
-            for name, value in (
-                ("history_hours", umans_history_hours),
-                ("tokens_warn", umans_tokens_warn),
-                ("tokens_crit", umans_tokens_crit),
-            )
-            if value is not None
-        }
         self._offline_threshold = offline_threshold
         self._rate_limit_default_seconds = rate_limit_default_seconds
         # The idle ladder widens the poll gap when a provider's reading is not
@@ -172,8 +156,8 @@ class FetchScheduler:
         Drives the idle ladder: an unchanged reading lets the gap widen, a
         changed one snaps it back to the floor. Percentages compare with an
         epsilon so background jitter doesn't keep a provider pinned at 5m;
-        ``detail`` is compared verbatim because quota-less providers (umans)
-        carry their movement there rather than in the percent fields.
+        ``detail`` is compared verbatim because quota-less providers carry
+        their movement there rather than in the percent fields.
         """
         if prev.status is not new.status:
             return True
@@ -269,14 +253,22 @@ class FetchScheduler:
                     ),
                 )
             )
-        if self._umans_key is not None:
-            tasks.append(
-                (
-                    Provider.UMANS,
-                    partial(fetch_umans_usage, self._umans_key, **self._umans_overrides),
-                )
-            )
         return tasks
+
+    def fetch_now(self) -> None:
+        """Force an immediate fetch for every configured provider (WI-012).
+
+        Used by the client-triggered ``POST /refresh`` endpoint: bypasses each
+        provider's per-provider due time and runs the normal fetch path. Each
+        ``_fetch_one`` re-schedules its provider (``next_due`` = now + interval
+        on success, backoff on failure), so the scheduler loop simply picks up
+        the new schedule state on its next tick — no need to wake the loop
+        thread. Thread-safe: DB writes are serialized under the Database lock,
+        and this is typically called from the API thread while the loop may be
+        running concurrently.
+        """
+        for provider, fetch_fn in self._get_fetch_tasks():
+            self._fetch_one(provider, fetch_fn)
 
     def _do_refresh(
         self, refresh_token: str, client_id: str | None, store_key: str

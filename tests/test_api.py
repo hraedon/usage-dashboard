@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from unittest.mock import MagicMock
 
 import httpx
 
@@ -99,7 +100,7 @@ class TestReadingsEndpoint:
             data = response.json()
             providers = {item["provider"] for item in data}
             assert providers == {
-                "claude", "claude_work", "zai", "ollama", "codex", "umans",
+                "claude", "claude_work", "zai", "ollama", "codex",
             }
 
         asyncio.run(_test())
@@ -212,11 +213,11 @@ class TestDashboardEndpoint:
 
         asyncio.run(_test())
 
-    def test_dashboard_shows_umans_detail_line(self, tmp_path):
+    def test_dashboard_shows_quotaless_detail_line(self, tmp_path):
         app, db = _create_app_with_db(tmp_path)
         db.store_reading(
             _make_reading(
-                provider=Provider.UMANS,
+                provider=Provider.ZAI,
                 session_percent=None,
                 weekly_percent=None,
                 weekly_resets_at=None,
@@ -228,6 +229,32 @@ class TestDashboardEndpoint:
             async with _client(app) as client:
                 response = await client.get("/dashboard")
             assert "req 161  tok 63.9M" in response.text
+
+        asyncio.run(_test())
+
+    def test_dashboard_shows_qwen_offpeak_card(self, tmp_path):
+        # Display-only QWEN tag: always present, coloured green/orange by whether
+        # the Qwen token plan's off-peak window (22:00–08:00 UTC+8) is open.
+        app, db = _create_app_with_db(tmp_path)
+        db.store_reading(_make_reading())
+
+        async def _test():
+            async with _client(app) as client:
+                response = await client.get("/dashboard")
+            assert ">QWEN</h2>" in response.text
+            assert "color:#22c55e" in response.text or "color:#f97316" in response.text
+
+        asyncio.run(_test())
+
+    def test_dashboard_zai_header_tinted_by_offpeak(self, tmp_path):
+        app, db = _create_app_with_db(tmp_path)
+        db.store_reading(_make_reading(provider=Provider.ZAI))
+
+        async def _test():
+            async with _client(app) as client:
+                response = await client.get("/dashboard")
+            assert "<h2 style=\"color:" in response.text
+            assert ">ZAI</h2>" in response.text
 
         asyncio.run(_test())
 
@@ -327,7 +354,13 @@ class TestDashboardEndpoint:
     def test_dashboard_escapes_detail_content(self, tmp_path):
         app, db = _create_app_with_db(tmp_path)
         db.store_reading(
-            _make_reading(provider=Provider.UMANS, detail="<script>alert(1)</script>")
+            _make_reading(
+                provider=Provider.ZAI,
+                session_percent=None,
+                weekly_percent=None,
+                weekly_resets_at=None,
+                detail="<script>alert(1)</script>",
+            )
         )
 
         async def _test():
@@ -365,7 +398,7 @@ class TestDashboardEndpoint:
             assert "CLAUDE" in response.text
             assert "ZAI" not in response.text
             assert "OLLAMA" not in response.text
-            assert "UMANS" not in response.text
+            assert "CODEX" not in response.text
 
         asyncio.run(_test())
 
@@ -505,5 +538,113 @@ class TestHistoryEndpoint:
                 )
             data = response.json()
             assert len(data["readings"]) == 1
+
+        asyncio.run(_test())
+
+
+class TestRefreshEndpoint:
+    """Client-triggered on-demand refresh (WI-012): POST /refresh forces an
+    immediate collection via scheduler.fetch_now, bearer-authenticated and
+    rate-limited to one call per 60s per app instance."""
+
+    @staticmethod
+    def _app(tmp_path, scheduler=None):
+        db = Database(str(tmp_path / "api_refresh.db"))
+        db.initialize()
+        return create_app(
+            API_KEY, db,
+            configured_providers=[Provider.CLAUDE],
+            scheduler=scheduler,
+        )
+
+    def test_refresh_requires_auth(self, tmp_path):
+        app = self._app(tmp_path, scheduler=MagicMock())
+
+        async def _test():
+            async with _client(app) as client:
+                response = await client.post("/refresh")
+            assert response.status_code == 401
+
+        asyncio.run(_test())
+
+    def test_refresh_with_wrong_api_key_returns_401(self, tmp_path):
+        app = self._app(tmp_path, scheduler=MagicMock())
+
+        async def _test():
+            async with _client(app) as client:
+                response = await client.post(
+                    "/refresh",
+                    headers={"Authorization": "Bearer wrong-key"},
+                )
+            assert response.status_code == 401
+
+        asyncio.run(_test())
+
+    def test_refresh_without_scheduler_returns_501(self, tmp_path):
+        # An app built without a scheduler (tests / config-only) reports the
+        # endpoint as unavailable rather than crashing on None.
+        app = self._app(tmp_path, scheduler=None)
+
+        async def _test():
+            async with _client(app) as client:
+                response = await client.post(
+                    "/refresh",
+                    headers={"Authorization": f"Bearer {API_KEY}"},
+                )
+            assert response.status_code == 501
+            assert "no scheduler" in response.json()["detail"]
+
+        asyncio.run(_test())
+
+    def test_refresh_calls_fetch_now(self, tmp_path):
+        scheduler = MagicMock()
+        app = self._app(tmp_path, scheduler=scheduler)
+
+        async def _test():
+            async with _client(app) as client:
+                response = await client.post(
+                    "/refresh",
+                    headers={"Authorization": f"Bearer {API_KEY}"},
+                )
+            assert response.status_code == 200
+            assert response.json() == {"status": "ok", "refreshed": True}
+
+        asyncio.run(_test())
+        scheduler.fetch_now.assert_called_once()
+
+    def test_refresh_rate_limits_second_request(self, tmp_path):
+        scheduler = MagicMock()
+        app = self._app(tmp_path, scheduler=scheduler)
+
+        async def _test():
+            async with _client(app) as client:
+                headers = {"Authorization": f"Bearer {API_KEY}"}
+                first = await client.post("/refresh", headers=headers)
+                second = await client.post("/refresh", headers=headers)
+            assert first.status_code == 200
+            assert second.status_code == 429
+            assert "retry in" in second.json()["detail"]
+
+        asyncio.run(_test())
+        scheduler.fetch_now.assert_called_once()  # the second call never ran
+
+    def test_rate_limit_is_per_app_instance(self, tmp_path):
+        # Each app gets an independent limiter: an immediate refresh on a
+        # second app must not trip the first app's rate limit.
+        scheduler_a = MagicMock()
+        scheduler_b = MagicMock()
+        app_a = self._app(tmp_path, scheduler=scheduler_a)
+        app_b = self._app(tmp_path, scheduler=scheduler_b)
+
+        async def _test():
+            async with _client(app_a) as client:
+                headers = {"Authorization": f"Bearer {API_KEY}"}
+                await client.post("/refresh", headers=headers)
+            async with _client(app_b) as client:
+                response = await client.post(
+                    "/refresh",
+                    headers={"Authorization": f"Bearer {API_KEY}"},
+                )
+            assert response.status_code == 200
 
         asyncio.run(_test())

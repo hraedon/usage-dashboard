@@ -73,12 +73,6 @@ def _resolve_ollama_cookie(
     return persisted or env_cookie
 
 
-def _optional_int_env(name: str) -> int | None:
-    """Parse an optional integer env var; unset/empty means None (use defaults)."""
-    value = os.environ.get(name)
-    return int(value) if value else None
-
-
 def main() -> None:
     logging.basicConfig(
         level=logging.INFO,
@@ -106,14 +100,6 @@ def main() -> None:
     codex_refresh_token = os.environ.get("CODEX_REFRESH_TOKEN") or None
     codex_client_id = os.environ.get("CODEX_CLIENT_ID") or None
     codex_account_id = os.environ.get("CODEX_ACCOUNT_ID") or None
-    umans_api_key = os.environ.get("UMANS_API_KEY") or None
-    # umans trailing-window knobs (unset = the fetcher's defaults): the window
-    # the detail line sums over, and the token totals that colour it warn/crit.
-    # The heavy-usage threshold is opaque on umans' side, so these must stay
-    # tunable without a code change.
-    umans_history_hours = _optional_int_env("UMANS_HISTORY_HOURS")
-    umans_tokens_warn = _optional_int_env("UMANS_TOKENS_WARN")
-    umans_tokens_crit = _optional_int_env("UMANS_TOKENS_CRIT")
     fetch_interval = int(os.environ.get("FETCH_INTERVAL", "300"))
     failure_backoff_cap = int(os.environ.get("FAILURE_BACKOFF_CAP", "3600"))
     port = int(os.environ.get("PORT", "8080"))
@@ -159,10 +145,6 @@ def main() -> None:
         codex_refresh_token=codex_refresh_token,
         codex_client_id=codex_client_id,
         codex_account_id=codex_account_id,
-        umans_key=umans_api_key,
-        umans_history_hours=umans_history_hours,
-        umans_tokens_warn=umans_tokens_warn,
-        umans_tokens_crit=umans_tokens_crit,
         interval_seconds=fetch_interval,
         failure_cap_seconds=failure_backoff_cap,
         token_store=token_store,
@@ -174,6 +156,7 @@ def main() -> None:
         db=database,
         configured_providers=scheduler.configured_providers(),
         schedule_config=ScheduleConfig.load(os.environ.get("SCHEDULES_DIR") or None),
+        scheduler=scheduler,
     )
 
     scheduler.start()

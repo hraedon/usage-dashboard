@@ -156,9 +156,9 @@ class TestDetailColumn:
     def test_detail_stored_and_retrieved(self, tmp_path):
         db = Database(str(tmp_path / "test.db"))
         db.initialize()
-        reading = _make_reading(provider=Provider.UMANS, detail="pk 2/4  req 161  tok 63.9M")
+        reading = _make_reading(provider=Provider.ZAI, detail="pk 2/4  req 161  tok 63.9M")
         db.store_reading(reading)
-        result = db.get_latest_readings()[Provider.UMANS]
+        result = db.get_latest_readings()[Provider.ZAI]
         assert result.detail == "pk 2/4  req 161  tok 63.9M"
 
     def test_initialize_migrates_legacy_schema_without_detail(self, tmp_path):
@@ -272,9 +272,9 @@ class TestModelsColumn:
     def test_alert_stored_and_retrieved(self, tmp_path):
         db = Database(str(tmp_path / "test.db"))
         db.initialize()
-        reading = _make_reading(provider=Provider.UMANS, alert=ALERT_WARN)
+        reading = _make_reading(provider=Provider.ZAI, alert=ALERT_WARN)
         db.store_reading(reading)
-        result = db.get_latest_readings()[Provider.UMANS]
+        result = db.get_latest_readings()[Provider.ZAI]
         assert result.alert == ALERT_WARN
 
     def test_alert_column_added_to_existing_db(self, tmp_path):
@@ -300,7 +300,7 @@ class TestModelsColumn:
         conn.execute(
             """
             INSERT INTO readings (provider, status, fetched_at, stale)
-            VALUES ('umans', 'current', '2026-01-14T12:00:00', 0)
+            VALUES ('zai', 'current', '2026-01-14T12:00:00', 0)
             """
         )
         conn.commit()
@@ -309,9 +309,9 @@ class TestModelsColumn:
         db = Database(path)
         db.initialize()  # should ALTER TABLE ADD COLUMN alert
         # The pre-existing row reads back with the default alert.
-        assert db.get_latest_readings()[Provider.UMANS].alert == ALERT_NONE
-        db.store_reading(_make_reading(provider=Provider.UMANS, alert=ALERT_WARN))
-        assert db.get_latest_readings()[Provider.UMANS].alert == ALERT_WARN
+        assert db.get_latest_readings()[Provider.ZAI].alert == ALERT_NONE
+        db.store_reading(_make_reading(provider=Provider.ZAI, alert=ALERT_WARN))
+        assert db.get_latest_readings()[Provider.ZAI].alert == ALERT_WARN
 
     def test_none_models_stored_and_retrieved(self, tmp_path):
         db = Database(str(tmp_path / "test.db"))
@@ -490,7 +490,7 @@ class TestGetReadingsSince:
         now = datetime.now(timezone.utc).replace(tzinfo=None)
         db.store_reading(_make_reading(fetched_at=now - timedelta(hours=1)))
         db.store_reading(
-            _make_reading(provider=Provider.UMANS, fetched_at=now - timedelta(hours=1))
+            _make_reading(provider=Provider.ZAI, fetched_at=now - timedelta(hours=1))
         )
 
         result = db.get_readings_since(Provider.CLAUDE, now - timedelta(hours=24))

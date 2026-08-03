@@ -139,16 +139,16 @@ class TestFetchSchedulerFailed:
     def test_unexpected_exception_contained_and_recorded(self, tmp_path):
         db = Database(str(tmp_path / "sched.db"))
         db.initialize()
-        db.store_reading(_make_reading(provider=Provider.UMANS))
+        db.store_reading(_make_reading(provider=Provider.OLLAMA))
         fetch_fn = MagicMock(
             side_effect=AttributeError("'NoneType' has no attribute 'get'")
         )
         scheduler = FetchScheduler(db)
         # A non-FetchError from one fetcher must not escape: if it does,
         # _run_loop's thread dies and every provider stops fetching.
-        scheduler._fetch_one(Provider.UMANS, fetch_fn)
-        assert db.get_consecutive_failures(Provider.UMANS) == 1
-        assert db.get_latest_readings()[Provider.UMANS].stale is True
+        scheduler._fetch_one(Provider.OLLAMA, fetch_fn)
+        assert db.get_consecutive_failures(Provider.OLLAMA) == 1
+        assert db.get_latest_readings()[Provider.OLLAMA].stale is True
 
 
 class TestFetchSchedulerNoProviders:
@@ -188,6 +188,57 @@ class TestFetchSchedulerNoProviders:
         scheduler = FetchScheduler(db, ollama_cookie="session=abc")
         tasks = scheduler._get_fetch_tasks()
         assert any(p is Provider.OLLAMA for p, _ in tasks)
+
+
+class TestFetchNow:
+    """Client-triggered on-demand refresh (WI-012): fetch_now() runs the
+    normal fetch path for every configured provider, ignoring due times."""
+
+    def test_fetch_now_fetches_all_configured_providers(self, tmp_path):
+        db = Database(str(tmp_path / "sched.db"))
+        db.initialize()
+        scheduler = FetchScheduler(db, claude_token="c", zai_key="z")
+        scheduler._fetch_one = MagicMock()  # type: ignore[method-assign]
+        scheduler.fetch_now()
+        assert scheduler._fetch_one.call_count == 2
+        assert [c.args[0] for c in scheduler._fetch_one.call_args_list] == [
+            Provider.CLAUDE, Provider.ZAI,
+        ]
+
+    def test_fetch_now_with_no_providers_is_noop(self, tmp_path):
+        db = Database(str(tmp_path / "sched.db"))
+        db.initialize()
+        scheduler = FetchScheduler(db)
+        scheduler._fetch_one = MagicMock()  # type: ignore[method-assign]
+        scheduler.fetch_now()
+        scheduler._fetch_one.assert_not_called()
+
+    def test_fetch_now_ignores_due_times_and_stores_reading(self, tmp_path):
+        # A provider still backed off from a failure is forced anyway, and the
+        # reading lands in the DB through the normal success path.
+        from unittest.mock import patch
+
+        db = Database(str(tmp_path / "sched.db"))
+        db.initialize()
+        scheduler = FetchScheduler(
+            db, claude_token="token", interval_seconds=300, failure_cap_seconds=3600
+        )
+        scheduler._fetch_one(  # put claude in a failure backoff
+            Provider.CLAUDE, MagicMock(side_effect=FetchError("boom"))
+        )
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        assert scheduler._is_blocked(Provider.CLAUDE, now)
+        reading = _make_reading(provider=Provider.CLAUDE, session_percent=50.0)
+        with patch(
+            "usage_dashboard.server.scheduler.fetch_claude_usage", return_value=reading,
+        ):
+            scheduler.fetch_now()
+        stored = db.get_latest_readings()[Provider.CLAUDE]
+        assert stored.status is ReadingStatus.CURRENT
+        assert stored.session_percent == 50.0
+        # The forced fetch re-schedules from now: not immediately due again.
+        assert scheduler._is_blocked(Provider.CLAUDE, now + timedelta(seconds=60))
+        assert not scheduler._is_blocked(Provider.CLAUDE, now + timedelta(seconds=310))
 
 
 class TestClaudeRefreshGating:
@@ -495,24 +546,24 @@ class TestIdleLadder:
         assert _interval(scheduler, Provider.CLAUDE) == 900  # treated as unchanged
 
     def test_detail_change_resets_quotaless_provider(self, tmp_path):
-        # umans carries movement in `detail`, not percentages.
+        # A quota-less provider carries movement in `detail`, not percentages.
         db = Database(str(tmp_path / "sched.db"))
         db.initialize()
-        scheduler = FetchScheduler(db, umans_key="key", interval_seconds=300)
+        scheduler = FetchScheduler(db, interval_seconds=300)
         r1 = _make_reading(
-            provider=Provider.UMANS, session_percent=None, weekly_percent=None,
+            provider=Provider.OLLAMA, session_percent=None, weekly_percent=None,
             session_resets_at=None, weekly_resets_at=None, detail="req 10 tok 1M",
         )
-        scheduler._fetch_one(Provider.UMANS, MagicMock(return_value=r1))
-        scheduler._fetch_one(Provider.UMANS, MagicMock(return_value=r1))
-        assert _interval(scheduler, Provider.UMANS) == 600
+        scheduler._fetch_one(Provider.OLLAMA, MagicMock(return_value=r1))
+        scheduler._fetch_one(Provider.OLLAMA, MagicMock(return_value=r1))
+        assert _interval(scheduler, Provider.OLLAMA) == 600
 
         r2 = _make_reading(
-            provider=Provider.UMANS, session_percent=None, weekly_percent=None,
+            provider=Provider.OLLAMA, session_percent=None, weekly_percent=None,
             session_resets_at=None, weekly_resets_at=None, detail="req 11 tok 1.2M",
         )
-        scheduler._fetch_one(Provider.UMANS, MagicMock(return_value=r2))
-        assert _interval(scheduler, Provider.UMANS) == 300
+        scheduler._fetch_one(Provider.OLLAMA, MagicMock(return_value=r2))
+        assert _interval(scheduler, Provider.OLLAMA) == 300
 
     def test_boxed_reading_stays_at_floor(self, tmp_path):
         # An unchanged reading normally lets the idle ladder widen the gap, but a
@@ -520,17 +571,17 @@ class TestIdleLadder:
         # clearing is caught on the next scan.
         db = Database(str(tmp_path / "sched.db"))
         db.initialize()
-        scheduler = FetchScheduler(db, umans_key="key", interval_seconds=300)
+        scheduler = FetchScheduler(db, interval_seconds=300)
         boxed = _make_reading(
-            provider=Provider.UMANS, session_percent=None, weekly_percent=None,
+            provider=Provider.OLLAMA, session_percent=None, weekly_percent=None,
             session_resets_at=datetime(2026, 1, 14, 17, 0, 0), weekly_resets_at=None,
             detail="req 10 tok 1M", throttle=THROTTLE_BOXED,
         )
         # Identical boxed reading three scans running — would widen to 900 if the
         # idle ladder applied; instead it stays pinned at the 300s floor.
         for _ in range(3):
-            scheduler._fetch_one(Provider.UMANS, MagicMock(return_value=boxed))
-        assert _interval(scheduler, Provider.UMANS) == 300
+            scheduler._fetch_one(Provider.OLLAMA, MagicMock(return_value=boxed))
+        assert _interval(scheduler, Provider.OLLAMA) == 300
 
     def test_low_interactivity_reading_stays_at_floor(self, tmp_path):
         # Same rationale as boxed: an idle account in low-interactivity mode
@@ -538,35 +589,35 @@ class TestIdleLadder:
         # promptly.
         db = Database(str(tmp_path / "sched.db"))
         db.initialize()
-        scheduler = FetchScheduler(db, umans_key="key", interval_seconds=300)
+        scheduler = FetchScheduler(db, interval_seconds=300)
         low_interactivity = _make_reading(
-            provider=Provider.UMANS, session_percent=None, weekly_percent=None,
+            provider=Provider.OLLAMA, session_percent=None, weekly_percent=None,
             session_resets_at=datetime(2026, 1, 14, 17, 0, 0), weekly_resets_at=None,
             detail="24h req 10 tok 1M", throttle=THROTTLE_LOW_INTERACTIVITY,
         )
         for _ in range(3):
             scheduler._fetch_one(
-                Provider.UMANS, MagicMock(return_value=low_interactivity)
+                Provider.OLLAMA, MagicMock(return_value=low_interactivity)
             )
-        assert _interval(scheduler, Provider.UMANS) == 300
+        assert _interval(scheduler, Provider.OLLAMA) == 300
 
     def test_throttle_change_snaps_back_to_floor(self, tmp_path):
         # A throttle flip with otherwise-identical fields is a real state
         # change and must reset the idle ladder.
         db = Database(str(tmp_path / "sched.db"))
         db.initialize()
-        scheduler = FetchScheduler(db, umans_key="key", interval_seconds=300)
+        scheduler = FetchScheduler(db, interval_seconds=300)
         base = dict(
-            provider=Provider.UMANS, session_percent=None, weekly_percent=None,
+            provider=Provider.OLLAMA, session_percent=None, weekly_percent=None,
             session_resets_at=None, weekly_resets_at=None, detail="24h req 10 tok 1M",
         )
         normal = _make_reading(**base, throttle=THROTTLE_NONE)
         for _ in range(3):
-            scheduler._fetch_one(Provider.UMANS, MagicMock(return_value=normal))
-        assert _interval(scheduler, Provider.UMANS) > 300
+            scheduler._fetch_one(Provider.OLLAMA, MagicMock(return_value=normal))
+        assert _interval(scheduler, Provider.OLLAMA) > 300
         low = _make_reading(**base, throttle=THROTTLE_LOW)
-        scheduler._fetch_one(Provider.UMANS, MagicMock(return_value=low))
-        assert _interval(scheduler, Provider.UMANS) == 300
+        scheduler._fetch_one(Provider.OLLAMA, MagicMock(return_value=low))
+        assert _interval(scheduler, Provider.OLLAMA) == 300
 
 
 class TestExponentialFailureBackoff:
@@ -654,7 +705,6 @@ class TestConfiguredProviders:
         db.initialize()
         scheduler = FetchScheduler(
             db,
-            umans_key="u",
             claude_token="c",
             claude_work_token="cw",
             zai_key="z",

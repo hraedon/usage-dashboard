@@ -8,16 +8,11 @@ from usage_dashboard.client.layout import (
     build_detail_layout,
     build_main_layout,
     hit_test,
+    refresh_hit_test,
     rotate_touch_norm,
     tap_transition,
 )
 from usage_dashboard.shared.models import (
-    ALERT_CRIT,
-    ALERT_WARN,
-    THROTTLE_BOXED,
-    THROTTLE_LOW,
-    THROTTLE_LOW_INTERACTIVITY,
-    THROTTLE_RATE_LIMITED,
     ModelUsage,
     Provider,
     Reading,
@@ -44,28 +39,23 @@ def _reading(provider: Provider, **over: object) -> Reading:
     return Reading(**base)  # type: ignore[arg-type]
 
 
-def _all_four() -> list[Reading]:
+def _all_configured() -> list[Reading]:
     return [
         _reading(Provider.CLAUDE),
         _reading(Provider.ZAI),
         _reading(Provider.OLLAMA),
-        _reading(
-            Provider.UMANS, session_percent=None, weekly_percent=None,
-            session_resets_at=None, weekly_resets_at=None, detail="req 5 tok 1M",
-        ),
     ]
 
 
 class TestMainLayout:
     def test_tile_per_provider_in_fixed_order(self) -> None:
-        # umans is quota-less: it goes to the footer, not a tile.
-        layout = build_main_layout(_all_four(), _SIZE, now=_NOW)
+        layout = build_main_layout(_all_configured(), _SIZE, now=_NOW)
         assert [t.provider for t in layout.tiles] == [
             Provider.CLAUDE, Provider.ZAI, Provider.OLLAMA,
         ]
 
     def test_zai_ollama_share_a_row_claude_full_width(self) -> None:
-        layout = build_main_layout(_all_four(), _SIZE, now=_NOW)
+        layout = build_main_layout(_all_configured(), _SIZE, now=_NOW)
         by = {t.provider: t for t in layout.tiles}
         claude, zai, ollama = by[Provider.CLAUDE], by[Provider.ZAI], by[Provider.OLLAMA]
         # Claude spans a full-width row above the pair.
@@ -77,7 +67,7 @@ class TestMainLayout:
         assert zai.rect.x + zai.rect.w <= ollama.rect.x
 
     def test_codex_after_claude_full_width(self) -> None:
-        readings = _all_four() + [_reading(Provider.CODEX)]
+        readings = _all_configured() + [_reading(Provider.CODEX)]
         layout = build_main_layout(readings, _SIZE, now=_NOW)
         order = [t.provider for t in layout.tiles]
         assert order == [
@@ -123,7 +113,7 @@ class TestMainLayout:
         )
 
     def test_tiles_within_bounds_and_nonoverlapping(self) -> None:
-        layout = build_main_layout(_all_four(), _SIZE, now=_NOW)
+        layout = build_main_layout(_all_configured(), _SIZE, now=_NOW)
         w, h = _SIZE
         rects = [t.rect for t in layout.tiles]
         for r in rects:
@@ -137,7 +127,7 @@ class TestMainLayout:
                 assert not (overlap_x and overlap_y)
 
     def test_bars_have_fraction_and_color(self) -> None:
-        layout = build_main_layout(_all_four(), _SIZE, now=_NOW)
+        layout = build_main_layout(_all_configured(), _SIZE, now=_NOW)
         claude = layout.tiles[0]
         session, weekly = claude.bars
         assert session.fraction == 0.5
@@ -152,7 +142,7 @@ class TestMainLayout:
         assert layout.tiles[0].compact is False
 
     def test_paired_tiles_use_compact_labels(self) -> None:
-        layout = build_main_layout(_all_four(), _SIZE, now=_NOW)
+        layout = build_main_layout(_all_configured(), _SIZE, now=_NOW)
         by = {t.provider: t for t in layout.tiles}
         assert [b.label for b in by[Provider.ZAI].bars] == ["S", "W"]
         assert [b.label for b in by[Provider.OLLAMA].bars] == ["S", "W"]
@@ -226,127 +216,58 @@ class TestMainLayout:
         assert "Session" not in labels
         assert "Weekly" in labels
 
-    def test_quotaless_provider_in_footer_not_a_tile(self) -> None:
-        layout = build_main_layout(_all_four(), _SIZE, now=_NOW)
-        assert Provider.UMANS not in [t.provider for t in layout.tiles]
-        assert layout.footer_note == "UMANS req 5 tok 1M"
-
-    def test_footer_default_color_when_not_throttled(self) -> None:
-        layout = build_main_layout(_all_four(), _SIZE, now=_NOW)
-        assert layout.footer_color == fmt.TEXT
-
-    def _umans_with_throttle(self, throttle: str) -> list[Reading]:
-        readings = _all_four()
-        readings[-1] = _reading(
-            Provider.UMANS, session_percent=None, weekly_percent=None,
-            session_resets_at=None, weekly_resets_at=None, detail="req 5 tok 1M",
-            throttle=throttle,
-        )
-        return readings
-
-    def test_footer_yellow_when_umans_low_priority(self) -> None:
-        layout = build_main_layout(self._umans_with_throttle(THROTTLE_LOW), _SIZE, now=_NOW)
-        assert layout.footer_color == fmt.YELLOW
-        # Low priority still shows the normal req/tok metrics.
-        assert layout.footer_note == "UMANS req 5 tok 1M"
-
-    def test_footer_orange_when_umans_rate_limited(self) -> None:
-        # Deprioritization window: still serving, so orange (not red) with a
-        # countdown to the window end.
-        readings = _all_four()
-        readings[-1] = _reading(
-            Provider.UMANS, session_percent=None, weekly_percent=None,
-            session_resets_at=_NOW + timedelta(hours=4, minutes=30),
-            weekly_resets_at=None, detail="req 5 tok 1M",
-            throttle=THROTTLE_RATE_LIMITED,
-        )
-        layout = build_main_layout(readings, _SIZE, now=_NOW)
-        assert layout.footer_color == fmt.ORANGE
-        assert layout.footer_note == "UMANS rate-limited 4h 30m"
-
-    def test_footer_blue_countdown_when_low_interactivity(self) -> None:
-        # Heavy-day queueing: blue (matching umans' own banner) with an h/m
-        # countdown to interactive-again in the metrics' spot.
-        readings = _all_four()
-        readings[-1] = _reading(
-            Provider.UMANS, session_percent=None, weekly_percent=None,
-            session_resets_at=_NOW + timedelta(hours=2, minutes=14),
-            weekly_resets_at=None, detail="24h req 5 tok 1M",
-            throttle=THROTTLE_LOW_INTERACTIVITY,
-        )
-        layout = build_main_layout(readings, _SIZE, now=_NOW)
-        assert layout.footer_color == fmt.BLUE
-        assert layout.footer_note == "UMANS low-interactivity 2h 14m"
-        assert "req" not in layout.footer_note
-
-    def test_footer_alert_warn_colors_metrics_orange(self) -> None:
-        readings = _all_four()
-        readings[-1] = _reading(
-            Provider.UMANS, session_percent=None, weekly_percent=None,
-            session_resets_at=None, weekly_resets_at=None,
-            detail="24h req 5 tok 260M", alert=ALERT_WARN,
-        )
-        layout = build_main_layout(readings, _SIZE, now=_NOW)
-        # Alert colours the line but keeps the metrics visible.
-        assert layout.footer_note == "UMANS 24h req 5 tok 260M"
+    def test_footer_shows_qwen_offpeak_when_window_open(self) -> None:
+        # _NOW = 2026-01-10 12:00 UTC = Sat 20:00 UTC+8 -> inside Qwen's peak
+        # (22:00–08:00 is the off-peak window), so the tag reads "peak".
+        layout = build_main_layout(_all_configured(), _SIZE, now=_NOW)
+        assert layout.footer_note == "QWEN peak"
         assert layout.footer_color == fmt.ORANGE
 
-    def test_footer_alert_crit_colors_metrics_red(self) -> None:
-        readings = _all_four()
-        readings[-1] = _reading(
-            Provider.UMANS, session_percent=None, weekly_percent=None,
-            session_resets_at=None, weekly_resets_at=None,
-            detail="24h req 5 tok 400M", alert=ALERT_CRIT,
-        )
-        layout = build_main_layout(readings, _SIZE, now=_NOW)
-        assert layout.footer_color == fmt.RED
+    def test_footer_shows_qwen_offpeak_when_window_closed(self) -> None:
+        # 2026-01-10 16:00 UTC = Sat 00:00 UTC+8 -> inside the off-peak window.
+        offpeak = datetime(2026, 1, 10, 16, 0, 0, tzinfo=timezone.utc)
+        layout = build_main_layout(_all_configured(), _SIZE, now=offpeak)
+        assert layout.footer_note == "QWEN off-peak"
+        assert layout.footer_color == fmt.GREEN
 
-    def test_footer_throttle_outranks_alert(self) -> None:
-        # A throttle state is the provider's own signal; the advisory volume
-        # alert must not repaint it.
-        readings = _all_four()
-        readings[-1] = _reading(
-            Provider.UMANS, session_percent=None, weekly_percent=None,
-            session_resets_at=_NOW + timedelta(hours=3),
-            weekly_resets_at=None, detail="24h req 5 tok 400M",
-            throttle=THROTTLE_LOW_INTERACTIVITY, alert=ALERT_CRIT,
-        )
-        layout = build_main_layout(readings, _SIZE, now=_NOW)
-        assert layout.footer_color == fmt.BLUE
+    def test_zai_title_green_offpeak(self) -> None:
+        # Sat 2026-01-10 (weekend): never peak -> title tints green.
+        layout = build_main_layout(_all_configured(), _SIZE, now=_NOW)
+        by = {t.provider: t for t in layout.tiles}
+        assert by[Provider.ZAI].title_color == fmt.GREEN
 
-    def test_footer_boxed_shows_countdown_not_metrics(self) -> None:
-        readings = _all_four()
-        readings[-1] = _reading(
-            Provider.UMANS, session_percent=None, weekly_percent=None,
-            session_resets_at=_NOW + timedelta(hours=4, minutes=30),
-            weekly_resets_at=None, detail="req 5 tok 1M",
-            throttle=THROTTLE_BOXED,
-        )
-        layout = build_main_layout(readings, _SIZE, now=_NOW)
-        assert layout.footer_color == fmt.RED
-        # The req/tok metrics are replaced by a countdown to the box clearing.
-        assert layout.footer_note == "UMANS boxed 4h 30m"
-        assert "req" not in layout.footer_note
+    def test_zai_title_orange_at_peak_boundary(self) -> None:
+        # Mon 2026-01-12 07:00 UTC = Mon 15:00 UTC+8 -> inside peak hours.
+        monday_peak = datetime(2026, 1, 12, 7, 0, 0, tzinfo=timezone.utc)
+        layout = build_main_layout(_all_configured(), _SIZE, now=monday_peak)
+        by = {t.provider: t for t in layout.tiles}
+        assert by[Provider.ZAI].title_color == fmt.ORANGE
+
+    def test_other_tiles_keep_white_title(self) -> None:
+        layout = build_main_layout(_all_configured(), _SIZE, now=_NOW)
+        by = {t.provider: t for t in layout.tiles}
+        assert by[Provider.CLAUDE].title_color == fmt.TEXT
+        assert by[Provider.OLLAMA].title_color == fmt.TEXT
 
     def test_accent_is_worst_bar_color(self) -> None:
-        layout = build_main_layout(_all_four(), _SIZE, now=_NOW)
+        layout = build_main_layout(_all_configured(), _SIZE, now=_NOW)
         # Claude has a 90% weekly bar -> red accent.
         assert layout.tiles[0].accent == fmt.RED
 
     def test_status_text_mentions_count(self) -> None:
-        layout = build_main_layout(_all_four(), _SIZE, now=_NOW)
-        assert "4 providers" in layout.status_text
+        layout = build_main_layout(_all_configured(), _SIZE, now=_NOW)
+        assert "3 providers" in layout.status_text
 
     def test_status_text_shows_refresh_interval(self) -> None:
-        layout = build_main_layout(_all_four(), _SIZE, now=_NOW, refresh_interval=300)
+        layout = build_main_layout(_all_configured(), _SIZE, now=_NOW, refresh_interval=300)
         assert "refresh 5m" in layout.status_text
 
     def test_status_text_omits_refresh_when_none(self) -> None:
-        layout = build_main_layout(_all_four(), _SIZE, now=_NOW)
+        layout = build_main_layout(_all_configured(), _SIZE, now=_NOW)
         assert "refresh" not in layout.status_text
 
     def test_status_text_not_utc(self) -> None:
-        layout = build_main_layout(_all_four(), _SIZE, now=_NOW)
+        layout = build_main_layout(_all_configured(), _SIZE, now=_NOW)
         assert "UTC" not in layout.status_text
 
     def test_empty_readings_safe(self) -> None:
@@ -362,7 +283,7 @@ class TestMainLayout:
         assert layout.tiles[0].title == "CLAUDE [stale]"
 
     def test_portrait_resolution_in_bounds(self) -> None:
-        layout = build_main_layout(_all_four(), (720, 1280), now=_NOW)
+        layout = build_main_layout(_all_configured(), (720, 1280), now=_NOW)
         for t in layout.tiles:
             assert t.rect.x + t.rect.w <= 720
             assert t.rect.y + t.rect.h <= 1280
@@ -370,31 +291,75 @@ class TestMainLayout:
 
 class TestHitTest:
     def test_tap_inside_tile_returns_provider(self) -> None:
-        layout = build_main_layout(_all_four(), _SIZE, now=_NOW)
+        layout = build_main_layout(_all_configured(), _SIZE, now=_NOW)
         r = layout.tiles[2].rect
         assert hit_test(layout, (r.x + r.w // 2, r.y + r.h // 2)) is Provider.OLLAMA
 
     def test_tap_in_status_bar_returns_none(self) -> None:
-        layout = build_main_layout(_all_four(), _SIZE, now=_NOW)
+        layout = build_main_layout(_all_configured(), _SIZE, now=_NOW)
         sr = layout.status_rect
         assert hit_test(layout, (sr.x + 5, sr.y + 5)) is None
 
 
+class TestRefreshButton:
+    """On-demand refresh button (WI-012): a tap target at the right edge of
+    the status bar, checked before the status-bar overlay."""
+
+    def test_refresh_button_inside_status_bar(self) -> None:
+        layout = build_main_layout(_all_configured(), _SIZE, now=_NOW)
+        assert layout.refresh_rect is not None
+        sr = layout.status_rect
+        r = layout.refresh_rect
+        assert sr.contains(r.x, r.y)
+        assert sr.contains(r.x + r.w - 1, r.y + r.h - 1)
+
+    def test_refresh_button_anchored_to_right_edge(self) -> None:
+        layout = build_main_layout(_all_configured(), _SIZE, now=_NOW)
+        r = layout.refresh_rect
+        assert r is not None
+        # Button's right edge sits inside the status bar's right edge, leaving
+        # the footer note (drawn just left of it) room.
+        assert r.x + r.w <= layout.status_rect.x + layout.status_rect.w
+        assert r.w == r.h  # a square finger target
+
+    def test_refresh_hit_test_inside(self) -> None:
+        layout = build_main_layout(_all_configured(), _SIZE, now=_NOW)
+        r = layout.refresh_rect
+        assert r is not None
+        assert refresh_hit_test(layout, (r.x + r.w // 2, r.y + r.h // 2)) is True
+
+    def test_refresh_hit_test_outside(self) -> None:
+        layout = build_main_layout(_all_configured(), _SIZE, now=_NOW)
+        # Top-left corner (over tiles) and the left end of the status bar
+        # (status text) are not the button.
+        assert refresh_hit_test(layout, (5, 5)) is False
+        sr = layout.status_rect
+        assert refresh_hit_test(layout, (sr.x + 5, sr.y + 5)) is False
+
+    def test_refresh_pending_flag_propagates(self) -> None:
+        layout = build_main_layout(
+            _all_configured(), _SIZE, now=_NOW, refresh_pending=True,
+        )
+        assert layout.refresh_pending is True
+        idle = build_main_layout(_all_configured(), _SIZE, now=_NOW)
+        assert idle.refresh_pending is False
+
+
 class TestViewTransitions:
     def test_tap_tile_opens_detail(self) -> None:
-        layout = build_main_layout(_all_four(), _SIZE, now=_NOW)
+        layout = build_main_layout(_all_configured(), _SIZE, now=_NOW)
         r = layout.tiles[0].rect
         state = tap_transition(ViewState(), layout, (r.x + 5, r.y + 5))
         assert state.detail_provider is Provider.CLAUDE
 
     def test_tap_outside_tile_stays_on_grid(self) -> None:
-        layout = build_main_layout(_all_four(), _SIZE, now=_NOW)
+        layout = build_main_layout(_all_configured(), _SIZE, now=_NOW)
         sr = layout.status_rect
         state = tap_transition(ViewState(), layout, (sr.x + 1, sr.y + 1))
         assert state.detail_provider is None
 
     def test_tap_in_detail_returns_to_grid(self) -> None:
-        layout = build_main_layout(_all_four(), _SIZE, now=_NOW)
+        layout = build_main_layout(_all_configured(), _SIZE, now=_NOW)
         state = ViewState(detail_provider=Provider.ZAI)
         assert tap_transition(state, layout, (0, 0)).detail_provider is None
 
@@ -409,11 +374,12 @@ class TestDetailLayout:
         assert "Fetched" in labels
 
     def test_quotaless_provider_shows_detail_line(self) -> None:
-        umans = _reading(
-            Provider.UMANS, session_percent=None, weekly_percent=None,
+        # A quota-less reading (no percentages) renders its detail text line.
+        zai = _reading(
+            Provider.ZAI, session_percent=None, weekly_percent=None,
             session_resets_at=None, weekly_resets_at=None, detail="req 9 tok 2M",
         )
-        detail = build_detail_layout(umans, now=_NOW)
+        detail = build_detail_layout(zai, now=_NOW)
         values = [line.value for line in detail.lines]
         assert "req 9 tok 2M" in values
 
@@ -503,7 +469,7 @@ class TestRotateTouchNorm:
         # must hit-test to CLAUDE once its portrait-frame touch is rotated.
         size = (1280, 720)
         readings = [_reading(p) for p in (
-            Provider.CLAUDE, Provider.ZAI, Provider.OLLAMA, Provider.UMANS
+            Provider.CLAUDE, Provider.ZAI, Provider.OLLAMA
         )]
         layout = build_main_layout(readings, size)
         claude = next(t for t in layout.tiles if t.provider is Provider.CLAUDE)

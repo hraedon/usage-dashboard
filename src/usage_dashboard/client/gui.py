@@ -14,6 +14,7 @@ import logging
 import os
 import signal
 import sys
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -42,6 +43,7 @@ from usage_dashboard.client.layout import (
     build_detail_layout,
     build_main_layout,
     build_status_overlay,
+    refresh_hit_test,
     rotate_touch_norm,
     tap_transition,
 )
@@ -53,6 +55,11 @@ logger = logging.getLogger(__name__)
 _TILE_BG = (17, 17, 17)
 _OVERLAY_BG = (28, 28, 28)
 _BTN_BG = (45, 45, 45)
+# A refresh POST is in flight: fill the button so the user sees the tap landed.
+_REFRESH_PENDING_BG = (92, 72, 10)
+# Circular-arrow glyph for the refresh button; ASCII fallback if the default
+# font lacks it (mirrors the ASCII-only convention of the brightness buttons).
+_REFRESH_GLYPH = "\u27f3"  # ⟳
 
 
 def _env_int(name: str, default: int) -> int:
@@ -163,6 +170,12 @@ class DashboardGui:
         self._server_url = server_url
         self._status_dir = status_dir
         self._diag: diag.Diagnostics | None = None
+        # On-demand refresh (WI-012): a tap on the status-bar refresh button
+        # POSTs /refresh in a background thread; the button stays highlighted
+        # while it's in flight so the tap reads as acknowledged.
+        self._refresh_pending = False
+        self._refresh_feedback = ""
+        self._refresh_thread: threading.Thread | None = None
         # While dark we tick slowly to save CPU but still pump touch events.
         self._sleep_fps = 4
         # Fonts scaled to the panel so the same code reads on any resolution.
@@ -235,6 +248,33 @@ class DashboardGui:
         if self._brightness_state_file is not None:
             save_level(self._brightness_state_file, level)
 
+    # -- on-demand refresh (WI-012) ------------------------------------------
+
+    def _start_refresh(self) -> None:
+        """POST /refresh and show feedback while the server collects.
+
+        Runs in a background thread so the draw loop isn't blocked for the
+        (up to tens of seconds) it can take to fetch every provider; the
+        button stays highlighted via ``_refresh_pending`` until it returns.
+        """
+        if self._refresh_pending:
+            return  # a refresh is already in flight
+        self._refresh_pending = True
+        self._refresh_feedback = "refreshing\u2026"
+        self._refresh_thread = threading.Thread(target=self._run_refresh, daemon=True)
+        self._refresh_thread.start()
+
+    def _run_refresh(self) -> None:
+        try:
+            request = getattr(self._fetcher, "request_refresh", None)
+            ok = request() if callable(request) else False
+            self._refresh_feedback = "refreshed" if ok else "refresh failed"
+        except Exception as exc:  # never let a refresh crash the thread
+            logger.warning("Refresh failed: %s", exc)
+            self._refresh_feedback = "refresh failed"
+        finally:
+            self._refresh_pending = False
+
     def _handle_overlay_tap(self, pos: tuple[int, int]) -> None:
         """Route a tap while the status overlay is open: the right-column
         ``−``/``+`` nudge brightness; a tap outside the card closes it; taps on
@@ -299,6 +339,14 @@ class DashboardGui:
                     continue
                 if (
                     self._state.detail_provider is None
+                    and refresh_hit_test(layout, pos)
+                ):
+                    # On-demand refresh button (WI-012): POST /refresh and show
+                    # feedback while the server collects fresh readings.
+                    self._start_refresh()
+                    continue
+                if (
+                    self._state.detail_provider is None
                     and layout.status_rect.contains(*pos)
                 ):
                     # Single tap on the "Updated…" line opens the status overlay.
@@ -341,6 +389,7 @@ class DashboardGui:
                 readings, (self._width, self._height),
                 refresh_interval=self._fetcher.current_interval,
                 tile_overhead=self._tile_overhead,
+                refresh_pending=self._refresh_pending,
             )
             # While dark, a tap wakes (sets _wake_until) instead of navigating.
             self._handle_events(layout, swallow_wake=dark, now=now)
@@ -399,14 +448,39 @@ class DashboardGui:
         sr = layout.status_rect
         status = self._font_small.render(layout.status_text, True, fmt.GRAY)
         self._screen.blit(status, (sr.x + 8, sr.y + (sr.h - status.get_height()) // 2))
-        # Quota-less umans summary sits in the status bar, next to the timer.
+        # Off-peak status tag (QWEN) sits in the status bar, next to the timer.
+        # With an on-demand refresh button at the right edge, the tag moves
+        # left of it so the two never overlap.
         if layout.footer_note:
             note = self._font_title.render(layout.footer_note, True, layout.footer_color)
+            if layout.refresh_rect is not None:
+                note_x = layout.refresh_rect.x - note.get_width() - 12
+            else:
+                note_x = sr.x + sr.w - note.get_width() - 12
             self._screen.blit(
                 note,
-                (sr.x + sr.w - note.get_width() - 12,
-                 sr.y + (sr.h - note.get_height()) // 2),
+                (note_x, sr.y + (sr.h - note.get_height()) // 2),
             )
+        if layout.refresh_rect is not None:
+            self._draw_refresh_button(layout.refresh_rect, layout.refresh_pending)
+
+    def _draw_refresh_button(self, rect: Rect, pending: bool) -> None:
+        """The status-bar on-demand refresh tap target: a rounded square with a
+        circular-arrow glyph, highlighted (and the glyph tinted) while a
+        refresh POST is in flight so the tap reads as acknowledged."""
+        br = pygame.Rect(rect.x, rect.y, rect.w, rect.h)
+        if pending:
+            pygame.draw.rect(self._screen, _REFRESH_PENDING_BG, br, border_radius=8)
+            pygame.draw.rect(self._screen, fmt.YELLOW, br, width=2, border_radius=8)
+        else:
+            pygame.draw.rect(self._screen, _BTN_BG, br, border_radius=8)
+            pygame.draw.rect(self._screen, fmt.GRAY, br, width=2, border_radius=8)
+        glyph = self._font_big.render(_REFRESH_GLYPH, True, fmt.TEXT)
+        self._screen.blit(
+            glyph,
+            (rect.x + (rect.w - glyph.get_width()) // 2,
+             rect.y + (rect.h - glyph.get_height()) // 2),
+        )
 
     def _draw_tile(self, tile: TileSpec, label_col_w: int) -> None:
         r = tile.rect
@@ -417,7 +491,7 @@ class DashboardGui:
         # Consistent padding across all tiles (screen-derived, not per-tile
         # height) so 2-bar and 3-bar tiles have identical spacing.
         pad = self._tile_pad
-        title_surf = self._font_title.render(tile.title, True, fmt.TEXT)
+        title_surf = self._font_title.render(tile.title, True, tile.title_color)
         self._screen.blit(title_surf, (r.x + pad, r.y + pad))
         if tile.subtitle:
             sub_surf = self._font_small.render(tile.subtitle, True, fmt.GRAY)
