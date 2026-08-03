@@ -257,6 +257,15 @@ class Database:
             self._conn.commit()
 
     def get_latest_readings(self) -> dict[Provider, Reading]:
+        """Latest reading per provider; unreadable rows are skipped.
+
+        Same corrupt-row tolerance as get_readings_since, and it matters more
+        here: this runs on the scheduler's fetch path, which is an unsupervised
+        thread — one raising row killed the loop outright and froze every
+        provider. Retiring a provider is the ordinary way to get such a row
+        (its historical readings outlive the Provider member), so a row this
+        build can't parse must never be fatal.
+        """
         with self._lock:
             cursor = self._conn.execute(
                 """
@@ -269,7 +278,16 @@ class Database:
 
         result: dict[Provider, Reading] = {}
         for row in rows:
-            reading = Reading.from_dict(_reading_dict_from_row(row))
+            try:
+                reading = Reading.from_dict(_reading_dict_from_row(row))
+            except (ValueError, TypeError, KeyError) as exc:
+                logger.warning(
+                    "skipping unreadable readings row id=%s: %s: %s",
+                    row["id"] if "id" in row.keys() else "?",
+                    type(exc).__name__,
+                    exc,
+                )
+                continue
             result[reading.provider] = reading
         return result
 

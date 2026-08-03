@@ -520,3 +520,49 @@ class TestGetReadingsSince:
         result = db.get_readings_since(Provider.CLAUDE, now - timedelta(hours=24))
         assert len(result) == 1
         assert result[0].session_percent == 50.0
+
+
+class TestGetLatestReadingsResilience:
+    """get_latest_readings runs on the scheduler's unsupervised fetch thread, so
+    a row it can't parse must be skipped rather than raised."""
+
+    def test_retired_provider_row_is_skipped(self, tmp_path):
+        # Retiring a provider leaves its historical rows behind with a value no
+        # longer in the Provider enum. This froze the live server: the raise
+        # propagated out of the scheduler loop and killed the thread, so every
+        # provider stopped updating.
+        db = Database(str(tmp_path / "test.db"))
+        db.initialize()
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        db.store_reading(_make_reading(session_percent=50.0, fetched_at=now))
+        with db._lock:
+            db._conn.execute(
+                "INSERT INTO readings"
+                " (provider, status, fetched_at, stale, throttle, alert)"
+                " VALUES ('umans', 'current', ?, 0, 'none', 'none')",
+                (now.isoformat(),),
+            )
+            db._conn.commit()
+
+        result = db.get_latest_readings()
+
+        assert set(result) == {Provider.CLAUDE}
+        assert result[Provider.CLAUDE].session_percent == 50.0
+
+    def test_corrupt_row_is_skipped(self, tmp_path):
+        db = Database(str(tmp_path / "test.db"))
+        db.initialize()
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        db.store_reading(_make_reading(session_percent=50.0, fetched_at=now))
+        with db._lock:
+            db._conn.execute(
+                "INSERT INTO readings"
+                " (provider, status, fetched_at, stale, models, throttle, alert)"
+                " VALUES ('zai', 'current', ?, 0, '{not-json', 'none', 'none')",
+                (now.isoformat(),),
+            )
+            db._conn.commit()
+
+        result = db.get_latest_readings()
+
+        assert set(result) == {Provider.CLAUDE}
