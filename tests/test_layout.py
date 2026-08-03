@@ -574,3 +574,32 @@ def test_detail_line_is_coloured_by_the_volume_alert():
     assert detail_colour("none") == fmt.TEXT
     assert detail_colour("warn") == fmt.ORANGE
     assert detail_colour("crit") == fmt.RED
+
+
+def test_zai_subtitle_matches_the_title_colour():
+    # The z.ai subtitle is the peak-window countdown — the same signal as the
+    # title tint — so it tracks the title rather than reading as neutral grey.
+    from usage_dashboard.client import format as fmt
+
+    def zai_tile(now):
+        layout = build_main_layout(_all_configured(), (1280, 720), now=now)
+        return next(t for t in layout.tiles if t.provider is Provider.ZAI)
+
+    # 2026-08-03 is a Monday. Peak = Mon-Fri 14:00-18:00 UTC+8 == 06:00-10:00 UTC.
+    in_peak = zai_tile(datetime(2026, 8, 3, 7, 0))
+    off_peak = zai_tile(datetime(2026, 8, 3, 12, 0))
+
+    assert in_peak.title_color == fmt.ORANGE
+    assert in_peak.subtitle_color == in_peak.title_color
+    assert off_peak.title_color == fmt.GREEN
+    assert off_peak.subtitle_color == off_peak.title_color
+
+
+def test_non_zai_subtitle_stays_neutral():
+    # Ollama's subtitle is a model breakdown, not a peak signal.
+    from usage_dashboard.client import format as fmt
+
+    layout = build_main_layout(_all_configured(), (1280, 720), now=_NOW)
+    for tile in layout.tiles:
+        if tile.provider is not Provider.ZAI:
+            assert tile.subtitle_color == fmt.GRAY
