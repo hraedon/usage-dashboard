@@ -550,3 +550,27 @@ class TestClaudeWorkAccount:
         assert "— work —" in labels
         # Session appears twice: once per account.
         assert labels.count("Session") == 2
+
+
+def test_detail_line_is_coloured_by_the_volume_alert():
+    # `alert` had no renderer on the Pi after umans was retired, so z.ai's
+    # warn/crit tiers were computed and discarded. The detail view carries the
+    # number, so it carries the cue.
+    from usage_dashboard.client import format as fmt
+
+    def detail_colour(alert):
+        r = Reading(
+            provider=Provider.ZAI, status=ReadingStatus.CURRENT,
+            session_percent=5.0, weekly_percent=93.0,
+            session_resets_at=None, weekly_resets_at=None,
+            fetched_at=_NOW, stale=False,
+            detail="week req 2273  tok 283.8M", alert=alert,
+        )
+        line = next(
+            ln for ln in build_detail_layout(r, _NOW).lines if ln.label == "Detail"
+        )
+        return line.color
+
+    assert detail_colour("none") == fmt.TEXT
+    assert detail_colour("warn") == fmt.ORANGE
+    assert detail_colour("crit") == fmt.RED

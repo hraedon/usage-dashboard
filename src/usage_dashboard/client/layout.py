@@ -14,6 +14,8 @@ from datetime import datetime
 
 from usage_dashboard.client import format as fmt
 from usage_dashboard.shared.models import (
+    ALERT_CRIT,
+    ALERT_WARN,
     ModelUsage,
     Provider,
     Reading,
@@ -568,7 +570,16 @@ def _detail_lines(reading: Reading, now: datetime | None) -> list[DetailLine]:
         if sl_reset:
             lines.append(DetailLine("  resets in", sl_reset, fmt.GRAY))
     if reading.detail:
-        lines.append(DetailLine("Detail", reading.detail, fmt.TEXT))
+        # Colour by the volume alert. Since umans was retired nothing on the Pi
+        # rendered `alert` at all, so z.ai's warn/crit tiers were computed and
+        # then thrown away; the detail view is where the number lives, so it is
+        # where the "close to the wall" cue belongs.
+        detail_color = fmt.TEXT
+        if reading.alert == ALERT_CRIT:
+            detail_color = fmt.RED
+        elif reading.alert == ALERT_WARN:
+            detail_color = fmt.ORANGE
+        lines.append(DetailLine("Detail", reading.detail, detail_color))
     if reading.models:
         label = "API tools" if reading.provider is Provider.ZAI else "Models"
         lines.append(DetailLine(label, "", fmt.GRAY))
