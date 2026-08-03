@@ -23,19 +23,23 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
-# Claude Code's public OAuth client. These were confirmed against a current
-# reference (binary analysis of the Claude Code CLI), per Plan 001's warning
-# not to trust them from memory. The usage endpoint requires the user:profile
-# scope; org:create_api_key + user:inference mirror what Claude Code requests.
+# Claude Code's public OAuth client. These were confirmed against the current
+# Claude Code CLI (binary analysis of v2.1.220), per Plan 001's warning not to
+# trust them from memory. The usage endpoint requires the user:profile scope;
+# the rest of the scope string mirrors what Claude Code requests so the server
+# issues a code it will accept at exchange time.
 _CLAUDE_AUTHORIZE_URL = "https://claude.ai/oauth/authorize"
 _CLAUDE_TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
 _CLAUDE_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
-_CLAUDE_SCOPES = "org:create_api_key user:profile user:inference"
-# Manual (no-port) flow: Claude's hosted callback renders the code as
-# ``CODE#STATE`` for the operator to copy. Loopback flow uses a localhost
-# redirect and reads the code straight off the query string.
+_CLAUDE_SCOPES = "user:inference user:profile user:sessions:claude_code user:mcp_servers"
+# Claude's authorize endpoint requires the non-standard ``code=true`` flag (the
+# real CLI always sends it first). Without it the sign-in appears to complete
+# but the returned value is not a usable PKCE code, so the exchange fails with
+# an "invalid response". The token endpoint has been observed to take 40-60s
+# during platform incidents, so the exchange uses a generous timeout.
 _MANUAL_REDIRECT_URI = "https://platform.claude.com/oauth/code/callback"
-_TIMEOUT = 30.0
+_CLAUDE_TIMEOUT = 120.0
+_TIMEOUT = 30.0  # codex login exchange
 
 # PKCE verifier: unreserved chars per RFC 7636 (A-Z a-z 0-9 - . _ ~)
 _VERIFIER_CHARS = string.ascii_letters + string.digits + "-._~"
@@ -51,6 +55,14 @@ def _generate_challenge(verifier: str) -> str:
     return base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
 
 
+class _TokenExchangeError(httpx.HTTPError):
+    """The token exchange failed (transport, rejection, or malformed body).
+
+    Subclasses httpx.HTTPError so the login command's existing error handling
+    keeps surfacing it as a clean "Token exchange failed: ..." message.
+    """
+
+
 def _exchange_code(
     code: str,
     verifier: str,
@@ -61,6 +73,9 @@ def _exchange_code(
 
     The redirect_uri must match the one sent to the authorize endpoint, and
     the public client_id must be included for a PKCE public-client exchange.
+    Server-side rejections (OAuth ``error`` bodies, non-JSON responses,
+    missing access_token) raise _TokenExchangeError with the server's reason
+    rather than crashing on a bare KeyError.
     """
     data = {
         "grant_type": "authorization_code",
@@ -71,16 +86,46 @@ def _exchange_code(
     }
     if state is not None:
         data["state"] = state
-    response = httpx.post(
-        _CLAUDE_TOKEN_URL,
-        data=data,
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
-        timeout=_TIMEOUT,
-    )
-    response.raise_for_status()
-    body = response.json()
-    access_token: str = body["access_token"]
-    refresh_token: str = body.get("refresh_token", "")
+    try:
+        response = httpx.post(
+            _CLAUDE_TOKEN_URL,
+            data=data,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            timeout=_CLAUDE_TIMEOUT,
+        )
+    except httpx.HTTPError as exc:
+        raise _TokenExchangeError(
+            f"token endpoint request failed: {type(exc).__name__}: {exc}"
+        ) from exc
+    try:
+        body = response.json()
+    except ValueError as exc:
+        raise _TokenExchangeError(
+            f"token endpoint returned a non-JSON body (HTTP {response.status_code})"
+        ) from exc
+    if not isinstance(body, dict):
+        raise _TokenExchangeError(
+            f"token endpoint returned an unexpected body (HTTP {response.status_code})"
+        )
+    error = body.get("error")
+    if error is not None:
+        if isinstance(error, dict):
+            error_str = str(error.get("type") or "error")
+            detail = str(error.get("message") or "")
+        else:
+            error_str = str(error)
+            detail = str(body.get("error_description") or body.get("message") or "")
+        message = f"token endpoint rejected the exchange: {error_str}"
+        if detail:
+            message += f" ({detail})"
+        raise _TokenExchangeError(message)
+    try:
+        access_token = body["access_token"]
+    except KeyError as exc:
+        raise _TokenExchangeError(
+            f"token endpoint response missing access_token (HTTP {response.status_code})"
+        ) from exc
+    refresh_token = body.get("refresh_token", "")
     return access_token, refresh_token
 
 
@@ -161,6 +206,10 @@ def login_claude(port: int | None = None, no_browser: bool = False) -> None:
     state = secrets.token_urlsafe(16)
 
     params = urlencode({
+        # Required (non-standard) flag: Claude's authorize endpoint only issues
+        # a usable PKCE authorization code when ``code=true`` is present. The
+        # real Claude Code CLI always sends it first.
+        "code": "true",
         "response_type": "code",
         "client_id": _CLAUDE_CLIENT_ID,
         "code_challenge": challenge,

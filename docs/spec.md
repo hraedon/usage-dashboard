@@ -19,13 +19,12 @@ for the planned pieces):
 
 - **umans** as a 4th provider — quota-less, rendered via `Reading.detail`, with
   a `throttle` severity (none/low/low_interactivity/rate_limited/boxed) that
-  colours its line and shows a penalty-box countdown. *(No spec/plan entry —
-  added directly.)* Extended 2026-07-16: the detail line now reports
-  trailing-24h requests+tokens from `/v1/usage/history` (fallback: current
-  window), a `Reading.alert` volume cue with env-tunable thresholds
-  (`UMANS_HISTORY_HOURS`/`UMANS_TOKENS_WARN`/`UMANS_TOKENS_CRIT`), and
-  low-interactivity mode renders blue with an interactive-again countdown.
-  *(Tracked as an agent-notes work item.)*
+  coloured its line and showed a penalty-box countdown. *(No spec/plan entry —
+  added directly.)* Extended 2026-07-16 (trailing-24h req/tok line,
+  `Reading.alert`, low-interactivity mode) — then **removed 2026-08-03**; the
+  provider is no longer in use. `Reading.throttle`/`Reading.alert` remain in
+  the schema for any future quota-less provider, and its status-bar slot is now
+  a display-only off-peak tag for the Qwen token plan.
 - **Second Claude account** (work login) — merged into the Claude tile as a
   muted second set of bars. *(No spec/plan entry.)*
 - **Dedicated Claude OAuth login** replacing the `~/.claude/.credentials.json`
@@ -57,8 +56,9 @@ autoincrement `id` and each fetch appends a row; a prune job honors
 
 > Governance note: per `AGENTS.md`, features beyond the spec are supposed to land
 > with a breadcrumb or plan entry. Several above (umans, 2nd Claude account,
-> model breakdown, web dashboard) did not — hence this reconciliation. A full
-> rewrite to a current Level-3 spec is the cleaner long-term fix if desired.
+> model breakdown, web dashboard) did not — hence this reconciliation. umans has
+> since been removed. A full rewrite to a current Level-3 spec is the cleaner
+> long-term fix if desired.
 
 ---
 

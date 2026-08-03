@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import hmac
 import html
+import math
+import threading
+import time
 from collections.abc import Callable, Iterable
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -12,12 +16,14 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from usage_dashboard.server.db import Database
 from usage_dashboard.server.schedule_config import ScheduleConfig
+from usage_dashboard.server.scheduler import FetchScheduler
 from usage_dashboard.shared.models import (
     Provider,
     Reading,
     ReadingStatus,
     make_offline_reading,
 )
+from usage_dashboard.shared.offpeak import qwen_is_offpeak, zai_is_offpeak
 
 _bearer_scheme = HTTPBearer(auto_error=False)
 
@@ -25,6 +31,11 @@ _bearer_scheme = HTTPBearer(auto_error=False)
 # (RETENTION_DAYS). Larger windows are accepted up to this cap; rows older
 # than retention simply won't exist.
 _MAX_HISTORY_HOURS = 24 * 7
+
+# Minimum gap between client-triggered refreshes (POST /refresh). The touch GUI
+# polls every 5-30m on its own; a forced refresh beyond this pace would hammer
+# the provider APIs into their own 429 limits.
+_REFRESH_MIN_INTERVAL_SECONDS = 60.0
 
 # Same thresholds as the Pi client's bar_color (client/format.py)
 _CSS_GREEN = "#22c55e"
@@ -104,14 +115,32 @@ def _render_dashboard_html(readings: list[Reading], now: datetime) -> str:
         if reading.provider == Provider.CLAUDE_WORK:
             continue
         name = html.escape(reading.provider.value.upper()) + _status_badge(reading)
-        if reading.provider == Provider.UMANS:
-            detail = html.escape(reading.detail) if reading.detail else "&mdash;"
-            body = f'<div class="detail">{detail}</div>'
-        elif reading.provider == Provider.CLAUDE and work is not None:
+        # z.ai's plan discounts off-peak use (peak = Mon–Fri 14:00–18:00
+        # Singapore time): tint the card header green off-peak / orange peak so
+        # "use it now vs wait it out" is glanceable from across the room.
+        header_style = ""
+        if reading.provider == Provider.ZAI:
+            color = _CSS_GREEN if zai_is_offpeak(now) else _CSS_ORANGE
+            header_style = f' style="color:{color}"'
+        if reading.provider == Provider.CLAUDE and work is not None:
             body = _account_rows(reading, now, "me") + _account_rows(work, now, "work")
         else:
             body = _account_rows(reading, now)
-        cards.append(f'<section class="card"><h2>{name}</h2>{body}</section>')
+            if not body and reading.detail:
+                # Quota-less provider: no percentage bars — show its detail line.
+                body = f'<div class="detail">{html.escape(reading.detail)}</div>'
+        cards.append(f'<section class="card"><h2{header_style}>{name}</h2>{body}</section>')
+
+    # Display-only QWEN tag: no data source, just whether we're inside the Qwen
+    # token plan's off-peak window (22:00–08:00 UTC+8), when credits consume
+    # much less. Replaces the retired umans card.
+    qwen_offpeak = qwen_is_offpeak(now)
+    qwen_color = _CSS_GREEN if qwen_offpeak else _CSS_ORANGE
+    qwen_label = "off-peak (22:00\u201308:00 UTC+8)" if qwen_offpeak else "peak hours"
+    cards.append(
+        f'<section class="card"><h2 style="color:{qwen_color}">QWEN</h2>'
+        f'<div class="detail" style="color:{qwen_color}">{qwen_label}</div></section>'
+    )
 
     fetched = max((r.fetched_at for r in readings), default=now)
     footer = (
@@ -182,6 +211,7 @@ def create_app(
     db: Database,
     configured_providers: Iterable[Provider] | None = None,
     schedule_config: ScheduleConfig | None = None,
+    scheduler: FetchScheduler | None = None,
 ) -> FastAPI:
     app = FastAPI()
     auth = _make_auth_dependency(api_key)
@@ -209,6 +239,39 @@ def create_app(
         _user: str = Depends(auth),
     ) -> list[dict[str, Any]]:
         return [reading.to_dict() for reading in _reported_readings()]
+
+    # On-demand refresh (WI-012): the touch GUI posts here to force an
+    # immediate collection cycle instead of waiting out the idle ladder.
+    # Rate-limit state lives in the closure so each app instance (and each
+    # test) gets an independent limiter; ``scheduler is None`` means the app
+    # was built without a scheduler (tests, or a config-only server) and the
+    # endpoint reports it as unavailable rather than crashing.
+    refresh_lock = threading.Lock()
+    refresh_last: float = -math.inf
+
+    @app.post("/refresh")
+    async def refresh(_user: str = Depends(auth)) -> dict[str, Any]:
+        if scheduler is None:
+            raise HTTPException(
+                status_code=501,
+                detail="refresh unavailable (no scheduler configured)",
+            )
+        nonlocal refresh_last
+        now = time.monotonic()
+        with refresh_lock:
+            elapsed = now - refresh_last
+            if elapsed < _REFRESH_MIN_INTERVAL_SECONDS:
+                remaining = math.ceil(_REFRESH_MIN_INTERVAL_SECONDS - elapsed)
+                raise HTTPException(
+                    status_code=429,
+                    detail=f"refresh rate-limited; retry in {remaining}s",
+                )
+            refresh_last = now
+        # Run the fetch off the event loop (it does provider network I/O) and
+        # wait for it so the client's follow-up /readings poll returns fresh
+        # data rather than a race with a background fetch.
+        await asyncio.to_thread(scheduler.fetch_now)
+        return {"status": "ok", "refreshed": True}
 
     @app.get("/history")
     async def get_history(

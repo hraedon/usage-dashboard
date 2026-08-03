@@ -156,7 +156,7 @@ def test_reading_detail_defaults_to_none():
 
 
 def test_reading_detail_round_trip():
-    reading = _make_reading(provider=Provider.UMANS, detail="pk 2/4  req 161  tok 63.9M")
+    reading = _make_reading(provider=Provider.ZAI, detail="pk 2/4  req 161  tok 63.9M")
     restored = Reading.from_dict(reading.to_dict())
     assert restored.detail == "pk 2/4  req 161  tok 63.9M"
     assert restored == reading
@@ -174,7 +174,7 @@ def test_reading_alert_defaults_to_none_level():
 
 
 def test_reading_alert_round_trip():
-    reading = _make_reading(provider=Provider.UMANS, alert=ALERT_WARN)
+    reading = _make_reading(provider=Provider.ZAI, alert=ALERT_WARN)
     restored = Reading.from_dict(reading.to_dict())
     assert restored.alert == ALERT_WARN
     assert restored == reading

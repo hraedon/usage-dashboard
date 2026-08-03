@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from typing import Any
 
 import httpx
@@ -34,6 +35,7 @@ class ClientFetcher:
         self._readings: list[Reading] = []
         self._schedule_spec: str | None = None
         self._stop_event = threading.Event()
+        self._wake_event = threading.Event()  # a refresh poke cuts the poll wait short
         self._thread: threading.Thread | None = None
         self._interval = default_interval
         self._stable_count = 0
@@ -69,8 +71,58 @@ class ClientFetcher:
 
     def _poll_loop(self) -> None:
         self._fetch_once()
-        while not self._stop_event.wait(timeout=self._interval):
+        while not self._stop_event.is_set():
+            self._wait_for_next_poll()
+            if self._stop_event.is_set():
+                break
             self._fetch_once()
+
+    def _wait_for_next_poll(self) -> None:
+        """Block until the next poll is due, a refresh poke arrives, or the
+        fetcher is stopped — whichever comes first (WI-012). A poke returns
+        early so a just-requested server refresh is followed by an immediate
+        /readings poll instead of waiting out the (possibly 5-30m) interval.
+        """
+        deadline = time.monotonic() + self._interval
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            if self._wake_event.is_set():
+                self._wake_event.clear()
+                return
+            if self._stop_event.wait(timeout=min(remaining, 0.5)):
+                return
+
+    def _poke(self) -> None:
+        """Wake the poll loop early (a refresh was just requested)."""
+        self._wake_event.set()
+
+    def request_refresh(self) -> bool:
+        """Ask the server to collect fresh readings immediately (WI-012).
+
+        POSTs to ``/refresh`` and, on success, wakes the poll loop so the
+        fresh readings are fetched right away. Returns True when the server
+        accepted the refresh (200); False on a rate limit (429), network
+        error, or any other non-success — the caller shows feedback either way.
+        """
+        try:
+            response = httpx.post(
+                f"{self._server_url}/refresh",
+                headers={"Authorization": f"Bearer {self._api_key}"},
+                timeout=60.0,
+            )
+            if response.status_code == 200:
+                self._poke()
+                return True
+            if response.status_code == 429:
+                logger.info("Refresh request rate-limited by the server")
+                return False
+            response.raise_for_status()
+            return False
+        except (httpx.HTTPError, ValueError) as exc:
+            logger.warning("Failed to request refresh: %s", exc)
+            return False
 
     def _fetch_once(self) -> None:
         try:

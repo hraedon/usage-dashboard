@@ -14,16 +14,11 @@ from datetime import datetime
 
 from usage_dashboard.client import format as fmt
 from usage_dashboard.shared.models import (
-    ALERT_CRIT,
-    ALERT_WARN,
-    THROTTLE_BOXED,
-    THROTTLE_LOW,
-    THROTTLE_LOW_INTERACTIVITY,
-    THROTTLE_RATE_LIMITED,
     ModelUsage,
     Provider,
     Reading,
 )
+from usage_dashboard.shared.offpeak import qwen_is_offpeak, zai_is_peak
 
 # Fixed tile order so a provider always lands in the same place frame to frame.
 # CLAUDE_WORK is intentionally absent: it has no tile of its own — it folds into
@@ -33,7 +28,6 @@ _PROVIDER_ORDER: list[Provider] = [
     Provider.CODEX,
     Provider.ZAI,
     Provider.OLLAMA,
-    Provider.UMANS,
 ]
 
 # Providers rendered half-width so two consecutive ones share a row, freeing
@@ -73,10 +67,11 @@ class TileSpec:
     title: str           # includes any [stale]/[offline] suffix
     rect: Rect
     bars: list[BarSpec]
-    detail: str | None   # quota-less providers (umans) show this instead of bars
+    detail: str | None   # quota-less providers show this instead of bars
     accent: Color        # worst-of bar colours, for a status edge
     subtitle: str = ""   # right-aligned model breakdown for the tile header
     compact: bool = False  # half-width paired tile: S/W labels, bare countdown
+    title_color: Color = fmt.TEXT  # off-peak tint for plans with peak windows
 
 
 @dataclass(frozen=True)
@@ -85,8 +80,10 @@ class MainLayout:
     tiles: list[TileSpec]
     status_text: str
     status_rect: Rect
-    footer_note: str = ""  # quota-less provider (umans) summary, shown by the status bar
-    footer_color: Color = fmt.TEXT  # yellow=low priority, red=penalty box
+    footer_note: str = ""  # off-peak status tag (QWEN), shown by the status bar
+    footer_color: Color = fmt.TEXT  # green=off-peak, orange=peak
+    refresh_rect: Rect | None = None  # on-demand refresh tap target (WI-012)
+    refresh_pending: bool = False  # True while a refresh POST is in flight
 
 
 @dataclass(frozen=True)
@@ -218,6 +215,7 @@ def build_main_layout(
     now: datetime | None = None,
     refresh_interval: int | None = None,
     tile_overhead: int | None = None,
+    refresh_pending: bool = False,
 ) -> MainLayout:
     """Lay out provider tiles in a grid plus a bottom status bar.
 
@@ -239,51 +237,15 @@ def build_main_layout(
             primary = by_provider.get(Provider.CLAUDE) or by_provider.get(Provider.CLAUDE_WORK)
             if primary is not None:
                 tile_plan.append((Provider.CLAUDE, primary))
-        elif provider is Provider.UMANS:
-            # umans is quota-less; it goes in the footer, not a tile (see below).
-            continue
         elif provider in by_provider:
             tile_plan.append((provider, by_provider[provider]))
 
-    # umans summary for the status-bar footer (quota-less: just its detail).
-    umans = by_provider.get(Provider.UMANS)
-    footer_note = ""
-    footer_color = fmt.TEXT
-    if umans is not None:
-        # umans has no quota to colour by; throttle severity is its signal.
-        # boxed (account locked) = red, rate_limited (deprioritized window,
-        # still serving) = orange, low-interactivity (heavy-day queueing) =
-        # blue matching umans' own banner, low priority = yellow, else the
-        # token-volume alert (crit red / warn orange) or default.
-        if umans.throttle == THROTTLE_BOXED:
-            # Replace the (now-moot) req/tok metrics with a countdown to when
-            # the penalty box clears.
-            text, _ = fmt.format_countdown(umans.session_resets_at, now)
-            footer_note = f"UMANS boxed {text}".strip()
-            footer_color = fmt.RED
-        elif umans.throttle == THROTTLE_RATE_LIMITED:
-            # Deprioritized window: the account is still serving; the window
-            # countdown is the actionable signal, so it takes the metrics' spot.
-            text, _ = fmt.format_countdown(umans.session_resets_at, now)
-            footer_note = f"UMANS rate-limited {text}".strip()
-            footer_color = fmt.ORANGE
-        elif umans.throttle == THROTTLE_LOW_INTERACTIVITY:
-            # Heavy-day queueing: interactive-again is the actionable signal,
-            # so the countdown takes the metrics' spot.
-            text, _ = fmt.format_countdown(umans.session_resets_at, now)
-            footer_note = f"UMANS low-interactivity {text}".strip()
-            footer_color = fmt.BLUE
-        elif umans.throttle == THROTTLE_LOW:
-            footer_note = f"UMANS {umans.detail}".strip() if umans.detail else "UMANS"
-            footer_color = fmt.YELLOW
-        else:
-            footer_note = f"UMANS {umans.detail}".strip() if umans.detail else "UMANS"
-            # Unthrottled: the trailing-window token volume is the early
-            # warning for the (opaque) heavy-usage penalty.
-            if umans.alert == ALERT_CRIT:
-                footer_color = fmt.RED
-            elif umans.alert == ALERT_WARN:
-                footer_color = fmt.ORANGE
+    # Display-only QWEN tag for the status-bar footer: no data source, just
+    # whether we're inside the Qwen token plan's off-peak window (22:00–08:00
+    # UTC+8), when credits consume much less. Replaces the retired umans slot.
+    qwen_offpeak = qwen_is_offpeak(now)
+    footer_note = "QWEN off-peak" if qwen_offpeak else "QWEN peak"
+    footer_color = fmt.GREEN if qwen_offpeak else fmt.ORANGE
 
     margin = max(4, round(width * 0.02))
     # A slim status band leaves more height for the tiles (the Claude tile in
@@ -311,7 +273,7 @@ def build_main_layout(
     # with more bars (Claude, with its extra Fable window) gets a proportionally
     # taller row, so every bar renders at the same height regardless of how many
     # bars its tile has.
-    BuiltTile = tuple[Provider, "Reading", list[BarSpec], "str | None", str, str, bool]
+    BuiltTile = tuple[Provider, "Reading", list[BarSpec], "str | None", str, str, bool, Color]
     built_rows: list[list[BuiltTile]] = []
     row_weights: list[int] = []
     for row_tiles in rows_plan:
@@ -319,7 +281,7 @@ def build_main_layout(
         weight = 1
         is_paired = len(row_tiles) > 1
         for provider, reading in row_tiles:
-            # umans has no percentages — show its detail string instead of bars.
+            # Quota-less providers have no percentages — show detail instead.
             is_quotaless = (
                 reading.session_percent is None and reading.weekly_percent is None
             )
@@ -339,7 +301,13 @@ def build_main_layout(
                 subtitle = _model_subtitle(reading.models)
             else:
                 subtitle = ""
-            built.append((provider, reading, bars, detail, title, subtitle, is_paired))
+            # z.ai's plan burns quota at a discount off-peak (peak = Mon–Fri
+            # 14:00–18:00 Singapore time): tint the tile title so "use it now"
+            # vs "wait it out" is glanceable.
+            title_color = (
+                fmt.ORANGE if zai_is_peak(now) else fmt.GREEN
+            ) if provider is Provider.ZAI else fmt.TEXT
+            built.append((provider, reading, bars, detail, title, subtitle, is_paired, title_color))
             weight = max(weight, len(bars))
         built_rows.append(built)
         row_weights.append(weight)
@@ -373,7 +341,7 @@ def build_main_layout(
         ncols = len(built)
         cell_w = (width - margin * (ncols + 1)) // ncols
         for col_idx, built_tile in enumerate(built):
-            provider, reading, bars, detail, title, subtitle, compact = built_tile
+            provider, reading, bars, detail, title, subtitle, compact, title_color = built_tile
             rect = Rect(
                 x=margin + col_idx * (cell_w + margin),
                 y=y,
@@ -390,6 +358,7 @@ def build_main_layout(
                     accent=_accent(bars, detail),
                     subtitle=subtitle,
                     compact=compact,
+                    title_color=title_color,
                 )
             )
         y += cell_h + margin
@@ -402,7 +371,22 @@ def build_main_layout(
         status_rect=status_rect,
         footer_note=footer_note,
         footer_color=footer_color,
+        refresh_rect=refresh_button_rect(status_rect),
+        refresh_pending=refresh_pending,
     )
+
+
+def refresh_button_rect(status_rect: Rect) -> Rect:
+    """A small square tap target at the right edge of the status bar.
+
+    The on-demand refresh button (WI-012): sized to a finger target where the
+    slim status bar allows (a share of the bar height), anchored to the bar's
+    right edge so the QWEN footer note sits to its left without overlap.
+    """
+    side = max(24, status_rect.h - 12)
+    x = status_rect.x + status_rect.w - side - 10
+    y = status_rect.y + (status_rect.h - side) // 2
+    return Rect(x, y, side, side)
 
 
 def _status_text(
@@ -451,6 +435,12 @@ def hit_test(layout: MainLayout, pos: tuple[int, int]) -> Provider | None:
         if tile.rect.contains(px, py):
             return tile.provider
     return None
+
+
+def refresh_hit_test(layout: MainLayout, pos: tuple[int, int]) -> bool:
+    """True if *pos* lands on the on-demand refresh button (WI-012)."""
+    r = layout.refresh_rect
+    return r is not None and r.contains(*pos)
 
 
 @dataclass(frozen=True)
