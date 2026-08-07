@@ -85,7 +85,7 @@ class TestReadingsEndpoint:
         asyncio.run(_test())
 
     def test_get_readings_returns_all_configured_providers(self, tmp_path):
-        # All four configured; only claude has a reading. The other three are
+        # Every provider configured; only claude has a reading. The rest are
         # configured-but-not-reporting, so they legitimately show as offline.
         app, db = _create_app_with_db(tmp_path, configured_providers=list(Provider))
         claude = _make_reading(provider=Provider.CLAUDE)
@@ -99,9 +99,11 @@ class TestReadingsEndpoint:
                 )
             data = response.json()
             providers = {item["provider"] for item in data}
-            assert providers == {
-                "claude", "claude_work", "zai", "ollama", "codex",
-            }
+            # Derived from the enum rather than spelled out: the point of the
+            # test is "every configured provider is reported", and a literal
+            # list only re-states the fixture while going stale on each new
+            # provider.
+            assert providers == {p.value for p in Provider}
 
         asyncio.run(_test())
 

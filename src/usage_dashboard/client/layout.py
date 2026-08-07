@@ -23,8 +23,15 @@ from usage_dashboard.shared.models import (
 from usage_dashboard.shared.offpeak import qwen_peak_countdown, zai_is_peak, zai_peak_countdown
 
 # Fixed tile order so a provider always lands in the same place frame to frame.
-# CLAUDE_WORK is intentionally absent: it has no tile of its own — it folds into
-# the CLAUDE tile as a second, muted set of bars.
+# A provider absent from this list gets no tile: CLAUDE_WORK folds into the
+# CLAUDE tile as a second, muted set of bars, and OPENCODE is server-side only
+# for now — it shows on the web /dashboard but is deliberately kept off the Pi
+# panel. A 5th full-width row would take the grid to 4 rows, and since the fixed
+# per-tile overhead (title + padding) is charged once per row, the height left
+# for bars drops by roughly two thirds. When it does earn a tile, pair it with
+# CODEX to stay at 3 rows — which needs _PAIRED_PROVIDERS to become explicit
+# pair *groups*, or CODEX would wrongly pair with ZAI whenever OpenCode Go is
+# unconfigured.
 _PROVIDER_ORDER: list[Provider] = [
     Provider.CLAUDE,
     Provider.CODEX,

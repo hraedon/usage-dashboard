@@ -11,6 +11,7 @@ from usage_dashboard.server.db import Database
 from usage_dashboard.server.fetch_claude import fetch_claude_usage, refresh_claude_token
 from usage_dashboard.server.fetch_codex import fetch_codex_usage, refresh_codex_token
 from usage_dashboard.server.fetch_ollama import fetch_ollama_usage
+from usage_dashboard.server.fetch_opencode import fetch_opencode_usage
 from usage_dashboard.server.fetch_types import (
     FetchAuthError,
     FetchError,
@@ -34,6 +35,18 @@ logger = logging.getLogger(__name__)
 # sleep so long that the loop stops re-evaluating due times for new providers.
 _MIN_SLEEP_SECONDS = 1.0
 _MAX_SLEEP_SECONDS = 1800.0
+
+# Providers authenticated by a scraped browser cookie rather than an OAuth pair.
+# There is nothing to refresh when one is rejected — only a human re-login helps
+# — so an auth failure parks the provider at the failure cap with an actionable
+# detail line instead of retrying on the normal backoff curve. The message
+# differs per provider because the causes differ: Ollama can only be an expired
+# cookie, while OpenCode Go serves the same sign-in redirect for an expired
+# cookie *and* a wrong workspace id.
+_COOKIE_AUTH_DETAIL: dict[Provider, str] = {
+    Provider.OLLAMA: "cookie expired — re-login",
+    Provider.OPENCODE: "cookie expired or bad workspace — re-login",
+}
 
 
 @dataclass
@@ -65,6 +78,8 @@ class FetchScheduler:
         zai_tokens_warn: int | None = None,
         zai_tokens_crit: int | None = None,
         ollama_cookie: str | None = None,
+        opencode_workspace_id: str | None = None,
+        opencode_cookie: str | None = None,
         codex_token: str | None = None,
         codex_refresh_token: str | None = None,
         codex_client_id: str | None = None,
@@ -75,6 +90,7 @@ class FetchScheduler:
         idle_ladder_seconds: tuple[int, ...] | None = None,
         failure_cap_seconds: int = 3600,
         change_epsilon: float = 0.5,
+        reset_epsilon_seconds: float = 90.0,
         token_store: TokenStore | None = None,
         retention_days: int = 7,
     ) -> None:
@@ -97,6 +113,11 @@ class FetchScheduler:
             if value is not None
         }
         self._ollama_cookie = ollama_cookie
+        # OpenCode Go needs both halves; either alone can't fetch, so the
+        # provider stays unconfigured (and absent from the API) unless both are
+        # set — the same "never fabricate an offline tile" rule as WI-003.
+        self._opencode_workspace_id = opencode_workspace_id
+        self._opencode_cookie = opencode_cookie
         self._codex_token = codex_token
         self._codex_refresh_token = codex_refresh_token
         self._codex_client_id = codex_client_id
@@ -115,6 +136,7 @@ class FetchScheduler:
         self._poll_floor = self._idle_ladder[0]
         self._failure_cap = float(failure_cap_seconds)
         self._change_epsilon = change_epsilon
+        self._reset_epsilon = timedelta(seconds=reset_epsilon_seconds)
         self._schedules: dict[Provider, _ProviderSchedule] = {}
         self._retention_days = retention_days
         self._last_prune: datetime | None = None
@@ -169,6 +191,23 @@ class FetchScheduler:
         epsilon so background jitter doesn't keep a provider pinned at 5m;
         ``detail`` is compared verbatim because quota-less providers carry
         their movement there rather than in the percent fields.
+
+        Reset times compare with their own epsilon, for the same reason. A
+        provider reporting a *relative* countdown has its absolute reset instant
+        recomputed from ``now`` on every poll, so it lands slightly off the last
+        one even when nothing changed (and the DB round-trip truncates it to
+        whole seconds besides). Exact comparison called that "changed" on every
+        poll, pinning the provider to the floor forever. The tolerance is safe
+        by orders of magnitude: the shortest window is 5 h, so a real rollover
+        moves the reset by hours.
+
+        This fixes **opencode**, whose ``resetInSec`` is exact and decrements in
+        lockstep with real time, so consecutive polls agree to within a second.
+        It does **not** fix **ollama**, whose countdown is scraped as rounded
+        text ("Resets in 5 hours"): its computed reset drifts by roughly the
+        whole poll gap until the text ticks over, which no sane epsilon covers.
+        Ollama stays pinned to the floor — pre-existing, tracked separately;
+        fixing it means comparing at the resolution the text actually carries.
         """
         if prev.status is not new.status:
             return True
@@ -185,10 +224,19 @@ class FetchScheduler:
                 return True
             if old is not None and cur is not None and abs(old - cur) >= self._change_epsilon:
                 return True
-        if prev.session_resets_at != new.session_resets_at:
-            return True
-        if prev.weekly_resets_at != new.weekly_resets_at:
-            return True
+        resets = (
+            (prev.session_resets_at, new.session_resets_at),
+            (prev.weekly_resets_at, new.weekly_resets_at),
+        )
+        for old_reset, cur_reset in resets:
+            if (old_reset is None) != (cur_reset is None):
+                return True
+            if (
+                old_reset is not None
+                and cur_reset is not None
+                and abs(cur_reset - old_reset) >= self._reset_epsilon
+            ):
+                return True
         return False
 
     def _schedule_after_success(
@@ -261,6 +309,19 @@ class FetchScheduler:
                         fetch_codex_usage,
                         self._codex_token,
                         self._codex_account_id,
+                    ),
+                )
+            )
+        # Keep this block last: ``configured_providers`` promises ``Provider``
+        # enum order, and it is derived from this list.
+        if self._opencode_workspace_id and self._opencode_cookie:
+            tasks.append(
+                (
+                    Provider.OPENCODE,
+                    partial(
+                        fetch_opencode_usage,
+                        self._opencode_workspace_id,
+                        self._opencode_cookie,
                     ),
                 )
             )
@@ -376,7 +437,7 @@ class FetchScheduler:
                 elif provider == Provider.CODEX and self._try_refresh_codex():
                     if self._retry_codex(provider, previous):
                         return
-            if provider is Provider.OLLAMA and isinstance(exc, FetchAuthError):
+            if provider in _COOKIE_AUTH_DETAIL and isinstance(exc, FetchAuthError):
                 self._record_auth_failure(provider, exc)
                 return
             self._record_failure(provider, exc)
@@ -459,7 +520,10 @@ class FetchScheduler:
         sched.interval = backoff
         sched.next_due = now + timedelta(seconds=backoff)
         self._db.store_reading(
-            replace(make_offline_reading(provider, now), detail="cookie expired — re-login"),
+            replace(
+                make_offline_reading(provider, now),
+                detail=_COOKIE_AUTH_DETAIL.get(provider, "credential rejected — re-login"),
+            ),
         )
         logger.warning(
             "Auth failed for %s (failure #%d, backing off %.0fs): %s",

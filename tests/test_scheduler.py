@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from functools import partial
 from unittest.mock import MagicMock
@@ -732,8 +733,149 @@ class TestConfiguredProviders:
             zai_key="z",
             ollama_cookie="o",
             codex_token="cx",
+            opencode_workspace_id="wrk_X",
+            opencode_cookie="oc",
         )
         assert scheduler.configured_providers() == list(Provider)
+
+
+class TestOpenCodeProvider:
+    def test_not_registered_without_credentials(self, tmp_path):
+        db = Database(str(tmp_path / "sched.db"))
+        db.initialize()
+        assert Provider.OPENCODE not in FetchScheduler(db).configured_providers()
+
+    def test_not_registered_with_only_one_half(self, tmp_path):
+        # Both halves are required. Registering on one would poll a request that
+        # can never succeed and surface a permanently-offline tile.
+        db = Database(str(tmp_path / "sched.db"))
+        db.initialize()
+        cookie_only = FetchScheduler(db, opencode_cookie="oc")
+        workspace_only = FetchScheduler(db, opencode_workspace_id="wrk_X")
+        assert Provider.OPENCODE not in cookie_only.configured_providers()
+        assert Provider.OPENCODE not in workspace_only.configured_providers()
+
+    def test_registered_with_both_halves(self, tmp_path):
+        db = Database(str(tmp_path / "sched.db"))
+        db.initialize()
+        scheduler = FetchScheduler(
+            db, opencode_workspace_id="wrk_X", opencode_cookie="oc"
+        )
+        assert scheduler.configured_providers() == [Provider.OPENCODE]
+
+    def test_auth_failure_names_both_causes(self, tmp_path):
+        # The site cannot distinguish an expired cookie from a wrong workspace
+        # id, so the detail line must not assert that a re-login is the fix.
+        db = Database(str(tmp_path / "sched.db"))
+        db.initialize()
+        scheduler = FetchScheduler(
+            db, opencode_workspace_id="wrk_X", opencode_cookie="oc"
+        )
+        scheduler._fetch_one(
+            Provider.OPENCODE, MagicMock(side_effect=FetchAuthError("sign-in"))
+        )
+        reading = db.get_latest_readings()[Provider.OPENCODE]
+        assert reading.status is ReadingStatus.OFFLINE
+        assert reading.detail is not None
+        assert "workspace" in reading.detail
+
+    def test_auth_failure_parks_at_the_failure_cap(self, tmp_path):
+        # Nothing to refresh: only a human re-login helps, so don't grind the
+        # normal backoff curve against a credential that cannot recover.
+        db = Database(str(tmp_path / "sched.db"))
+        db.initialize()
+        scheduler = FetchScheduler(
+            db,
+            opencode_workspace_id="wrk_X",
+            opencode_cookie="oc",
+            failure_cap_seconds=3600,
+        )
+        scheduler._fetch_one(
+            Provider.OPENCODE, MagicMock(side_effect=FetchAuthError("sign-in"))
+        )
+        assert scheduler.schedule_snapshot()[Provider.OPENCODE][
+            "interval_seconds"
+        ] == 3600
+
+
+class TestRelativeCountdownIdleLadder:
+    """A provider whose reset time is a *relative* countdown must still idle.
+
+    Its absolute reset instant is recomputed from ``now`` each poll, so exact
+    comparison saw "changed" every time and held the provider at the poll floor
+    forever, defeating the idle ladder entirely.
+    """
+
+    @staticmethod
+    def _poll_series(scheduler, polls, session_remaining=17223.0, weekly_remaining=256748.0):
+        """Drive *polls* fetches against a countdown that decrements in lockstep
+        with real time, advancing the clock by whatever gap the scheduler chose.
+        Returns the interval after each poll."""
+        start = datetime(2026, 8, 7, 0, 0, 0, 123456)
+        elapsed = 0.0
+        intervals = []
+        for i in range(polls):
+            now = start + timedelta(seconds=elapsed, microseconds=7919 * i)
+            reading = _make_reading(
+                provider=Provider.OPENCODE,
+                session_percent=0.0,
+                session_resets_at=now + timedelta(seconds=session_remaining - elapsed),
+                weekly_percent=13.0,
+                weekly_resets_at=now + timedelta(seconds=weekly_remaining - elapsed),
+                fetched_at=now,
+            )
+            scheduler._fetch_one(Provider.OPENCODE, MagicMock(return_value=reading))
+            interval = scheduler.schedule_snapshot()[Provider.OPENCODE]["interval_seconds"]
+            intervals.append(interval)
+            elapsed += interval
+        return intervals
+
+    def _scheduler(self, tmp_path):
+        db = Database(str(tmp_path / "sched.db"))
+        db.initialize()
+        return db, FetchScheduler(
+            db, opencode_workspace_id="wrk_X", opencode_cookie="oc"
+        )
+
+    def test_unchanged_reading_climbs_the_idle_ladder(self, tmp_path):
+        _, scheduler = self._scheduler(tmp_path)
+        assert self._poll_series(scheduler, 4) == [300, 600, 900, 1800]
+
+    def test_sub_second_recompute_jitter_is_not_a_change(self, tmp_path):
+        _, scheduler = self._scheduler(tmp_path)
+        base = _make_reading(provider=Provider.OPENCODE)
+        jittered = replace(
+            base,
+            session_resets_at=base.session_resets_at + timedelta(seconds=1),
+            weekly_resets_at=base.weekly_resets_at + timedelta(milliseconds=712),
+        )
+        assert scheduler._reading_changed(base, jittered) is False
+
+    def test_a_real_window_rollover_still_snaps_back_to_the_floor(self, tmp_path):
+        # The tolerance must not swallow an actual reset: a new 5h window moves
+        # the reset by hours, far beyond the epsilon.
+        _, scheduler = self._scheduler(tmp_path)
+        self._poll_series(scheduler, 4)
+        rolled = _make_reading(
+            provider=Provider.OPENCODE,
+            session_percent=0.0,
+            session_resets_at=datetime(2026, 8, 7, 12, 0, 0),
+            weekly_percent=13.0,
+            weekly_resets_at=datetime(2026, 8, 10, 0, 0, 0),
+            fetched_at=datetime(2026, 8, 7, 7, 0, 0),
+        )
+        scheduler._fetch_one(Provider.OPENCODE, MagicMock(return_value=rolled))
+        assert scheduler.schedule_snapshot()[Provider.OPENCODE]["interval_seconds"] == 300
+
+    def test_reset_appearing_or_vanishing_is_a_change(self, tmp_path):
+        _, scheduler = self._scheduler(tmp_path)
+        base = _make_reading(provider=Provider.OPENCODE)
+        assert scheduler._reading_changed(
+            base, replace(base, session_resets_at=None)
+        ) is True
+        assert scheduler._reading_changed(
+            replace(base, weekly_resets_at=None), base
+        ) is True
 
 
 class TestOllamaAuthFailureSignal:
