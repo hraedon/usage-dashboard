@@ -1,35 +1,76 @@
-# Ingress for the usage dashboard. The live cluster splits this across two
-# ingresses, mirrored here; fill in the CHANGE-ME host / TLS / class values to
-# match your setup (hostnames are left as placeholders because this repo is
-# public).
+# Ingress for the usage dashboard — the REAL deployed manifests, not a template.
 #
-# 1. EXTERNAL — the API the Pi clients poll. Exposes ONLY the bearer-authenticated
-#    routes (/readings, /refresh, /history, /schedule). Do NOT add / here — that
-#    would expose the unauthenticated /dashboard (the private-network phone view)
-#    on a public host. This list is enforced: tests/test_ingress_contract.py
-#    fails if an authed route goes unrouted or an unauthed route leaks here.
-#    Hostnames stay as CHANGE-ME placeholders; committing the real values is a
-#    separate, gated decision — see plans/003-versioned-api-and-ingress-contract.md
-#    (WP-3 item 2).
+# These are committed with their actual hostnames (Plan 003 WP-3 item 2,
+# sanctioned 2026-08-07). `usage.hraedon.com` is served by a public Let's
+# Encrypt certificate, and LE cannot issue without submitting to Certificate
+# Transparency logs — so the name is already public and committing it leaks
+# nothing new. This is the homelab-names-are-not-secret stance; work-domain
+# identifiers remain hard-forbidden and are unaffected.
 #
-# 2. INTERNAL — the full app (incl. the unauthenticated /dashboard at `/`) on an
-#    internal-only host.
+# Committing the real thing is the point: the CI guard
+# (tests/test_ingress_contract.py) can only catch drift if the manifest it
+# checks is the artifact that is actually applied. While this file was a
+# CHANGE-ME template, the guard validated something nobody deployed — and the
+# live cluster silently drifted (it was missing /history until 2026-08-07).
+#
+# DNS is split-horizon and hand-managed (no external-dns): internal AD DNS
+# returns the private LB address, public Porkbun returns the WAN IP.
+# cert-manager's porkbun webhook does DNS-01, so it issues for both names.
+#
+# 1. EXTERNAL — the API the Pi fleet polls. Routes `/api` (the whole versioned
+#    surface) plus the legacy aliases. Every route under `/api` is
+#    authenticated by construction; the unauthenticated views are not on `/api`
+#    at all, so `/dashboard` cannot be reached here. Exposure is DECLARED
+#    per route in `server/api.py` (`**EXTERNAL` / `**INTERNAL_ONLY`), not
+#    inferred — the guard fails the build if a declared-external route is
+#    unrouted, if a declared-internal-only route is reachable here, or if an
+#    authenticated route declares nothing at all.
+#
+# 2. INTERNAL — the full app, including the unauthenticated `/dashboard` phone
+#    view, on an internal-only host.
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
   name: usage-dashboard-readings-ext
   namespace: usage-dashboard
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod-porkbun
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
 spec:
-  ingressClassName: CHANGE-ME-external-ingress-class
+  # Both traefik instances watch all IngressRoute CRDs, so the class is how a
+  # standard Ingress is pinned to one of them.
+  ingressClassName: traefik-external
   tls:
     - hosts:
-        - CHANGE-ME.example.com
-      secretName: usage-dashboard-ext-tls
+        - usage.hraedon.com
+      secretName: usage-hraedon-com-tls
   rules:
-    - host: CHANGE-ME.example.com
+    - host: usage.hraedon.com
       http:
         paths:
+          # The versioned surface. One Prefix covers every current and future
+          # externally-declared route, so this list never has to grow again —
+          # which is what ended the three-time recurrence of endpoints silently
+          # 404ing the fleet (WI-024).
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: usage-dashboard-server
+                port:
+                  number: 8080
+          # Legacy pre-/api/v1 aliases. The server and the Pis roll on
+          # independent schedules, so these stay until BOTH units are confirmed
+          # on a client that uses /api/v1 (WP-4 gate: `git -C ~/usage-dashboard
+          # rev-parse --short HEAD` on each unit). mpmusage02 is offsite.
           - path: /readings
+            pathType: Prefix
+            backend:
+              service:
+                name: usage-dashboard-server
+                port:
+                  number: 8080
+          - path: /schedule
             pathType: Prefix
             backend:
               service:
@@ -50,29 +91,27 @@ spec:
                 name: usage-dashboard-server
                 port:
                   number: 8080
-          - path: /schedule
-            pathType: Prefix
-            backend:
-              service:
-                name: usage-dashboard-server
-                port:
-                  number: 8080
 ---
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
   name: usage-dashboard-ui-int
   namespace: usage-dashboard
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod-porkbun
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
 spec:
-  ingressClassName: CHANGE-ME-internal-ingress-class
+  ingressClassName: traefik-internal
   tls:
     - hosts:
-        - CHANGE-ME.internal.example.com
-      secretName: usage-dashboard-int-tls
+        - usage.k8s.hraedon.com
+      secretName: usage-k8s-hraedon-com-tls
   rules:
-    - host: CHANGE-ME.internal.example.com
+    - host: usage.k8s.hraedon.com
       http:
         paths:
+          # Everything, including the unauthenticated /dashboard. Safe only
+          # because this class is the internal-only traefik.
           - path: /
             pathType: Prefix
             backend:
