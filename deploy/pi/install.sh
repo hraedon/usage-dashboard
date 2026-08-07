@@ -19,7 +19,14 @@
 set -euo pipefail
 
 # --- config (override via env) ---------------------------------------------
-HERE="$(cd "$(dirname "$0")" && pwd)"
+# Where this script's siblings (unit files, launcher, goodix helper) live.
+# MUST survive the re-exec in step 4: that replaces $0 with a copy in /tmp, so
+# recomputing from $0 afterwards would point HERE at /tmp and every
+# "$HERE/<file>" read would fail — which is exactly what happened when the
+# re-exec was first added. APPDIR is derived from HERE too, so a stale HERE also
+# silently retargets the install at ~/usage-dashboard regardless of where the
+# checkout actually is. The pre-re-exec value is passed through the environment.
+HERE="${_INSTALL_SH_HERE:-$(cd "$(dirname "$0")" && pwd)}"
 REPO_URL="${REPO_URL:-https://github.com/hraedon/usage-dashboard.git}"
 # Default the app dir to wherever this checkout already lives, so it doesn't
 # matter which directory you cloned it into. Falls back to ~/usage-dashboard.
@@ -86,7 +93,10 @@ if [ -z "${_INSTALL_SH_REEXECED:-}" ]; then
     _STABLE_COPY="$(mktemp --suffix=.sh)"
     cp "$0" "$_STABLE_COPY"
     chmod +x "$_STABLE_COPY"
-    export _STABLE_COPY _INSTALL_SH_REEXECED=1
+    # Carry HERE across the exec: $0 becomes the /tmp copy, so the re-exec'd
+    # run cannot recompute it. Files under HERE are read AFTER the git reset
+    # below, so they are the freshly-checked-out versions — which is the point.
+    export _STABLE_COPY _INSTALL_SH_REEXECED=1 _INSTALL_SH_HERE="$HERE"
     exec "$_STABLE_COPY" "$@"
 fi
 trap 'rm -f "${_STABLE_COPY:-}"' EXIT
