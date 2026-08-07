@@ -43,23 +43,29 @@ def _env_or_file(env: dict[str, str], env_file: Path | None, name: str) -> str:
 
 class TestKnobResolution:
     def test_environment_wins(self, tmp_path):
-        f = tmp_path / "env"; f.write_text("UPDATE_REF=from-file\n")
+        f = tmp_path / "env"
+        f.write_text("UPDATE_REF=from-file\n")
         assert _env_or_file({"UPDATE_REF": "from-env", "PATH": "/usr/bin:/bin"}, f,
                             "UPDATE_REF") == "from-env"
 
     def test_falls_back_to_a_readable_file(self, tmp_path):
-        f = tmp_path / "env"; f.write_text("UPDATE_REF=from-file\n")
+        f = tmp_path / "env"
+        f.write_text("UPDATE_REF=from-file\n")
         assert _env_or_file({"PATH": "/usr/bin:/bin"}, f, "UPDATE_REF") == "from-file"
 
     def test_unreadable_file_yields_empty_not_an_error(self, tmp_path):
         # The live failure mode: file exists but the run user cannot read it.
-        f = tmp_path / "env"; f.write_text("AUTO_REDEPLOY=1\n"); f.chmod(0o000)
+        f = tmp_path / "env"
+        f.write_text("AUTO_REDEPLOY=1\n")
+        f.chmod(0o000)
         assert _env_or_file({"PATH": "/usr/bin:/bin"}, f, "AUTO_REDEPLOY") == ""
 
     def test_unreadable_file_is_survivable_when_the_env_carries_the_value(self, tmp_path):
         # ...and this is why the fix works: systemd injects it, so the
         # unreadable file no longer matters.
-        f = tmp_path / "env"; f.write_text("AUTO_REDEPLOY=1\n"); f.chmod(0o000)
+        f = tmp_path / "env"
+        f.write_text("AUTO_REDEPLOY=1\n")
+        f.chmod(0o000)
         assert _env_or_file({"AUTO_REDEPLOY": "1", "PATH": "/usr/bin:/bin"}, f,
                             "AUTO_REDEPLOY") == "1"
 
