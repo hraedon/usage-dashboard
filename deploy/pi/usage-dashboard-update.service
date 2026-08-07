@@ -5,6 +5,15 @@ After=network-online.target
 
 [Service]
 Type=oneshot
+# systemd reads this as root and injects the values, THEN drops to @RUNUSER@.
+# That is the only way the updater can see its own knobs: the file is
+# 600 root:root because it carries API_KEY, so the unprivileged updater cannot
+# read it directly. Without this line update.sh's greps fail with "Permission
+# denied", `|| true` swallows it, and both AUTO_REDEPLOY and UPDATE_REF are
+# silently empty — auto-redeploy never arms and every unit tracks main no
+# matter what UPDATE_REF says. Leading `-` so a missing file is not fatal
+# (matches the GUI unit, and a fresh install writes the file after the units).
+EnvironmentFile=-/etc/usage-dashboard-gui.env
 # Runs the stable copy installed at /usr/local/bin (not the repo copy it may
 # rewrite). @RUNUSER@ is filled in by deploy/pi/install.sh.
 User=@RUNUSER@
