@@ -15,6 +15,23 @@ ENV_FILE="/etc/usage-dashboard-gui.env"
 
 log() { echo "usage-dashboard-update: $*"; }
 
+# Read a knob: the systemd-injected environment first, the env file only as a
+# fallback. The unit carries EnvironmentFile=, so systemd reads the 600
+# root:root file as root and hands the values down. Grepping the file directly
+# CANNOT work from the unprivileged run user — it fails "Permission denied",
+# `|| true` swallows it, and the knob silently reads empty. That is how
+# AUTO_REDEPLOY appeared to do nothing once set, and why UPDATE_REF had never
+# taken effect on any unit. The file fallback is kept for a hand-run invocation
+# as root, where the environment is not populated.
+env_or_file() {  # name
+    local name="$1" val=""
+    val="$(printenv "$name" 2>/dev/null || true)"
+    if [ -z "$val" ] && [ -r "$ENV_FILE" ]; then
+        val="$(grep -E "^${name}=" "$ENV_FILE" | tail -1 | cut -d= -f2- | tr -d '"' || true)"
+    fi
+    printf '%s' "$val"
+}
+
 # Opt-in self-redeploy of the installer-managed components (update.sh itself, the
 # systemd units, the X-session launcher, the touch-rebind helper). Off unless
 # AUTO_REDEPLOY=1 in the env file, so a unit only starts re-applying root-owned
@@ -22,9 +39,7 @@ log() { echo "usage-dashboard-update: $*"; }
 # (a no-op when nothing drifted), so it's safe to call on every cycle.
 maybe_redeploy() {
     local want=""
-    if [ -f "$ENV_FILE" ]; then
-        want="$(grep -E '^AUTO_REDEPLOY=' "$ENV_FILE" | tail -1 | cut -d= -f2- | tr -d '"' || true)"
-    fi
+    want="$(env_or_file AUTO_REDEPLOY)"
     case "$want" in
         1|true|yes|on)
             if [ -x /usr/local/bin/usage-dashboard-redeploy ]; then
@@ -54,11 +69,8 @@ write_change() {  # old, new
 }
 
 # Tracked ref: UPDATE_REF from the env file, else main.
-REF="main"
-if [ -f "$ENV_FILE" ]; then
-    val="$(grep -E '^UPDATE_REF=' "$ENV_FILE" | tail -1 | cut -d= -f2- | tr -d '"' || true)"
-    [ -n "$val" ] && REF="$val"
-fi
+REF="$(env_or_file UPDATE_REF)"
+[ -n "$REF" ] || REF="main"
 
 cd "$APPDIR"
 git fetch --quiet origin "$REF"
