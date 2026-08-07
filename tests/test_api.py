@@ -766,11 +766,14 @@ class TestVersionedApiSurface:
     def test_every_authed_route_has_a_versioned_twin(self, tmp_path):
         # Derived from the app, so a route added to only one mount is caught
         # rather than depending on this test's hardcoded list staying current.
-        from fastapi.routing import APIRoute
-
+        #
+        # Read from the OpenAPI schema, NOT `app.routes`: from fastapi 0.141
+        # `include_router` leaves an opaque `_IncludedRouter` there instead of
+        # flattened APIRoutes, so a route walk finds nothing and this test
+        # would pass over an empty set. The schema is stable across versions.
         from usage_dashboard.server.api import API_V1_PREFIX
         app, _db = _create_app_with_db(tmp_path)
-        paths = {r.path for r in app.routes if isinstance(r, APIRoute)}
+        paths = set(app.openapi().get("paths") or {})
         versioned = {p for p in paths if p.startswith(API_V1_PREFIX)}
         legacy_of = {p[len(API_V1_PREFIX):] for p in versioned}
         assert legacy_of <= paths, (

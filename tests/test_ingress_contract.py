@@ -3,14 +3,11 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from fastapi.routing import APIRoute
-from fastapi.security import HTTPBearer
-
 from usage_dashboard.server.api import (
     EXPOSURE_EXTERNAL,
     EXPOSURE_INTERNAL_ONLY,
+    EXPOSURE_KEY,
     create_app,
-    route_exposure,
 )
 from usage_dashboard.server.db import Database
 
@@ -60,13 +57,35 @@ def _covered_by(path: str, prefixes: set[str]) -> bool:
     return False
 
 
-def _iter_dependants(dependant):
-    yield dependant
-    for sub in getattr(dependant, "dependencies", None) or []:
-        yield from _iter_dependants(sub)
+# Routes are read from the app's OpenAPI schema, NOT from `app.routes`.
+#
+# This is load-bearing. Until 2026-08-07 the guard walked `app.routes` and
+# matched `isinstance(route, APIRoute)`. That works on fastapi 0.136, but from
+# 0.141 `include_router` leaves an opaque `_IncludedRouter` in `app.routes`
+# instead of flattened `APIRoute`s — so the walk found NOTHING, both contract
+# assertions passed over empty sets, and the guard silently became a no-op on
+# the exact version CI and production run. A security guard that reports
+# "nothing wrong" because it can no longer see anything is worse than no guard.
+#
+# The schema is the stable public contract across versions: `security` marks an
+# authenticated operation and `openapi_extra` surfaces the x-exposure
+# declaration. `_MINIMUM_AUTHED` below is the anti-vacuity floor — if
+# introspection breaks again, discovery returns less than the routes we know
+# exist and every test fails loudly instead of passing on emptiness.
+_MINIMUM_AUTHED = {"/readings", "/refresh", "/history", "/schedule"}
 
 
-def _exposure_split(app) -> tuple[set[str], set[str], set[str]]:
+def _assert_discovery_works(authed: set[str]) -> None:
+    missing = _MINIMUM_AUTHED - authed
+    assert not missing, (
+        f"route discovery is broken: expected at least {sorted(_MINIMUM_AUTHED)} "
+        f"to be found as authenticated, but {sorted(missing)} were not seen. "
+        f"This is an introspection failure, NOT a clean app — do not 'fix' it "
+        f"by relaxing the check. See the note above about fastapi 0.141."
+    )
+
+
+def _exposure_split(app, *, require_discovery: bool = True) -> tuple[set[str], set[str], set[str]]:
     """(declared-external, declared-internal-only, undeclared-but-authed).
 
     Exposure is read from the route's own declaration, never inferred from
@@ -77,37 +96,41 @@ def _exposure_split(app) -> tuple[set[str], set[str], set[str]]:
     external: set[str] = set()
     internal: set[str] = set()
     undeclared: set[str] = set()
-    authed, _unauthed = _auth_split(app)
-    for route in app.routes:
-        if not isinstance(route, APIRoute) or route.path not in authed:
+    for path, authed, declared in _operations(app):
+        if not authed:
             continue
-        declared = route_exposure(route)
         if declared == EXPOSURE_EXTERNAL:
-            external.add(route.path)
+            external.add(path)
         elif declared == EXPOSURE_INTERNAL_ONLY:
-            internal.add(route.path)
+            internal.add(path)
         else:
-            undeclared.add(route.path)
+            undeclared.add(path)
+    if require_discovery:
+        _assert_discovery_works(external | internal | undeclared)
     return external, internal, undeclared
 
 
-def _auth_split(app) -> tuple[set[str], set[str]]:
-    # A route is authenticated iff its dependency tree carries the bearer
-    # scheme (an HTTPBearer instance). Read from the live FastAPI app's
-    # dependant graph rather than parsed from decorators/source, so renaming
-    # or reordering the auth dependency cannot silently hide a route. If the
-    # scheme changes, this returns an empty authed set and the tests fail
-    # loudly — a change to the auth mechanism must force a contract re-check.
-    authed: set[str] = set()
-    unauthed: set[str] = set()
-    for route in app.routes:
-        if not isinstance(route, APIRoute):
-            continue
-        carries_bearer = any(
-            isinstance(getattr(dep, "call", None), HTTPBearer)
-            for dep in _iter_dependants(route.dependant)
-        )
-        (authed if carries_bearer else unauthed).add(route.path)
+def _operations(app) -> list[tuple[str, bool, str | None]]:
+    """(path, is_authenticated, declared_exposure) for every documented op.
+
+    ``security`` on an operation is FastAPI's own rendering of the bearer
+    dependency, so this tracks the real dependency graph without depending on
+    a particular version's route-object layout.
+    """
+    ops: list[tuple[str, bool, str | None]] = []
+    for path, methods in (app.openapi().get("paths") or {}).items():
+        for operation in methods.values():
+            if not isinstance(operation, dict):
+                continue
+            ops.append((path, bool(operation.get("security")), operation.get(EXPOSURE_KEY)))
+    return ops
+
+
+def _auth_split(app, *, require_discovery: bool = True) -> tuple[set[str], set[str]]:
+    authed = {p for p, a, _ in _operations(app) if a}
+    unauthed = {p for p, a, _ in _operations(app) if not a} - authed
+    if require_discovery:
+        _assert_discovery_works(authed)
     return authed, unauthed
 
 
@@ -222,7 +245,7 @@ class TestExposureIsDeclaredNotInferred:
         async def undeclared_route(_u: str = Depends(auth)) -> dict[str, str]:
             return {}
 
-        _ext, _int, undeclared = _exposure_split(app)
+        _ext, _int, undeclared = _exposure_split(app, require_discovery=False)
         assert undeclared == {"/api/v1/undeclared"}
 
     def test_the_guard_flags_an_internal_only_route_left_under_api(self):
@@ -239,7 +262,7 @@ class TestExposureIsDeclaredNotInferred:
         async def admin_reset(_u: str = Depends(auth)) -> dict[str, str]:
             return {}
 
-        _ext, internal, _und = _exposure_split(app)
+        _ext, internal, _und = _exposure_split(app, require_discovery=False)
         assert internal == {"/api/v1/admin/reset"}
         assert _covered_by("/api/v1/admin/reset", {"/api"}), (
             "an internal-only route under /api IS externally covered — this is "

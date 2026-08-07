@@ -51,9 +51,12 @@ LEGACY_ALIAS_PREFIX = ""
 # internet-reachable the moment it exists. That is how `/history` got exposed on
 # 2026-08-07 without anyone deciding to.
 #
-# Spread these into the route decorator. The contract test requires EVERY
-# authenticated route to carry one — an undeclared route fails the build rather
-# than defaulting either way, so adding a route forces the decision.
+# Spread these into the route decorator. `openapi_extra` surfaces the marker in
+# the OpenAPI schema, which is where the contract test reads it from — the only
+# representation stable across fastapi versions (0.141 stopped exposing
+# flattened routes on `app.routes`). The test requires EVERY authenticated route
+# to carry a marker: an undeclared route fails the build rather than defaulting
+# either way, so adding a route forces the decision.
 #
 #   @api.get("/readings", **EXTERNAL)
 #   @api.get("/admin/reset", **INTERNAL_ONLY)
@@ -74,12 +77,6 @@ INTERNAL_ONLY: dict[str, Any] = {"openapi_extra": {EXPOSURE_KEY: EXPOSURE_INTERN
 # be exposed by accident.
 INTERNAL_V1_PREFIX = "/internal/v1"
 
-
-def route_exposure(route: Any) -> str | None:
-    """Declared exposure for *route*, or None if it never declared one."""
-    extra = getattr(route, "openapi_extra", None) or {}
-    value = extra.get(EXPOSURE_KEY)
-    return value if isinstance(value, str) else None
 
 # Upper bound for /history windows — matches the default 7-day retention
 # (RETENTION_DAYS). Larger windows are accepted up to this cap; rows older
