@@ -9,6 +9,7 @@ import pytest
 from usage_dashboard.server.fetch_claude import fetch_claude_usage, refresh_claude_token
 from usage_dashboard.server.fetch_codex import fetch_codex_usage
 from usage_dashboard.server.fetch_ollama import _parse_relative_reset, fetch_ollama_usage
+from usage_dashboard.server.fetch_opencode import fetch_opencode_usage
 from usage_dashboard.server.fetch_types import (
     FetchAuthError,
     FetchError,
@@ -1136,3 +1137,251 @@ class TestParseRelativeReset:
 
     def test_phrase_without_duration_returns_none(self):
         assert _parse_relative_reset("resets in a moment", self._NOW) is None
+
+
+# ---------------------------------------------------------------------------
+# OpenCode Go
+#
+# Fixture shapes were copied from a live capture of
+# https://opencode.ai/workspace/<wrk_...>/go on 2026-08-07, not invented.
+# ---------------------------------------------------------------------------
+
+# The billing object earlier on the page also carries a `monthlyUsage` key, set
+# to null. Anything matching it instead of the real window silently loses the
+# monthly bar, so every SSR fixture keeps it in front.
+_OPENCODE_BILLING_NOISE = (
+    "reloadAmount:20,reloadAmountMin:10,monthlyLimit:null,monthlyUsage:null,"
+    "timeMonthlyUsageUpdated:null,reloadError:null,"
+)
+
+
+def _opencode_ssr_html(
+    rolling='status:"ok",resetInSec:17223,usagePercent:0',
+    weekly='status:"ok",resetInSec:256748,usagePercent:13',
+    monthly='status:"ok",resetInSec:2306645,usagePercent:7',
+):
+    """The SolidJS hydration blob, in the live nesting."""
+    windows = []
+    if rolling is not None:
+        windows.append(f"rollingUsage:$R[36]={{{rolling}}}")
+    if weekly is not None:
+        windows.append(f"weeklyUsage:$R[37]={{{weekly}}}")
+    if monthly is not None:
+        windows.append(f"monthlyUsage:$R[38]={{{monthly}}}")
+    return (
+        "<html><body><script>"
+        f"$R[28]($R[14],$R[33]={{{_OPENCODE_BILLING_NOISE}}});"
+        '$R[28]($R[18],$R[34]={mine:!0,useBalance:!1,region:$R[35]=["us","eu"],'
+        + ",".join(windows)
+        + "});</script></body></html>"
+    )
+
+
+def _opencode_markup_item(label, percent, reset_slot="reset-time", reset_text="4 hours 47 minutes"):
+    inner = (
+        f'<!--$-->Resets in<!--/--> <!--$-->{reset_text}<!--/-->'
+        if reset_slot == "reset-time"
+        else "<!--$-->Reset now<!--/-->"
+    )
+    return (
+        f'<div data-slot="usage-item"><div data-slot="usage-header">'
+        f'<span data-slot="usage-label">{label}</span>'
+        f'<span data-slot="usage-value"><!--$-->{percent}<!--/-->%</span></div>'
+        f'<div data-slot="progress"><div data-slot="progress-bar" '
+        f'style="width:{percent}%"></div></div>'
+        f'<span data-slot="{reset_slot}">{inner}</span></div>'
+    )
+
+
+def _opencode_markup_html(items=None):
+    """The rendered fallback markup, with no hydration blob present."""
+    if items is None:
+        items = [
+            _opencode_markup_item("Rolling Usage", "0", reset_text="4 hours 47 minutes"),
+            _opencode_markup_item("Weekly Usage", "13", reset_text="2 days 23 hours"),
+            _opencode_markup_item("Monthly Usage", "7", reset_text="26 days 16 hours"),
+        ]
+    return "<html><body>" + "".join(items) + "</body></html>"
+
+
+class TestFetchOpenCode:
+    @staticmethod
+    def _mock_get(mock_client_cls, text="", status_code=200, url=None):
+        response = MagicMock()
+        response.text = text
+        response.status_code = status_code
+        # A real URL matters: the signed-out check calls .url.host.endswith(),
+        # and a bare MagicMock would return a truthy MagicMock from it — every
+        # fetch would then look like an auth failure.
+        response.url = httpx.URL(
+            url or "https://opencode.ai/workspace/wrk_TEST/go"
+        )
+        response.raise_for_status = MagicMock()
+        mock_client = MagicMock()
+        mock_client.get.return_value = response
+        mock_client.__enter__ = MagicMock(return_value=mock_client)
+        mock_client.__exit__ = MagicMock(return_value=False)
+        mock_client_cls.return_value = mock_client
+        return mock_client
+
+    @patch("usage_dashboard.server.fetch_opencode.httpx.Client")
+    def test_ssr_blob_maps_three_windows(self, mock_client_cls):
+        before = datetime.now(timezone.utc).replace(tzinfo=None)
+        self._mock_get(mock_client_cls, text=_opencode_ssr_html())
+
+        reading = fetch_opencode_usage("wrk_TEST", "cookie-value")
+
+        assert reading.provider is Provider.OPENCODE
+        assert reading.status is ReadingStatus.CURRENT
+        assert reading.stale is False
+        assert reading.session_percent == 0.0
+        assert reading.weekly_percent == 13.0
+        # Reset times are relative countdowns, so assert the offset from the
+        # fetch instant rather than an absolute timestamp.
+        assert reading.session_resets_at is not None
+        assert timedelta(seconds=17223) <= (
+            reading.session_resets_at - before
+        ) <= timedelta(seconds=17223 + 60)
+        assert reading.weekly_resets_at is not None
+        assert timedelta(seconds=256748) <= (
+            reading.weekly_resets_at - before
+        ) <= timedelta(seconds=256748 + 60)
+        # Monthly has no first-class field; it rides as a scoped limit.
+        assert reading.scoped_limits is not None
+        (monthly,) = reading.scoped_limits
+        assert monthly.name == "Monthly"
+        assert monthly.percent == 7.0
+        assert monthly.resets_at is not None
+        assert timedelta(seconds=2306645) <= (
+            monthly.resets_at - before
+        ) <= timedelta(seconds=2306645 + 60)
+
+    @patch("usage_dashboard.server.fetch_opencode.httpx.Client")
+    def test_ssr_ignores_the_null_monthly_usage_in_the_billing_object(self, mock_client_cls):
+        # The page carries `monthlyUsage:null` before the real window. A pattern
+        # that matched it would drop the monthly bar entirely.
+        html = _opencode_ssr_html()
+        assert "monthlyUsage:null" in html  # the hazard is actually present
+        self._mock_get(mock_client_cls, text=html)
+
+        reading = fetch_opencode_usage("wrk_TEST", "cookie-value")
+        assert reading.scoped_limits is not None
+        assert reading.scoped_limits[0].percent == 7.0
+
+    @patch("usage_dashboard.server.fetch_opencode.httpx.Client")
+    def test_ssr_field_order_does_not_matter(self, mock_client_cls):
+        self._mock_get(
+            mock_client_cls,
+            text=_opencode_ssr_html(
+                rolling='usagePercent:42,status:"ok",resetInSec:600',
+                weekly='resetInSec:1200,usagePercent:8',
+                monthly=None,
+            ),
+        )
+        reading = fetch_opencode_usage("wrk_TEST", "cookie-value")
+        assert reading.session_percent == 42.0
+        assert reading.weekly_percent == 8.0
+        assert reading.scoped_limits is None
+
+    @patch("usage_dashboard.server.fetch_opencode.httpx.Client")
+    def test_markup_fallback_when_no_hydration_blob(self, mock_client_cls):
+        before = datetime.now(timezone.utc).replace(tzinfo=None)
+        self._mock_get(mock_client_cls, text=_opencode_markup_html())
+
+        reading = fetch_opencode_usage("wrk_TEST", "cookie-value")
+        assert reading.session_percent == 0.0
+        assert reading.weekly_percent == 13.0
+        assert reading.scoped_limits is not None
+        assert reading.scoped_limits[0].percent == 7.0
+        # The markup countdown is rounded to whole units: 4h47m, not 17223s.
+        assert reading.session_resets_at is not None
+        assert timedelta(seconds=17220) <= (
+            reading.session_resets_at - before
+        ) <= timedelta(seconds=17220 + 60)
+
+    @patch("usage_dashboard.server.fetch_opencode.httpx.Client")
+    def test_ssr_wins_over_markup_when_both_present(self, mock_client_cls):
+        # The live page carries both. The hydration values are exact, so a page
+        # whose markup disagrees must still report the hydration numbers.
+        html = _opencode_ssr_html() + _opencode_markup_html(
+            items=[_opencode_markup_item("Rolling Usage", "99", reset_text="1 hour")]
+        )
+        self._mock_get(mock_client_cls, text=html)
+
+        reading = fetch_opencode_usage("wrk_TEST", "cookie-value")
+        assert reading.session_percent == 0.0
+
+    @patch("usage_dashboard.server.fetch_opencode.httpx.Client")
+    def test_markup_reset_now_is_zero_not_missing(self, mock_client_cls):
+        before = datetime.now(timezone.utc).replace(tzinfo=None)
+        self._mock_get(
+            mock_client_cls,
+            text=_opencode_markup_html(
+                items=[
+                    _opencode_markup_item("Rolling Usage", "5", reset_slot="reset-now"),
+                ]
+            ),
+        )
+        reading = fetch_opencode_usage("wrk_TEST", "cookie-value")
+        assert reading.session_resets_at is not None
+        assert reading.session_resets_at - before < timedelta(seconds=60)
+
+    @patch("usage_dashboard.server.fetch_opencode.httpx.Client")
+    def test_markup_unparseable_countdown_leaves_reset_unknown(self, mock_client_cls):
+        self._mock_get(
+            mock_client_cls,
+            text=_opencode_markup_html(
+                items=[
+                    _opencode_markup_item(
+                        "Weekly Usage", "50", reset_text="soon"
+                    ),
+                ]
+            ),
+        )
+        reading = fetch_opencode_usage("wrk_TEST", "cookie-value")
+        assert reading.weekly_percent == 50.0
+        assert reading.weekly_resets_at is None
+
+    @patch("usage_dashboard.server.fetch_opencode.httpx.Client")
+    def test_sign_in_redirect_is_an_auth_error(self, mock_client_cls):
+        # Signed out (or a wrong workspace id): the site 302s to its auth host
+        # and serves the sign-in page with HTTP 200. Status code alone is not
+        # a usable signal — the final URL is.
+        self._mock_get(
+            mock_client_cls,
+            text="<html><body>Sign in</body></html>",
+            status_code=200,
+            url="https://auth.opencode.ai/authorize?client_id=app",
+        )
+        with pytest.raises(FetchAuthError) as excinfo:
+            fetch_opencode_usage("wrk_TEST", "stale-cookie")
+        # Both causes are indistinguishable, so both must be named.
+        assert "workspace id" in str(excinfo.value)
+
+    @patch("usage_dashboard.server.fetch_opencode.httpx.Client")
+    def test_http_401_is_an_auth_error(self, mock_client_cls):
+        self._mock_get(mock_client_cls, text="", status_code=401)
+        with pytest.raises(FetchAuthError):
+            fetch_opencode_usage("wrk_TEST", "stale-cookie")
+
+    @patch("usage_dashboard.server.fetch_opencode.httpx.Client")
+    def test_unparseable_page_is_a_fetch_error_not_an_auth_error(self, mock_client_cls):
+        # A page served from opencode.ai that we simply can't parse is a parser
+        # regression, not a credential problem — it must not park the provider
+        # at the auth backoff cap with a misleading "re-login" detail.
+        self._mock_get(mock_client_cls, text="<html><body>redesigned</body></html>")
+        with pytest.raises(FetchError) as excinfo:
+            fetch_opencode_usage("wrk_TEST", "cookie-value")
+        assert not isinstance(excinfo.value, FetchAuthError)
+
+    def test_missing_workspace_id_is_a_fetch_error(self):
+        with pytest.raises(FetchError):
+            fetch_opencode_usage("", "cookie-value")
+
+    @patch("usage_dashboard.server.fetch_opencode.httpx.Client")
+    def test_cookie_is_sent_as_the_auth_cookie(self, mock_client_cls):
+        client = self._mock_get(mock_client_cls, text=_opencode_ssr_html())
+        fetch_opencode_usage("wrk_TEST", "cookie-value")
+        url, kwargs = client.get.call_args[0][0], client.get.call_args[1]
+        assert url == "https://opencode.ai/workspace/wrk_TEST/go"
+        assert kwargs["headers"]["Cookie"] == "auth=cookie-value"

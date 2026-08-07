@@ -50,24 +50,28 @@ def _resolve_claude_tokens(
     return persisted_access or env_access, persisted_refresh or env_refresh
 
 
-def _resolve_ollama_cookie(
+def _resolve_cookie(
     token_store: TokenStore,
     env_cookie: str | None,
+    store_key: str,
 ) -> str | None:
-    """Decide which ollama cookie to run with (WI-017).
+    """Decide which scraped session cookie to run with (WI-017).
 
     Mirrors ``_resolve_claude_tokens`` but for a single opaque credential
     string (no refresh pair): only (re)seed from the env when the Secret
     differs from what we last seeded (first boot or a deliberate re-login);
     otherwise prefer the persisted cookie so a pod restart keeps it.
+
+    *store_key* namespaces the credential, so each cookie-authenticated
+    provider (ollama, opencode) seeds and persists independently.
     """
-    persisted = token_store.get_credential("ollama")
+    persisted = token_store.get_credential(store_key)
 
     if env_cookie:
         marker = hashlib.sha256(env_cookie.encode()).hexdigest()
-        if marker != token_store.get_seed_marker("ollama"):
-            token_store.save_credential("ollama", env_cookie)
-            token_store.set_seed_marker("ollama", marker)
+        if marker != token_store.get_seed_marker(store_key):
+            token_store.save_credential(store_key, env_cookie)
+            token_store.set_seed_marker(store_key, marker)
             return env_cookie
 
     return persisted or env_cookie
@@ -107,6 +111,10 @@ def main() -> None:
     zai_tokens_warn = _optional_int_env("ZAI_WEEK_TOKENS_WARN")
     zai_tokens_crit = _optional_int_env("ZAI_WEEK_TOKENS_CRIT")
     ollama_cookie = os.environ.get("OLLAMA_COOKIE") or None
+    # Optional OpenCode Go workspace. Scraped like ollama, but needs two halves:
+    # the workspace id (stable, `wrk_…`) and the `auth` browser cookie.
+    opencode_workspace_id = os.environ.get("OPENCODE_WORKSPACE_ID") or None
+    opencode_cookie = os.environ.get("OPENCODE_COOKIE") or None
     # Optional OpenAI Codex (ChatGPT-plan) account, via a dedicated OAuth login.
     codex_token = os.environ.get("CODEX_TOKEN") or None
     codex_refresh_token = os.environ.get("CODEX_REFRESH_TOKEN") or None
@@ -136,7 +144,8 @@ def main() -> None:
         token_store, claude_work_token, claude_work_refresh_token,
         store_key="claude_work",
     )
-    ollama_cookie = _resolve_ollama_cookie(token_store, ollama_cookie)
+    ollama_cookie = _resolve_cookie(token_store, ollama_cookie, "ollama")
+    opencode_cookie = _resolve_cookie(token_store, opencode_cookie, "opencode")
     # Codex reuses the Claude token-resolution logic (seed-once, prefer
     # persisted-refreshed) under its own store key.
     codex_token, codex_refresh_token = _resolve_claude_tokens(
@@ -155,6 +164,8 @@ def main() -> None:
         zai_tokens_warn=zai_tokens_warn,
         zai_tokens_crit=zai_tokens_crit,
         ollama_cookie=ollama_cookie,
+        opencode_workspace_id=opencode_workspace_id,
+        opencode_cookie=opencode_cookie,
         codex_token=codex_token,
         codex_refresh_token=codex_refresh_token,
         codex_client_id=codex_client_id,

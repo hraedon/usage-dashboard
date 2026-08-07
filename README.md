@@ -1,6 +1,6 @@
 # usage-dashboard
 
-A two-component system for monitoring AI usage across [Claude](https://claude.ai), [z.ai](https://z.ai), [Ollama](https://ollama.com), and [Codex](https://chatgpt.com/codex). A server fetches usage data from all configured providers, normalizes it into a unified format, stores in SQLite, and serves it via an authenticated API. A client polls the server and renders usage as color-coded progress bars — a fullscreen touch GUI for a **Raspberry Pi 4B + Touch Display 2** (with optional scheduled backlight-sleep + tap-to-wake, and a tap-the-status-line overlay for unit diagnostics + brightness). Plans that discount off-peak use get glanceable hints: the z.ai tile title tints green off-peak / orange during peak hours, and a display-only `QWEN` tag in the status bar shows whether the Qwen token plan's off-peak window (22:00–08:00 UTC+8) is open. The server also serves a mobile-friendly HTML view at `/dashboard`.
+A two-component system for monitoring AI usage across [Claude](https://claude.ai), [z.ai](https://z.ai), [Ollama](https://ollama.com), [Codex](https://chatgpt.com/codex), and [OpenCode Go](https://opencode.ai). A server fetches usage data from all configured providers, normalizes it into a unified format, stores in SQLite, and serves it via an authenticated API. A client polls the server and renders usage as color-coded progress bars — a fullscreen touch GUI for a **Raspberry Pi 4B + Touch Display 2** (with optional scheduled backlight-sleep + tap-to-wake, and a tap-the-status-line overlay for unit diagnostics + brightness). Plans that discount off-peak use get glanceable hints: the z.ai tile title tints green off-peak / orange during peak hours, and a display-only `QWEN` tag in the status bar shows whether the Qwen token plan's off-peak window (22:00–08:00 UTC+8) is open. The server also serves a mobile-friendly HTML view at `/dashboard`.
 
 ## Architecture
 
@@ -151,6 +151,8 @@ Images are built and pushed to `ghcr.io/hraedon/usage-dashboard-server` and `ghc
 | `ollama-cookie` | No | ollama.com browser session cookie (`name=value`; see below) |
 | `ollama-email` | No | Unused — see *Ollama login* (kept only as a placeholder) |
 | `ollama-password` | No | Unused — see *Ollama login* (kept only as a placeholder) |
+| `opencode-workspace-id` | No | OpenCode Go workspace id (`wrk_…`; see below) |
+| `opencode-cookie` | No | opencode.ai `auth` browser cookie (bare value, no `auth=` prefix) |
 
 ollama.com has no usage API and no plain-HTTP login — it authenticates via
 WorkOS AuthKit (a JS-driven form plus an anti-bot device-fingerprint signal),
@@ -162,6 +164,23 @@ obtain that cookie is `usage-dashboard login ollama` (see below); the manual
 fallback is browser devtools (Application → Cookies → ollama.com), copying the
 session cookie and storing it as `name=value`. When the cookie expires the tile
 goes stale/offline and the log says so; mint a fresh one.
+
+OpenCode Go is the same shape: no usage API, so the fetcher scrapes
+`opencode.ai/workspace/<wrk_…>/go` with the `auth` browser cookie. It needs
+**both** halves — the workspace id and the cookie — and stays hidden unless both
+are set. Get them with `usage-dashboard login opencode` (see below).
+
+Two things about this provider are worth knowing before you debug it:
+
+- **An expired cookie and a wrong workspace id are indistinguishable.** Both
+  redirect to `auth.opencode.ai/authorize` and return HTTP 200 on the final
+  hop; there is no 401 and no marker in the body. The card's detail line says
+  `cookie expired or bad workspace — re-login` because the server genuinely
+  cannot tell which it is. Check the workspace id before re-minting a cookie.
+- **Capture the cookie from a private/incognito window, and close it rather
+  than signing out.** Signing out invalidates the cookie server-side, taking
+  the captured value with it. (`login opencode` uses an ephemeral browser
+  context, which gets this right by construction.)
 
 The Claude usage endpoint requires the `user:profile` OAuth scope. A
 `claude setup-token` is scoped for inference only and returns `403` here, and
@@ -258,7 +277,33 @@ flow (run it on a machine with a display) rather than an unattended server-side
 refresh — the cookie still expires, so re-run it when the Ollama tile goes
 offline. `--headless` exists but rarely clears the anti-bot check.
 
+### OpenCode Go login
+
+`login opencode` is the same human-in-the-loop browser flow, capturing two
+values instead of one:
+
+```bash
+pip install 'usage-dashboard[login]'
+playwright install chromium
+usage-dashboard login opencode
+```
+
+A browser opens on `opencode.ai`. Sign in, then **navigate to your workspace's
+Go page** (`opencode.ai/workspace/<wrk_…>/go`) so the workspace id can be read
+out of the URL, and press Enter. The command captures the `auth` cookie, reads
+the `wrk_…` id, verifies the pair against the live page, and prints both lines
+ready for the Secret. Do not sign out afterwards — that kills the cookie you
+just captured.
+
 Only providers with configured credentials are fetched.
+
+### Where each provider is shown
+
+OpenCode Go currently renders on the web `/dashboard` only — it is deliberately
+**not** on the Pi panel. A fifth full-width tile would take the grid to four
+rows, and because the per-tile overhead (title + padding) is charged once per
+row, that cuts the height left for bars by roughly two thirds. See the comment
+on `_PROVIDER_ORDER` in `client/layout.py` for what adding it would take.
 
 ## Backlight sleep schedule
 

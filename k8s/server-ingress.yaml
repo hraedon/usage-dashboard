@@ -3,12 +3,14 @@
 # match your setup (hostnames are left as placeholders because this repo is
 # public).
 #
-# 1. EXTERNAL — the API the Pi clients poll. Exposes ONLY the bearer-protected
-#    paths: /readings and /schedule. Do NOT add / here (that would expose the
-#    unauthenticated /dashboard externally). Both endpoints require the Bearer
-#    token, so they're safe on an external host.
-#    NOTE: /schedule must be listed here — clients fetch their backlight schedule
-#    from it; omitting it silently falls clients back to their built-in default.
+# 1. EXTERNAL — the API the Pi clients poll. Exposes ONLY the bearer-authenticated
+#    routes (/readings, /refresh, /history, /schedule). Do NOT add / here — that
+#    would expose the unauthenticated /dashboard (the private-network phone view)
+#    on a public host. This list is enforced: tests/test_ingress_contract.py
+#    fails if an authed route goes unrouted or an unauthed route leaks here.
+#    Hostnames stay as CHANGE-ME placeholders; committing the real values is a
+#    separate, gated decision — see plans/003-versioned-api-and-ingress-contract.md
+#    (WP-3 item 2).
 #
 # 2. INTERNAL — the full app (incl. the unauthenticated /dashboard at `/`) on an
 #    internal-only host.
@@ -28,6 +30,20 @@ spec:
       http:
         paths:
           - path: /readings
+            pathType: Prefix
+            backend:
+              service:
+                name: usage-dashboard-server
+                port:
+                  number: 8080
+          - path: /refresh
+            pathType: Prefix
+            backend:
+              service:
+                name: usage-dashboard-server
+                port:
+                  number: 8080
+          - path: /history
             pathType: Prefix
             backend:
               service:

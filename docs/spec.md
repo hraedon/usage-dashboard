@@ -43,6 +43,15 @@ for the planned pieces):
   **scheduled backlight sleep + tap-to-wake** with server-served per-unit
   schedules — see `plans/002` and the `/schedule` endpoint.
 - **Responsive web `/dashboard`** — listed *out of scope* in §3, but built.
+- **OpenCode Go** as a 6th provider — scraped from `opencode.ai/workspace/<wrk_…>/go`
+  with the operator's `auth` browser cookie (no first-party usage API exists). Three
+  windows: rolling (~5h) → `session`, weekly → `weekly`, monthly → a `ScopedLimit`
+  extra bar. Same fragile-but-sanctioned cookie-scrape class as Ollama; the path was
+  explicitly chosen (WI-023) because the reading feeds switchboard's `TruthSource`
+  consumption of `/readings` (Plan 003) and the Go plan's dollar-quota bars are
+  exposed only via the web dashboard. Rendered on `/dashboard` only — deliberately
+  kept off the Pi panel (a 5th full-width row would collapse bar height; see the
+  `_PROVIDER_ORDER` comment in `client/layout.py`).
 
 **Reading schema** now also carries `detail`, `models`, and `throttle` (the §6
 schema shows only the original fields).
@@ -52,9 +61,11 @@ same as `/readings`) returns stored readings for one provider over a
 trailing window, oldest first — built for switchboard/operator trend
 queries. Storage is **append-only** — the `readings` table has an
 autoincrement `id` and each fetch appends a row; a prune job honors
-`RETENTION_DAYS` (default 7). A trends UI is still Phase 2. The
-`login claude` browser flow is also currently broken
-(agent-notes WI-013); the workaround is a manual login elsewhere.
+`RETENTION_DAYS` (default 7). A trends UI is still Phase 2. The `login
+claude` browser flow's code-exchange failure (agent-notes WI-013) is fixed
+in code (`e871c8c` — the authorize request was missing the non-standard
+`code=true` flag); it awaits a live browser round-trip to confirm, with a
+sacrificial-VM login as the interim workaround.
 
 **Resolved open questions (§13):** z.ai `unit` mappings and the Claude
 `seven_day` reset timestamp are both resolved in the implementation.

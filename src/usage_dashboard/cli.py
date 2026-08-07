@@ -11,6 +11,7 @@ import hashlib
 import http.server
 import json
 import logging
+import re
 import secrets
 import string
 import sys
@@ -385,6 +386,127 @@ def login_ollama(headless: bool = False, verify: bool = True) -> None:
 
 
 # ---------------------------------------------------------------------------
+# OpenCode Go login
+#
+# Same shape as the ollama flow — a human-in-the-loop browser session, because
+# opencode.ai has no usage API and no unattended login. It captures two things:
+# the `auth` cookie and the `wrk_…` workspace id, both of which the fetcher
+# needs. Playwright's context is ephemeral (its own profile, discarded on
+# close), which is what the operator otherwise gets by using a private window:
+# the point is to end the flow by *closing the browser*, never by signing out —
+# signing out invalidates the cookie server-side and the captured value dies
+# with it.
+# ---------------------------------------------------------------------------
+
+_OPENCODE_HOME_URL = "https://opencode.ai/auth"
+_OPENCODE_USER_AGENT = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/126.0.0.0 Safari/537.36"
+)
+# Workspace ids are ULID-shaped: `wrk_` + Crockford base32.
+_WORKSPACE_ID_RE = re.compile(r"\bwrk_[0-9A-HJKMNP-TV-Z]{26}\b")
+
+
+def _opencode_auth_cookie(cookies: Iterable[Mapping[str, Any]]) -> str | None:
+    """The bare ``auth`` cookie value for opencode.ai, if the session set one."""
+    for cookie in cookies:
+        if cookie.get("name") == "auth" and "opencode.ai" in str(cookie.get("domain", "")):
+            return str(cookie["value"])
+    return None
+
+
+def _workspace_id_from(*sources: str) -> str | None:
+    """First ``wrk_…`` id found across *sources* (page URL, then page HTML)."""
+    for source in sources:
+        match = _WORKSPACE_ID_RE.search(source or "")
+        if match is not None:
+            return match.group(0)
+    return None
+
+
+def login_opencode(headless: bool = False, verify: bool = True) -> None:
+    """Drive a browser through the opencode.ai login and print both credentials."""
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        print(
+            "Playwright is required for opencode login. Install it with:\n"
+            "  pip install 'usage-dashboard[login]'\n"
+            "  playwright install chromium",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    print("Opening a browser to opencode.ai ...")
+    print(
+        "Sign in, then navigate to your workspace's Go page\n"
+        "(opencode.ai/workspace/<wrk_...>/go) so the workspace id can be read\n"
+        "from the URL. Return here and press Enter.\n"
+        "Do NOT sign out afterwards — that invalidates the cookie you just took."
+    )
+    try:
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(headless=headless)
+            context = browser.new_context(user_agent=_OPENCODE_USER_AGENT)
+            page = context.new_page()
+            page.goto(_OPENCODE_HOME_URL)
+            input("> Press Enter once you are on the workspace Go page... ")
+            raw_cookies = context.cookies()
+            page_url = page.url
+            try:
+                page_html = page.content()
+            except Exception:  # noqa: BLE001 - content() races a navigation
+                page_html = ""
+            browser.close()
+    except Exception as exc:  # noqa: BLE001 - surface any browser/launch failure
+        print(f"Browser automation failed: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    cookie = _opencode_auth_cookie(raw_cookies)
+    if not cookie:
+        print(
+            "No opencode.ai `auth` cookie captured — login may not have completed.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    workspace_id = _workspace_id_from(page_url, page_html)
+    if not workspace_id:
+        print(
+            "Captured the cookie but found no wrk_... id on the page. Open the\n"
+            "workspace Go page and read the id out of the URL, then set\n"
+            "opencode-workspace-id by hand.",
+            file=sys.stderr,
+        )
+
+    if verify and workspace_id:
+        from usage_dashboard.server.fetch_opencode import fetch_opencode_usage
+
+        try:
+            fetch_opencode_usage(workspace_id, cookie)
+            print("\nVerified: opencode.ai workspace usage parsed with these credentials.")
+        except Exception as exc:  # noqa: BLE001 - verification is best-effort
+            print(
+                f"\nWarning: captured credentials but the usage fetch failed: {exc}\n"
+                "Check the secret after loading it.",
+                file=sys.stderr,
+            )
+
+    print("\nOpenCode Go credentials captured.\n")
+    print("Load them into the k8s Secret (server-secret.yaml):\n")
+    print(f'  opencode-workspace-id: "{workspace_id or "<wrk_... not found>"}"')
+    print(f'  opencode-cookie: "{cookie}"')
+    print()
+    print("Then update the Secret and roll the server, e.g.:")
+    print(
+        "  kubectl -n usage-dashboard patch secret server-secrets --type merge -p \\\n"
+        '    "{\\"stringData\\":{\\"opencode-workspace-id\\":\\"$WORKSPACE\\",'
+        '\\"opencode-cookie\\":\\"$COOKIE\\"}}"'
+    )
+    print("  kubectl -n usage-dashboard rollout restart deploy/usage-dashboard-server")
+
+
+# ---------------------------------------------------------------------------
 # Codex (OpenAI / ChatGPT-plan) login
 #
 # Mirrors the Claude PKCE flow against OpenAI's OAuth (auth.openai.com), using
@@ -543,7 +665,9 @@ def main() -> None:
 
     login_parser = sub.add_parser("login", help="Log in to a provider")
     login_parser.add_argument(
-        "provider", choices=["claude", "ollama", "codex"], help="Provider to log in to"
+        "provider",
+        choices=["claude", "ollama", "opencode", "codex"],
+        help="Provider to log in to",
     )
     login_parser.add_argument(
         "--port",
@@ -560,12 +684,13 @@ def main() -> None:
     login_parser.add_argument(
         "--headless",
         action="store_true",
-        help="[ollama] Run the browser headless (rarely clears WorkOS anti-bot)",
+        help="[ollama|opencode] Run the browser headless (rarely clears an "
+        "anti-bot check; opencode's sign-in needs a real window in practice)",
     )
     login_parser.add_argument(
         "--no-verify",
         action="store_true",
-        help="[ollama] Skip fetching the usage page to validate the cookie",
+        help="[ollama|opencode] Skip fetching the usage page to validate the cookie",
     )
 
     args = parser.parse_args()
@@ -575,6 +700,8 @@ def main() -> None:
             login_claude(port=args.port, no_browser=args.no_browser)
         elif args.provider == "ollama":
             login_ollama(headless=args.headless, verify=not args.no_verify)
+        elif args.provider == "opencode":
+            login_opencode(headless=args.headless, verify=not args.no_verify)
         elif args.provider == "codex":
             login_codex(port=args.port, no_browser=args.no_browser)
     else:

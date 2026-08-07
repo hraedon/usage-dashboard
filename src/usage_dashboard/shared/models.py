@@ -16,6 +16,7 @@ class Provider(Enum):
     ZAI = "zai"
     OLLAMA = "ollama"
     CODEX = "codex"
+    OPENCODE = "opencode"
 
 
 # Claude-family providers that share the OAuth fetch/refresh machinery, mapped
@@ -86,18 +87,26 @@ class ModelUsage:
 
 @dataclass(frozen=True, slots=True)
 class ScopedLimit:
-    """A usage window scoped to a single model (or surface), reported by the
-    Claude ``/api/oauth/usage`` endpoint in its ``limits[]`` array.
+    """An extra usage window beyond the ``session``/``weekly`` pair, rendered as
+    its own additional bar.
 
-    The top-level ``five_hour``/``seven_day`` blocks are all-model aggregates;
-    ``limits[]`` additionally carries ``weekly_scoped`` entries whose ``scope``
-    names a specific model (e.g. ``{"model": {"display_name": "Fable"}}``). This
-    is the only place per-model Claude usage is exposed, so a scoped limit is
-    rendered as its own extra bar rather than folded into the aggregate windows.
+    Two things use it:
 
-    ``is_active`` reflects the endpoint's flag for whether this limit is the
-    currently-binding constraint on the plan (a scoped limit can be present but
-    not active).
+    - **Claude** — a window scoped to a single model, from the
+      ``/api/oauth/usage`` endpoint's ``limits[]`` array. The top-level
+      ``five_hour``/``seven_day`` blocks are all-model aggregates; ``limits[]``
+      additionally carries ``weekly_scoped`` entries whose ``scope`` names a
+      specific model (e.g. ``{"model": {"display_name": "Fable"}}``). This is
+      the only place per-model Claude usage is exposed.
+    - **OpenCode Go** — the *monthly* window. It is an all-model aggregate, not
+      a model scope, but it is structurally the same thing: a third window with
+      a name, a percentage, and a reset time. Giving it first-class
+      ``monthly_*`` fields would mean two more columns only one provider ever
+      populates.
+
+    ``is_active`` reflects the Claude endpoint's flag for whether this limit is
+    the currently-binding constraint on the plan (a scoped limit can be present
+    but not active); other providers leave it False.
     """
 
     name: str

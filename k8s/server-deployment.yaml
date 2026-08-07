@@ -87,6 +87,19 @@ spec:
                   name: server-secrets
                   key: ollama-cookie
                   optional: true
+            # OpenCode Go needs both halves; either alone leaves it unconfigured.
+            - name: OPENCODE_WORKSPACE_ID
+              valueFrom:
+                secretKeyRef:
+                  name: server-secrets
+                  key: opencode-workspace-id
+                  optional: true
+            - name: OPENCODE_COOKIE
+              valueFrom:
+                secretKeyRef:
+                  name: server-secrets
+                  key: opencode-cookie
+                  optional: true
             - name: CODEX_TOKEN
               valueFrom:
                 secretKeyRef:
