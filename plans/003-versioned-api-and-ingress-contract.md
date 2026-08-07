@@ -102,6 +102,48 @@ switchboard remains free to hold its own *in-flight* observations (it already
 does, in `token_budget.py`) and reconcile them against the canonical reading.
 That is a cache, not a second source of truth.
 
+## Status (updated 2026-08-07)
+
+| WP | State |
+|----|-------|
+| WP-1 | **DONE** — `tests/fixtures/readings.json` recorded, contract test asserts every key `DashboardTruthSource` reads. |
+| WP-2 | **DONE** — one `APIRouter` mounted at `/api/v1` and at the legacy root, so the two path sets cannot drift. |
+| WP-3 | items 1+3 **DONE** (single `/api` Prefix in the template; guard is prefix-coverage-aware). Item 2 (commit real manifests) **awaiting owner decision**. |
+| WP-4 | **Blocked** — `mpmusage02` is offsite; cannot confirm both units on a WP-2 client. |
+| WP-5 | Not started. |
+
+**Premises that moved since this plan was written (2026-08-03):**
+
+1. **The switchboard motive is confirmed and sharpened** (owner, 2026-08-07):
+   switchboard will route by usage, and usage history is to be **centralized in
+   usage-dashboard so provider calls are not doubled**. That settles open
+   question 3 in favour of usage-dashboard as the canonical store, and it is
+   what makes the version prefix earn its keep — a second consumer on an
+   independent release cycle. Note `DashboardTruthSource` is still
+   single-provider and will need rework for multi-provider routing; that is
+   switchboard-side work, not a change to this contract.
+2. **`/history` is now externally routed.** This happened on 2026-08-07 as a
+   side effect of syncing the live ingress to the app contract — precisely the
+   "conscious decision, not a side effect" this plan's Risks section asked to
+   avoid. It is bearer-authenticated and returns 401 unauthenticated, so it is
+   consistent with its siblings, but it was not an explicit decision. Ratify or
+   revert it deliberately.
+3. **The guard that landed is not yet WP-3 item 3.** It asserts *every authed
+   route is routed externally and no unauthed one is* — the enumerated-list
+   contract. Item 3 as written asks for *no authenticated route defined outside
+   `/api/`*, which is a different and stronger claim. Still to do.
+
+**Open question 1 is now load-bearing, not theoretical.** This plan asks whether
+exposure should be *declared per route* rather than *inferred from "is it
+authenticated"*. The guard currently encodes `authed ⇒ external`, and a single
+`/api` Prefix rule makes that inference automatic: every future authenticated
+route is externally reachable the moment it exists. That is a default-**allow**
+posture for external exposure, sitting inside a plan whose stated purpose is to
+preserve deny-by-default. `/history` is the worked example — it was exposed
+without anyone deciding to. There is no authed-but-internal-only route today
+(an admin or debug endpoint would be the first), so this is cheap to settle now
+and expensive later.
+
 ## Plan
 
 Four work packages. WP-1 is independent and can land any time; WP-2→WP-4 are

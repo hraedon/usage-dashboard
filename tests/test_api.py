@@ -688,3 +688,92 @@ class TestRefreshEndpoint:
             assert response.status_code == 200
 
         asyncio.run(_test())
+
+
+class TestVersionedApiSurface:
+    """Plan 003 WP-2: authenticated routes move under /api/v1, legacy paths
+    keep working as aliases until the fleet has rolled (WP-4).
+
+    The server rolls on an image rebuild; the Pis roll on their own 15-minute
+    timer. A flag-day rename would 404 every unit until it caught up — quietly,
+    which is the exact failure this plan exists to end.
+    """
+
+    _AUTHED = [("GET", "/readings"), ("GET", "/schedule"), ("GET", "/history")]
+
+    def test_authed_routes_answer_on_both_path_sets(self, tmp_path):
+        app, db = _create_app_with_db(tmp_path, configured_providers=[Provider.CLAUDE])
+        db.store_reading(_make_reading(provider=Provider.CLAUDE))
+
+        async def _test():
+            async with _client(app) as client:
+                for method, path in self._AUTHED:
+                    for full in (path, f"/api/v1{path}"):
+                        r = await client.request(
+                            method, full,
+                            params={"provider": "claude", "hours": 1},
+                            headers={"Authorization": f"Bearer {API_KEY}"},
+                        )
+                        assert r.status_code == 200, f"{method} {full} -> {r.status_code}"
+
+        asyncio.run(_test())
+
+    def test_both_path_sets_return_identical_payloads(self, tmp_path):
+        # Mounted from one router, so they cannot diverge — assert it, because
+        # a future refactor that re-declares the alias separately could.
+        app, db = _create_app_with_db(tmp_path, configured_providers=[Provider.CLAUDE])
+        db.store_reading(_make_reading(provider=Provider.CLAUDE))
+
+        async def _test():
+            async with _client(app) as client:
+                h = {"Authorization": f"Bearer {API_KEY}"}
+                legacy = await client.get("/readings", headers=h)
+                versioned = await client.get("/api/v1/readings", headers=h)
+                assert legacy.json() == versioned.json()
+
+        asyncio.run(_test())
+
+    def test_versioned_routes_still_require_auth(self, tmp_path):
+        # The /api prefix is routed externally as a single rule, so anything
+        # under it that forgot its dependency would be internet-reachable.
+        app, _db = _create_app_with_db(tmp_path)
+
+        async def _test():
+            async with _client(app) as client:
+                for _method, path in self._AUTHED:
+                    r = await client.get(f"/api/v1{path}")
+                    assert r.status_code == 401, f"/api/v1{path} -> {r.status_code}"
+                r = await client.post("/api/v1/refresh")
+                assert r.status_code == 401
+
+        asyncio.run(_test())
+
+    def test_no_unauthenticated_view_is_reachable_under_api(self, tmp_path):
+        # The whole /api prefix is public-facing. /dashboard is deliberately
+        # unauthenticated for the private network; it must not acquire an /api
+        # alias by accident.
+        app, _db = _create_app_with_db(tmp_path)
+
+        async def _test():
+            async with _client(app) as client:
+                for path in ("/api/v1/dashboard", "/api/dashboard", "/api/v1/",
+                             "/api/v1/health", "/api/health", "/api"):
+                    r = await client.get(path)
+                    assert r.status_code == 404, f"{path} -> {r.status_code}"
+
+        asyncio.run(_test())
+
+    def test_every_authed_route_has_a_versioned_twin(self, tmp_path):
+        # Derived from the app, so a route added to only one mount is caught
+        # rather than depending on this test's hardcoded list staying current.
+        from fastapi.routing import APIRoute
+
+        from usage_dashboard.server.api import API_V1_PREFIX
+        app, _db = _create_app_with_db(tmp_path)
+        paths = {r.path for r in app.routes if isinstance(r, APIRoute)}
+        versioned = {p for p in paths if p.startswith(API_V1_PREFIX)}
+        legacy_of = {p[len(API_V1_PREFIX):] for p in versioned}
+        assert legacy_of <= paths, (
+            f"versioned routes with no legacy alias: {sorted(legacy_of - paths)}"
+        )
+        assert versioned, "no versioned routes registered at all"

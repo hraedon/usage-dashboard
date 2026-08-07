@@ -10,7 +10,7 @@ from collections.abc import Callable, Iterable
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import APIRouter, Depends, FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
@@ -28,6 +28,58 @@ from usage_dashboard.shared.models import (
 from usage_dashboard.shared.offpeak import qwen_peak_countdown, zai_is_offpeak
 
 _bearer_scheme = HTTPBearer(auto_error=False)
+
+# Every authenticated route is served under this prefix (Plan 003 WP-2). The
+# unauthenticated routes (`/`, `/dashboard`, `/health`) deliberately stay off
+# `/api` entirely — that is what lets the external ingress route one `/api`
+# prefix instead of a hand-maintained path list that has silently 404'd the Pi
+# fleet three times (WI-024).
+API_V1_PREFIX = "/api/v1"
+
+# The pre-prefix paths keep working. The server rolls on an image rebuild while
+# the Pis roll on their own 15-minute `update.sh` timer, so a flag-day rename
+# would 404 the whole fleet until every unit caught up. Both path sets are
+# served from ONE router mounted twice, so they cannot drift apart. Retiring
+# these is WP-4, gated on both units being confirmed on a WP-2 client.
+LEGACY_ALIAS_PREFIX = ""
+
+# --- Exposure declaration (Plan 003 WP-3, open question 1) -------------------
+#
+# Whether a route is reachable from the public host is DECLARED, never inferred.
+# Inferring it from "is it authenticated" is default-allow: with a single `/api`
+# Prefix on the external ingress, every new authenticated route would be
+# internet-reachable the moment it exists. That is how `/history` got exposed on
+# 2026-08-07 without anyone deciding to.
+#
+# Spread these into the route decorator. The contract test requires EVERY
+# authenticated route to carry one — an undeclared route fails the build rather
+# than defaulting either way, so adding a route forces the decision.
+#
+#   @api.get("/readings", **EXTERNAL)
+#   @api.get("/admin/reset", **INTERNAL_ONLY)
+#
+# INTERNAL_ONLY routes must be mounted off `/api` (see INTERNAL_V1_PREFIX) so
+# the single external `/api` rule cannot reach them; the guard enforces that a
+# declared-internal route is NOT covered by the external ingress.
+EXPOSURE_KEY = "x-exposure"
+EXPOSURE_EXTERNAL = "external"
+EXPOSURE_INTERNAL_ONLY = "internal-only"
+
+EXTERNAL: dict[str, Any] = {"openapi_extra": {EXPOSURE_KEY: EXPOSURE_EXTERNAL}}
+INTERNAL_ONLY: dict[str, Any] = {"openapi_extra": {EXPOSURE_KEY: EXPOSURE_INTERNAL_ONLY}}
+
+# Reserved for authenticated-but-internal-only routes (an admin or debug
+# endpoint). Deliberately NOT under /api, which the external ingress routes
+# wholesale. Empty today; the machinery exists so the first such route cannot
+# be exposed by accident.
+INTERNAL_V1_PREFIX = "/internal/v1"
+
+
+def route_exposure(route: Any) -> str | None:
+    """Declared exposure for *route*, or None if it never declared one."""
+    extra = getattr(route, "openapi_extra", None) or {}
+    value = extra.get(EXPOSURE_KEY)
+    return value if isinstance(value, str) else None
 
 # Upper bound for /history windows — matches the default 7-day retention
 # (RETENTION_DAYS). Larger windows are accepted up to this cap; rows older
@@ -250,6 +302,9 @@ def create_app(
 ) -> FastAPI:
     app = FastAPI()
     auth = _make_auth_dependency(api_key)
+    # Authenticated routes live on this router so they can be mounted at both
+    # /api/v1 and the legacy root paths from a single definition.
+    api = APIRouter()
 
     # Only report providers that are actually configured. A provider that was
     # never configured is omitted entirely rather than fabricated as "offline",
@@ -269,7 +324,7 @@ def create_app(
             for provider in providers
         ]
 
-    @app.get("/readings")
+    @api.get("/readings", **EXTERNAL)
     async def get_readings(
         _user: str = Depends(auth),
     ) -> list[dict[str, Any]]:
@@ -284,7 +339,7 @@ def create_app(
     refresh_lock = threading.Lock()
     refresh_last: float = -math.inf
 
-    @app.post("/refresh")
+    @api.post("/refresh", **EXTERNAL)
     async def refresh(_user: str = Depends(auth)) -> dict[str, Any]:
         if scheduler is None:
             raise HTTPException(
@@ -308,7 +363,7 @@ def create_app(
         await asyncio.to_thread(scheduler.fetch_now)
         return {"status": "ok", "refreshed": True}
 
-    @app.get("/history")
+    @api.get("/history", **EXTERNAL)
     async def get_history(
         provider: str,
         hours: float = 24.0,
@@ -350,7 +405,7 @@ def create_app(
         now = datetime.now(timezone.utc).replace(tzinfo=None)
         return HTMLResponse(_render_dashboard_html(_reported_readings(), now))
 
-    @app.get("/schedule")
+    @api.get("/schedule", **EXTERNAL)
     async def get_schedule(
         unit: str | None = None,
         _user: str = Depends(auth),
@@ -363,5 +418,11 @@ def create_app(
     @app.get("/health")
     async def health() -> dict[str, str]:
         return {"status": "ok"}
+
+    # Mount the authenticated surface twice: canonically under /api/v1, and at
+    # the legacy root paths for the fleet still on the old client. Same router
+    # object, so a route can never exist on one set and not the other.
+    app.include_router(api, prefix=API_V1_PREFIX)
+    app.include_router(api, prefix=LEGACY_ALIAS_PREFIX)
 
     return app
