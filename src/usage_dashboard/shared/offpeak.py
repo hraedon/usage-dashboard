@@ -22,6 +22,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
+from usage_dashboard.shared.format import format_duration
+
 _UTC8 = timezone(timedelta(hours=8))
 
 # z.ai peak window (Mon–Fri 14:00–18:00 Singapore time).
@@ -123,3 +125,31 @@ def qwen_peak_countdown(now: datetime | None = None) -> PeakWindow:
         return PeakWindow(in_peak=False, seconds_to_boundary=(boundary - local).total_seconds())
     boundary = _next_or_same_utc8(local, _QWEN_PEAK_END_HOUR)
     return PeakWindow(in_peak=True, seconds_to_boundary=(boundary - local).total_seconds())
+
+
+def peak_label(window: PeakWindow) -> str:
+    """The user-facing countdown text for a peak window.
+
+    Both surfaces render this string, so neither can answer "is it peak?"
+    without also answering "for how long?". Keeping the *wording* here (not
+    just the arithmetic) is the point: the peak maths was already shared when
+    the z.ai countdown shipped on the panel and never reached the web view —
+    what diverged was the text built on top of it (WI-030, WI-020 before it).
+    """
+    return (
+        f"peak in {format_duration(window.seconds_to_boundary)}"
+        if not window.in_peak
+        else f"ends in {format_duration(window.seconds_to_boundary)}"
+    )
+
+
+def zai_peak_label(now: datetime | None = None) -> str:
+    """z.ai peak countdown text, e.g. 'peak in 3h 24m' / 'ends in 1h 24m'."""
+    return peak_label(zai_peak_countdown(now))
+
+
+def qwen_peak_label(now: datetime | None = None) -> str:
+    """Qwen peak countdown text. Callers prefix the provider name themselves
+    (the Pi's status bar writes 'QWEN <label>'; the web card's header already
+    says QWEN)."""
+    return peak_label(qwen_peak_countdown(now))

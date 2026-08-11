@@ -294,7 +294,10 @@ class TestDashboardEndpoint:
             async with _client(app) as client:
                 response = await client.get("/dashboard")
             assert "<h2 style=\"color:" in response.text
-            assert ">ZAI</h2>" in response.text
+            # The heading now carries the peak countdown as a trailing span
+            # (WI-030), so ZAI is no longer the whole element body.
+            assert ">ZAI<" in response.text
+            assert 'class="peak"' in response.text
 
         asyncio.run(_test())
 

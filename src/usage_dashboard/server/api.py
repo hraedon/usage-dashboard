@@ -25,7 +25,12 @@ from usage_dashboard.shared.models import (
     ReadingStatus,
     make_offline_reading,
 )
-from usage_dashboard.shared.offpeak import qwen_peak_countdown, zai_is_offpeak
+from usage_dashboard.shared.offpeak import (
+    qwen_peak_countdown,
+    qwen_peak_label,
+    zai_is_offpeak,
+    zai_peak_label,
+)
 
 _bearer_scheme = HTTPBearer(auto_error=False)
 
@@ -128,19 +133,6 @@ def _countdown_text(resets_at: datetime | None, now: datetime) -> str:
     return f"resets {hours}h {minutes}m"
 
 
-def _countdown_short(total_seconds: float) -> str:
-    """Abbreviated countdown for window boundaries: 204 -> '3h 24m'."""
-    seconds = max(0, int(total_seconds))
-    days = seconds // 86400
-    hours = (seconds % 86400) // 3600
-    minutes = (seconds % 3600) // 60
-    if days > 0:
-        return f"{days}d {hours}h"
-    if hours > 0:
-        return f"{hours}h {minutes}m"
-    return f"{max(1, minutes)}m"
-
-
 def _status_badge(reading: Reading) -> str:
     if reading.status == ReadingStatus.OFFLINE:
         return ' <span class="badge">offline</span>'
@@ -192,9 +184,19 @@ def _render_dashboard_html(readings: list[Reading], now: datetime) -> str:
         # Singapore time): tint the card header green off-peak / orange peak so
         # "use it now vs wait it out" is glanceable from across the room.
         header_style = ""
+        peak_note = ""
         if reading.provider == Provider.ZAI:
-            color = _CSS_GREEN if zai_is_offpeak(now) else _CSS_ORANGE
+            offpeak = zai_is_offpeak(now)
+            color = _CSS_GREEN if offpeak else _CSS_ORANGE
             header_style = f' style="color:{color}"'
+            # ...and say how long it lasts. The tint alone answers "is it
+            # peak?" but not "for how much longer?", which is the actionable
+            # half — you cannot tell from a colour whether to start a job now
+            # or wait twenty minutes. Same label the panel shows (WI-030).
+            peak_note = (
+                f'<span class="peak" style="color:{color}">'
+                f"{html.escape(zai_peak_label(now))}</span>"
+            )
         if reading.provider == Provider.CLAUDE and work is not None:
             body = _account_rows(reading, now, "me") + _account_rows(work, now, "work")
         else:
@@ -208,7 +210,10 @@ def _render_dashboard_html(readings: list[Reading], now: datetime) -> str:
                 f'<div class="detail" style="color:{detail_color}">'
                 f"{html.escape(reading.detail)}</div>"
             )
-        cards.append(f'<section class="card"><h2{header_style}>{name}</h2>{body}</section>')
+        cards.append(
+            f'<section class="card"><h2{header_style}>{name}{peak_note}</h2>'
+            f"{body}</section>"
+        )
 
     # Display-only QWEN tag: no data source, just whether we're inside the Qwen
     # token plan's off-peak window (22:00–08:00 UTC+8), when credits consume
@@ -216,11 +221,7 @@ def _render_dashboard_html(readings: list[Reading], now: datetime) -> str:
     # umans card.
     qwen = qwen_peak_countdown(now)
     qwen_color = _CSS_GREEN if not qwen.in_peak else _CSS_ORANGE
-    qwen_label = (
-        f"peak in {_countdown_short(qwen.seconds_to_boundary)}"
-        if not qwen.in_peak
-        else f"peak ends in {_countdown_short(qwen.seconds_to_boundary)}"
-    )
+    qwen_label = qwen_peak_label(now)
     cards.append(
         f'<section class="card"><h2 style="color:{qwen_color}">QWEN</h2>'
         f'<div class="detail" style="color:{qwen_color}">{qwen_label}</div></section>'
@@ -254,6 +255,11 @@ header h1 {{ margin:4px 4px 12px; font-size:1.1rem; font-weight:600;
 h2 {{ margin:0 0 10px; font-size:1.05rem; letter-spacing:0.04em; }}
 .badge {{ font-size:0.7rem; color:#eab308; border:1px solid #eab308;
   border-radius:6px; padding:1px 6px; vertical-align:middle; }}
+/* Peak-window countdown beside a card title. Floated right so it reads as a
+   subtitle rather than part of the provider name, matching the Pi, where it
+   sits in the tile's subtitle slot. */
+.peak {{ float:right; font-size:0.78rem; font-weight:400;
+  letter-spacing:0; line-height:1.6; }}
 .row {{ display:flex; align-items:center; gap:10px; }}
 .label {{ width:96px; font-size:0.85rem; color:#ccc; }}
 .track {{ flex:1; height:12px; background:#323232; border-radius:6px; overflow:hidden;
