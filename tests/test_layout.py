@@ -82,6 +82,92 @@ class TestMainLayout:
             < by[Provider.ZAI].rect.y
         )
 
+    def test_opencode_pairs_with_codex_keeping_three_rows(self) -> None:
+        readings = _all_configured() + [
+            _reading(Provider.CODEX), _reading(Provider.OPENCODE),
+        ]
+        layout = build_main_layout(readings, _SIZE, now=_NOW)
+        by = {t.provider: t for t in layout.tiles}
+        codex, opencode = by[Provider.CODEX], by[Provider.OPENCODE]
+        # Codex and OpenCode share one row, side by side, no overlap.
+        assert codex.rect.y == opencode.rect.y
+        assert codex.rect.x < opencode.rect.x
+        assert codex.rect.x + codex.rect.w <= opencode.rect.x
+        # Both go compact (half width) rather than Codex keeping a full row.
+        assert codex.compact is True
+        assert opencode.compact is True
+        assert codex.rect.w < by[Provider.CLAUDE].rect.w
+        # Still three rows: Claude, Codex|OpenCode, zai|ollama.
+        assert len({t.rect.y for t in layout.tiles}) == 3
+
+    def test_codex_stays_full_width_when_opencode_absent(self) -> None:
+        """The regression group-scoped pairing exists to prevent.
+
+        With a flat "pairable" set, dropping OpenCode leaves CODEX adjacent to
+        ZAI and the two pair up — stranding OLLAMA on its own row and silently
+        restyling a layout that has nothing to do with OpenCode.
+        """
+        readings = _all_configured() + [_reading(Provider.CODEX)]
+        layout = build_main_layout(readings, _SIZE, now=_NOW)
+        by = {t.provider: t for t in layout.tiles}
+        assert Provider.OPENCODE not in by
+        # Codex full-width and alone on its row...
+        assert by[Provider.CODEX].rect.w == by[Provider.CLAUDE].rect.w
+        assert by[Provider.CODEX].compact is False
+        assert by[Provider.CODEX].rect.y != by[Provider.ZAI].rect.y
+        # ...and the zai/ollama pair is untouched.
+        assert by[Provider.ZAI].rect.y == by[Provider.OLLAMA].rect.y
+
+    def test_show_opencode_false_restores_the_previous_layout(self) -> None:
+        """The revert switch must reproduce the pre-OpenCode layout exactly."""
+        readings = _all_configured() + [
+            _reading(Provider.CODEX), _reading(Provider.OPENCODE),
+        ]
+        reverted = build_main_layout(readings, _SIZE, now=_NOW, show_opencode=False)
+        # Byte-for-byte the same geometry as a fleet that never reported OpenCode.
+        without = build_main_layout(
+            _all_configured() + [_reading(Provider.CODEX)], _SIZE, now=_NOW,
+        )
+        assert [t.provider for t in reverted.tiles] == [
+            t.provider for t in without.tiles
+        ]
+        assert [t.rect for t in reverted.tiles] == [t.rect for t in without.tiles]
+        assert [t.compact for t in reverted.tiles] == [
+            t.compact for t in without.tiles
+        ]
+
+    def test_compact_scoped_limit_label_is_abbreviated(self) -> None:
+        """OpenCode's monthly window is a ScopedLimit; on a paired tile its
+        label must shrink to an initial so it doesn't widen the compact label
+        column (which is shared by every paired tile, not just this one)."""
+        opencode = _reading(
+            Provider.OPENCODE,
+            scoped_limits=[ScopedLimit(
+                name="Monthly", percent=9.0,
+                resets_at=_NOW + timedelta(days=22), is_active=False,
+            )],
+        )
+        layout = build_main_layout(
+            [_reading(Provider.CODEX), opencode], _SIZE, now=_NOW,
+        )
+        by = {t.provider: t for t in layout.tiles}
+        assert by[Provider.OPENCODE].compact is True
+        assert [b.label for b in by[Provider.OPENCODE].bars] == ["S", "W", "M"]
+
+    def test_full_width_scoped_limit_label_is_not_abbreviated(self) -> None:
+        """Claude is never paired, so its Fable bar keeps the readable name."""
+        claude = _reading(
+            Provider.CLAUDE,
+            scoped_limits=[ScopedLimit(
+                name="Fable", percent=13.0,
+                resets_at=_NOW + timedelta(days=3), is_active=False,
+            )],
+        )
+        layout = build_main_layout([claude], _SIZE, now=_NOW)
+        assert [b.label for b in layout.tiles[0].bars] == [
+            "Session", "Weekly", "Fable",
+        ]
+
     def test_overhead_gives_equal_row_heights(self) -> None:
         # With tile_overhead specified, a 3-bar tile and a 2-bar tile get
         # equal row heights: (tile_h - overhead) / n_bars is the same.

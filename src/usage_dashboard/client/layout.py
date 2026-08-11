@@ -24,25 +24,44 @@ from usage_dashboard.shared.offpeak import qwen_peak_countdown, zai_is_peak, zai
 
 # Fixed tile order so a provider always lands in the same place frame to frame.
 # A provider absent from this list gets no tile: CLAUDE_WORK folds into the
-# CLAUDE tile as a second, muted set of bars, and OPENCODE is server-side only
-# for now — it shows on the web /dashboard but is deliberately kept off the Pi
-# panel. A 5th full-width row would take the grid to 4 rows, and since the fixed
+# CLAUDE tile as a second, muted set of bars.
+#
+# OPENCODE earns a tile by *pairing with CODEX* rather than taking a row of its
+# own. A 5th full-width row would push the grid to 4 rows, and since the fixed
 # per-tile overhead (title + padding) is charged once per row, the height left
-# for bars drops by roughly two thirds. When it does earn a tile, pair it with
-# CODEX to stay at 3 rows — which needs _PAIRED_PROVIDERS to become explicit
-# pair *groups*, or CODEX would wrongly pair with ZAI whenever OpenCode Go is
-# unconfigured.
+# for bars would drop by roughly two thirds. Pairing keeps the grid at 3 rows,
+# and it costs nothing: CODEX carries a single weekly bar, so it was spending a
+# full-width row on one bar.
 _PROVIDER_ORDER: list[Provider] = [
     Provider.CLAUDE,
     Provider.CODEX,
+    Provider.OPENCODE,
     Provider.ZAI,
     Provider.OLLAMA,
 ]
 
-# Providers rendered half-width so two consecutive ones share a row, freeing
-# vertical space. Claude/Codex stay full-width (Claude carries an extra Fable
-# bar and can fold in a work account); z.ai + ollama pair up beneath them.
-_PAIRED_PROVIDERS: frozenset[Provider] = frozenset({Provider.ZAI, Provider.OLLAMA})
+# Providers rendered half-width so the two members of a group share a row,
+# freeing vertical space. CLAUDE stays full-width on its own (it carries an
+# extra Fable bar and can fold in a work account).
+#
+# These are explicit *pair groups*, not one flat set of "pairable" providers.
+# A flat set pairs any two adjacent members, so with OpenCode Go unconfigured
+# the order collapses to CLAUDE, CODEX, ZAI, OLLAMA and CODEX would wrongly
+# pair with ZAI — leaving OLLAMA stranded on its own row and silently changing
+# a layout that has nothing to do with OpenCode. Grouping keeps a partner
+# absence local: CODEX simply goes full-width, exactly as it does today.
+_PAIR_GROUPS: tuple[frozenset[Provider], ...] = (
+    frozenset({Provider.CODEX, Provider.OPENCODE}),
+    frozenset({Provider.ZAI, Provider.OLLAMA}),
+)
+
+
+def _pair_group(provider: Provider) -> frozenset[Provider] | None:
+    """The pair group *provider* belongs to, or None if it never pairs."""
+    for group in _PAIR_GROUPS:
+        if provider in group:
+            return group
+    return None
 
 Color = tuple[int, int, int]
 
@@ -142,8 +161,14 @@ def _bars_for(
     ]
     # Per-model scoped windows (e.g. Fable) render as extra bars after the
     # aggregate two; the label is the model name so the tile stays legible.
+    # On a compact tile the scoped label is cut to its initial, matching the
+    # S/W abbreviations beside it (OpenCode Go's "Monthly" -> "M"). The label
+    # column is sized to the widest label *in the compact group*, so leaving a
+    # full word here would shrink the bars on every paired tile, not just this
+    # one.
     for sl in reading.scoped_limits or []:
-        windows.append((sl.name, sl.percent, sl.resets_at))
+        label = sl.name[:1].upper() if compact and sl.name else sl.name
+        windows.append((label, sl.percent, sl.resets_at))
     # Skip windows with no data (e.g. Codex weekly-only mode has no session
     # limit; showing a grayed "N/A" bar is misleading).
     windows = [(lbl, pct, rst) for lbl, pct, rst in windows if pct is not None]
@@ -231,6 +256,7 @@ def build_main_layout(
     refresh_interval: int | None = None,
     tile_overhead: int | None = None,
     refresh_pending: bool = False,
+    show_opencode: bool = True,
 ) -> MainLayout:
     """Lay out provider tiles in a grid plus a bottom status bar.
 
@@ -239,6 +265,12 @@ def build_main_layout(
     knows the real font height), row heights are distributed so that every
     tile's bars get the same row height regardless of bar count.  When None,
     an estimate from the screen size is used.
+
+    *show_opencode* is the revert switch for the OpenCode Go tile (driven by
+    ``GUI_OPENCODE_TILE`` in the unit's env file). Setting it False drops the
+    tile, and because pairing is group-scoped CODEX then returns to full width
+    on its own row — i.e. exactly the layout that shipped before the tile
+    existed, with no code revert and no redeploy.
     """
     width, height = size
     by_provider = {r.provider: r for r in readings}
@@ -248,6 +280,8 @@ def build_main_layout(
     # from the personal account when present (else the work account).
     tile_plan: list[tuple[Provider, Reading]] = []
     for provider in _PROVIDER_ORDER:
+        if provider is Provider.OPENCODE and not show_opencode:
+            continue
         if provider is Provider.CLAUDE:
             primary = by_provider.get(Provider.CLAUDE) or by_provider.get(Provider.CLAUDE_WORK)
             if primary is not None:
@@ -279,7 +313,10 @@ def build_main_layout(
     while idx < len(tile_plan):
         provider = tile_plan[idx][0]
         nxt = tile_plan[idx + 1][0] if idx + 1 < len(tile_plan) else None
-        if provider in _PAIRED_PROVIDERS and nxt in _PAIRED_PROVIDERS:
+        group = _pair_group(provider)
+        # Pair only with the *same group's* partner, so an absent partner leaves
+        # this provider full-width instead of pairing it with whoever follows.
+        if group is not None and nxt is not None and nxt in group:
             rows_plan.append([tile_plan[idx], tile_plan[idx + 1]])
             idx += 2
         else:
