@@ -8,6 +8,11 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
+# format_duration is re-exported so client call sites keep reading
+# `fmt.format_duration(...)`. It lives in shared/ because the web dashboard
+# renders the same durations — it was a byte-identical copy of
+# server/api._countdown_short until WI-030.
+from usage_dashboard.shared.format import format_duration  # noqa: F401
 from usage_dashboard.shared.models import Reading, ReadingStatus
 
 # Colour palette (RGB), matching the web dashboard's thresholds.
@@ -48,18 +53,6 @@ def bar_color(percent: float | None) -> tuple[int, int, int]:
     return GREEN
 
 
-def format_duration(total_seconds: float) -> str:
-    """Compact duration label, same style as :func:`format_countdown` but for a
-    raw second count: 45 -> '1m', 12240 -> '3h 24m', 176400 -> '2d 1h'."""
-    seconds = max(0, int(total_seconds))
-    days = seconds // 86400
-    hours = (seconds % 86400) // 3600
-    minutes = (seconds % 3600) // 60
-    if days > 0:
-        return f"{days}d {hours}h"
-    if hours > 0:
-        return f"{hours}h {minutes}m"
-    return f"{max(1, minutes)}m"
 
 
 def format_countdown(

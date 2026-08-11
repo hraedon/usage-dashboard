@@ -20,7 +20,12 @@ from usage_dashboard.shared.models import (
     Provider,
     Reading,
 )
-from usage_dashboard.shared.offpeak import qwen_peak_countdown, zai_is_peak, zai_peak_countdown
+from usage_dashboard.shared.offpeak import (
+    qwen_peak_countdown,
+    qwen_peak_label,
+    zai_is_peak,
+    zai_peak_label,
+)
 
 # Fixed tile order so a provider always lands in the same place frame to frame.
 # A provider absent from this list gets no tile: CLAUDE_WORK folds into the
@@ -293,11 +298,7 @@ def build_main_layout(
     # long until the next boundary — peak start when currently off-peak, peak
     # end when in peak. Replaces the retired umans slot.
     qwen = qwen_peak_countdown(now)
-    footer_note = (
-        f"QWEN peak in {fmt.format_duration(qwen.seconds_to_boundary)}"
-        if not qwen.in_peak
-        else f"QWEN ends in {fmt.format_duration(qwen.seconds_to_boundary)}"
-    )
+    footer_note = f"QWEN {qwen_peak_label(now)}"
     footer_color = fmt.GREEN if not qwen.in_peak else fmt.ORANGE
 
     margin = max(4, round(width * 0.02))
@@ -359,12 +360,7 @@ def build_main_layout(
             if provider is Provider.OLLAMA and not is_paired:
                 subtitle = _model_subtitle(reading.models)
             elif provider is Provider.ZAI:
-                zai_peak = zai_peak_countdown(now)
-                subtitle = (
-                    f"peak in {fmt.format_duration(zai_peak.seconds_to_boundary)}"
-                    if not zai_peak.in_peak
-                    else f"ends in {fmt.format_duration(zai_peak.seconds_to_boundary)}"
-                )
+                subtitle = zai_peak_label(now)
             else:
                 subtitle = ""
             # z.ai's plan burns quota at a discount off-peak (peak = Mon–Fri
