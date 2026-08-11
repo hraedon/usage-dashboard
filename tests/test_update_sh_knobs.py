@@ -70,6 +70,134 @@ class TestKnobResolution:
                             "AUTO_REDEPLOY") == "1"
 
 
+def _run_updater(tmp_path, ref: str, *, auto_redeploy: str = "1", tag=None):
+    """Run the real update.sh against a throwaway git repo.
+
+    Renders the @APPDIR@/@VENV@ placeholders like install.sh does, and shims
+    `sudo` so the redeploy hand-off is observable without root. *tag* is an
+    optional ``(name, annotated)`` pair created on origin before cloning.
+    """
+    origin = tmp_path / "origin"
+    origin.mkdir()
+    git = ["git", "-C", str(origin)]
+    subprocess.run(git + ["init", "--quiet", "-b", "main"], check=True)
+    subprocess.run(git + ["config", "user.email", "t@t"], check=True)
+    subprocess.run(git + ["config", "user.name", "t"], check=True)
+    (origin / "f").write_text("x")
+    subprocess.run(git + ["add", "f"], check=True)
+    subprocess.run(git + ["commit", "--quiet", "-m", "init"], check=True)
+    if tag is not None:
+        name, annotated = tag
+        subprocess.run(
+            git + (["tag", "-a", name, "-m", name] if annotated else ["tag", name]),
+            check=True,
+        )
+
+    appdir = tmp_path / "app"
+    subprocess.run(
+        ["git", "clone", "--quiet", str(origin), str(appdir)], check=True
+    )
+
+    # A `sudo` shim on PATH records the redeploy hand-off; a `usage-dashboard-
+    # redeploy` stub makes the -x test pass.
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    marker = tmp_path / "redeploy-ran"
+    (bin_dir / "sudo").write_text(
+        f'#!/bin/sh\necho ran >> "{marker}"\nexit 0\n'
+    )
+    (bin_dir / "sudo").chmod(0o755)
+    helper = tmp_path / "usage-dashboard-redeploy"
+    helper.write_text("#!/bin/sh\nexit 0\n")
+    helper.chmod(0o755)
+
+    script = tmp_path / "update.sh"
+    body = UPDATE_SH.read_text().replace("@APPDIR@", str(appdir)).replace(
+        "@VENV@", str(tmp_path / "venv")
+    )
+    # Point the helper -x check at our stub rather than /usr/local/bin.
+    body = body.replace("/usr/local/bin/usage-dashboard-redeploy", str(helper))
+    script.write_text(body)
+    script.chmod(0o755)
+
+    state = tmp_path / "state"
+    proc = subprocess.run(
+        ["bash", str(script)],
+        capture_output=True,
+        text=True,
+        env={
+            "PATH": f"{bin_dir}:/usr/bin:/bin",
+            "HOME": str(tmp_path),
+            "XDG_STATE_HOME": str(state),
+            "UPDATE_REF": ref,
+            "AUTO_REDEPLOY": auto_redeploy,
+        },
+    )
+    check_file = state / "usage-dashboard" / "update-last-check"
+    return proc, (check_file.read_text().strip() if check_file.exists() else ""), marker
+
+
+class TestUnresolvableRefIsLoudNotSilent:
+    """WI-031: a pinned ref that no longer exists must not stall the unit
+    invisibly. Merged PR branches are deleted, so this is the normal end state
+    of a staged rollout, not an exotic typo."""
+
+    def test_bad_ref_writes_a_breadcrumb_and_fails(self, tmp_path):
+        proc, check, _ = _run_updater(tmp_path, "no-such-branch")
+        assert proc.returncode != 0, "a bad pin must not look like success"
+        assert "no-such-branch" in proc.stdout, (
+            "the log must name the unresolvable ref"
+        )
+        assert "STALLED" in proc.stdout
+        # The breadcrumb is what lets the panel say "stalled" not just "stale".
+        assert check.split()[1] == "bad-ref", (
+            f"expected a bad-ref breadcrumb, got {check!r}"
+        )
+
+    def test_bad_ref_still_runs_auto_redeploy(self, tmp_path):
+        """Infra self-correction must not die with a bad app pin."""
+        _, _, marker = _run_updater(tmp_path, "no-such-branch")
+        assert marker.exists(), (
+            "auto-redeploy must still run when the app ref cannot be resolved"
+        )
+
+    def test_bad_ref_does_not_silently_fall_back_to_main(self, tmp_path):
+        proc, check, _ = _run_updater(tmp_path, "no-such-branch")
+        assert "up to date (main" not in proc.stdout
+        assert "updating main" not in proc.stdout
+
+    def test_good_ref_still_reports_up_to_date(self, tmp_path):
+        proc, check, _ = _run_updater(tmp_path, "main")
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert "up to date (main" in proc.stdout
+        assert check.split()[1] == "up-to-date"
+
+
+class TestTagPinning:
+    """deploy/pi/README.md and the env example both advertise pinning a fleet
+    to a tag. Resolving via "origin/$REF" only ever worked for branches — no
+    remote-tracking ref exists for a tag — so the documented workflow would
+    have killed the updater at rev-parse. Resolution goes through FETCH_HEAD,
+    which `git fetch origin <ref>` sets for branches, tags and HEAD alike."""
+
+    def test_lightweight_tag_resolves(self, tmp_path):
+        proc, check, _ = _run_updater(tmp_path, "v0.2.0", tag=("v0.2.0", False))
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert "up to date (v0.2.0" in proc.stdout
+        assert check.split()[1] == "up-to-date"
+
+    def test_annotated_tag_resolves_to_its_commit(self, tmp_path):
+        # An annotated tag is its own object; without ^{commit} the rev-parse
+        # returns the tag SHA, which never equals HEAD, so the updater would
+        # "update" on every single run.
+        proc, check, _ = _run_updater(tmp_path, "v0.3.0", tag=("v0.3.0", True))
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert "up to date (v0.3.0" in proc.stdout, (
+            "an annotated tag must dereference to its commit, else the unit "
+            "re-updates forever"
+        )
+
+
 class TestUnitInjectsTheEnvFile:
     def test_update_unit_has_environmentfile(self):
         text = UPDATE_UNIT.read_text()
