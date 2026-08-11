@@ -126,8 +126,13 @@ class DashboardGui:
         brightness_state_file: Path | None = None,
         server_url: str = "",
         status_dir: Path | None = None,
+        show_opencode: bool = True,
     ) -> None:
         self._fetcher = fetcher
+        # Revert switch for the OpenCode Go tile (GUI_OPENCODE_TILE=0). Kept as
+        # a plain flag rather than an env read in the draw path so tests drive
+        # it directly and a unit can flip it without a code change.
+        self._show_opencode = show_opencode
         screen = pygame.display.get_surface()
         if screen is None:
             raise RuntimeError("no pygame display surface; call set_mode() first")
@@ -412,6 +417,7 @@ class DashboardGui:
                 refresh_interval=self._fetcher.current_interval,
                 tile_overhead=self._tile_overhead,
                 refresh_pending=self._refresh_pending,
+                show_opencode=self._show_opencode,
             )
             # While dark, a tap wakes (sets _wake_until) instead of navigating.
             self._handle_events(layout, swallow_wake=dark, now=now)
@@ -822,6 +828,9 @@ def main() -> None:
         brightness_state_file=brightness_state_file,
         server_url=server_url,
         status_dir=diag.default_state_dir(),
+        # Default on; GUI_OPENCODE_TILE=0 reverts a unit to the pre-OpenCode
+        # layout (CODEX full-width) without a code change or a redeploy.
+        show_opencode=os.environ.get("GUI_OPENCODE_TILE", "1") != "0",
     )
 
     def _handle_sigterm(signum: int, frame: Any) -> None:
