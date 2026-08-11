@@ -73,9 +73,43 @@ REF="$(env_or_file UPDATE_REF)"
 [ -n "$REF" ] || REF="main"
 
 cd "$APPDIR"
-git fetch --quiet origin "$REF"
 local_rev="$(git rev-parse HEAD)"
-remote_rev="$(git rev-parse "origin/$REF")"
+
+# Resolve the tracked ref BEFORE anything that can abort the run (WI-031).
+#
+# A pinned ref that no longer exists is the realistic case, not a typo: merged
+# PR branches are deleted, so pinning a unit to a feature branch to stage a
+# rollout invalidates the pin at the moment the PR merges. Left bare under
+# `set -e`, `git fetch` then killed the script *upstream of* write_check and
+# maybe_redeploy, so three things happened at once and none were visible: the
+# unit stopped updating, it stopped self-correcting its infra, and the GUI
+# diagnostics overlay kept showing the last good timestamp — a stalled unit
+# looked exactly like a healthy idle one, and only journalctl on the unit
+# could tell them apart.
+#
+# Policy: a pin is honoured, so we do NOT silently fall back to main — a
+# deliberate hold must stay held. But the failure is made loud, a breadcrumb
+# is written so the panel can show "stalled" rather than merely "stale", and
+# auto-redeploy still runs, because infra self-correction has nothing to do
+# with whether the app ref resolves.
+if ! git fetch --quiet origin "$REF"; then
+    log "ERROR: tracked ref '$REF' cannot be resolved on origin"
+    log "       (deleted upstream, or a typo). This unit is STALLED at"
+    log "       ${local_rev:0:8} and will not update until UPDATE_REF is fixed"
+    log "       in $ENV_FILE. Merged PR branches are deleted — pin to a tag."
+    write_check bad-ref "$local_rev"
+    maybe_redeploy  # a bad app pin must not disable infra self-correction
+    exit 1
+fi
+
+# Resolve what was just fetched via FETCH_HEAD rather than "origin/$REF".
+# `git fetch origin <ref>` sets FETCH_HEAD for branches, tags and HEAD alike,
+# whereas a remote-tracking "origin/<ref>" only exists for branches — so the
+# tag pinning that deploy/pi/README.md and the env example both advertise
+# ("pin to a tag to freeze a fleet on a known-good release") could never have
+# worked: rev-parse would fail on origin/v0.2.0 and kill the updater. ^{commit}
+# dereferences an annotated tag to the commit it points at.
+remote_rev="$(git rev-parse "FETCH_HEAD^{commit}")"
 
 if [ "$local_rev" = "$remote_rev" ]; then
     log "up to date ($REF @ ${local_rev:0:8})"

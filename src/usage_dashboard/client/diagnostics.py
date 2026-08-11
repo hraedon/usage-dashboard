@@ -11,7 +11,7 @@ writes on every run — there's no daemon to query, so the updater leaves a
 breadcrumb and we read it:
 
 * ``update-last-check``  — ``<iso8601> <result> <short-commit>`` every run
-  (``result`` ∈ up-to-date / updated / pip-failed / import-failed)
+  (``result`` ∈ up-to-date / updated / pip-failed / import-failed / bad-ref)
 * ``update-last-change`` — ``<iso8601> <old-short> <new-short>`` only when the
   code actually moved.
 
@@ -35,8 +35,12 @@ _RESULT_LABELS = {
     "updated": "updated",
     "pip-failed": "pip failed",
     "import-failed": "import failed",
+    # The tracked ref no longer resolves on origin (WI-031). Distinct from a
+    # merely old timestamp: the unit is not going to update again on its own,
+    # so it must read as a failure here rather than as quiet staleness.
+    "bad-ref": "ref gone — stalled",
 }
-_FAILED_RESULTS = frozenset({"pip-failed", "import-failed"})
+_FAILED_RESULTS = frozenset({"pip-failed", "import-failed", "bad-ref"})
 
 
 @dataclass(frozen=True)
