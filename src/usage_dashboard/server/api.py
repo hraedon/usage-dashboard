@@ -26,8 +26,6 @@ from usage_dashboard.shared.models import (
     make_offline_reading,
 )
 from usage_dashboard.shared.offpeak import (
-    qwen_peak_countdown,
-    qwen_peak_label,
     zai_is_offpeak,
     zai_peak_label,
 )
@@ -98,6 +96,35 @@ _CSS_GREEN = "#22c55e"
 _CSS_ORANGE = "#f97316"
 _CSS_RED = "#ef4444"
 _CSS_GRAY = "#969696"
+_CSS_YELLOW = "#eab308"
+
+# The web view deliberately has its own order.  ``Provider`` order follows
+# the scheduler's wiring (and includes the folded Claude work account), while
+# this is the order a person scans the dashboard in.  OpenCode Go is a web-only
+# card; the touch layout intentionally does not include it.
+_WEB_PROVIDER_ORDER: tuple[Provider, ...] = (
+    Provider.CLAUDE,
+    Provider.CODEX,
+    Provider.ZAI,
+    Provider.OLLAMA,
+    Provider.OPENCODE,
+)
+_WEB_PROVIDER_NAMES: dict[Provider, str] = {
+    Provider.CLAUDE: "Claude",
+    Provider.CODEX: "Codex",
+    Provider.ZAI: "ZAI",
+    Provider.OLLAMA: "Ollama",
+    Provider.OPENCODE: "OpenCode Go",
+}
+
+# Keep these values together with the generated CSS so the responsive contract
+# is easy to test without a browser.  At 1280px, body padding leaves 1256px:
+# four 260px cards plus three 12px gaps fit.  At 320–390px only one does.
+_WEB_BODY_PADDING = 12
+_WEB_MAX_WIDTH = 1280
+_WEB_GRID_MIN_WIDTH = 260
+_WEB_GRID_GAP = 12
+_RESET_NEAR_SECONDS = 3 * 24 * 60 * 60
 
 
 def _bar_color_css(percent: float | None) -> str:
@@ -119,10 +146,60 @@ def _alert_color_css(alert: str) -> str:
     return _CSS_GRAY
 
 
+def _status_name(reading: Reading) -> str:
+    """Return the visual status class for *reading*.
+
+    Offline is intentionally checked before stale: an offline reading carries
+    ``stale=True`` as part of the model, but the stronger state must remain
+    visible to a glance.
+    """
+    if reading.status == ReadingStatus.OFFLINE:
+        return "offline"
+    if reading.status == ReadingStatus.STALE or reading.stale:
+        return "stale"
+    return "current"
+
+
+def _worst_status(*readings: Reading | None) -> str:
+    """Status for a card that may contain more than one account."""
+    statuses = {_status_name(reading) for reading in readings if reading is not None}
+    if "offline" in statuses:
+        return "offline"
+    if "stale" in statuses:
+        return "stale"
+    return "current"
+
+
+def _status_badge_for(status: str) -> str:
+    if status == "offline":
+        return ' <span class="badge badge-offline">offline</span>'
+    if status == "stale":
+        return ' <span class="badge badge-stale">stale</span>'
+    return ""
+
+
+def _seconds_until_reset(resets_at: datetime, now: datetime) -> int:
+    """Return whole UTC seconds until a reset, accepting naive or aware times."""
+    target = (
+        resets_at.replace(tzinfo=timezone.utc)
+        if resets_at.tzinfo is None
+        else resets_at.astimezone(timezone.utc)
+    )
+    current = (
+        now.replace(tzinfo=timezone.utc)
+        if now.tzinfo is None
+        else now.astimezone(timezone.utc)
+    )
+    return int((target - current).total_seconds())
+
+
 def _countdown_text(resets_at: datetime | None, now: datetime) -> str:
     if resets_at is None:
         return ""
-    total_seconds = int((resets_at - now).total_seconds())
+    # Readings are stored as naive UTC, while direct renderer/parity tests often
+    # use aware UTC datetimes.  Normalize both sides so the web renderer never
+    # raises on an otherwise valid reading.
+    total_seconds = _seconds_until_reset(resets_at, now)
     if total_seconds <= 0:
         return "resets 0m"
     days = total_seconds // 86400
@@ -133,25 +210,41 @@ def _countdown_text(resets_at: datetime | None, now: datetime) -> str:
     return f"resets {hours}h {minutes}m"
 
 
+def _countdown_state(resets_at: datetime | None, now: datetime) -> str:
+    """Classify a reset the same way the touch client highlights it.
+
+    ``near`` and ``expired`` are both urgent (the touch display uses its
+    highlighted reset colour for both); only a reset more than three days away
+    is ``distant``.  A missing reset has no visible countdown and is ``none``.
+    """
+    if resets_at is None:
+        return "none"
+    total_seconds = _seconds_until_reset(resets_at, now)
+    if total_seconds <= 0:
+        return "expired"
+    if total_seconds <= _RESET_NEAR_SECONDS:
+        return "near"
+    return "distant"
+
+
 def _status_badge(reading: Reading) -> str:
-    if reading.status == ReadingStatus.OFFLINE:
-        return ' <span class="badge">offline</span>'
-    if reading.status == ReadingStatus.STALE or reading.stale:
-        return ' <span class="badge">stale</span>'
-    return ""
+    return _status_badge_for(_status_name(reading))
 
 
 def _bar_row(label: str, percent: float | None, resets_at: datetime | None, now: datetime) -> str:
     color = _bar_color_css(percent)
-    width = min(percent, 100.0) if percent is not None else 0.0
+    width = max(0.0, min(percent, 100.0)) if percent is not None else 0.0
     pct_text = f"{percent:.0f}%" if percent is not None else "N/A"
     countdown = _countdown_text(resets_at, now)
+    reset_state = _countdown_state(resets_at, now)
+    reset_class = f" reset-{reset_state}" if reset_state != "none" else ""
     return (
-        f'<div class="row"><span class="label">{label}</span>'
+        f'<div class="row"><span class="label">{html.escape(label)}</span>'
         f'<span class="track"><span class="fill" style="width:{width:.0f}%;'
         f'background:{color}"></span></span>'
         f'<span class="pct">{pct_text}</span></div>'
-        f'<div class="resets">{countdown}</div>'
+        f'<div class="resets{reset_class}" data-reset-state="{reset_state}">'
+        f"{countdown}</div>"
     )
 
 
@@ -173,19 +266,32 @@ def _account_rows(reading: Reading, now: datetime, label: str = "") -> str:
 
 def _render_dashboard_html(readings: list[Reading], now: datetime) -> str:
     by_provider = {r.provider: r for r in readings}
-    work = by_provider.get(Provider.CLAUDE_WORK)
     cards: list[str] = []
-    for reading in readings:
-        # The work Claude account folds into the Claude card, not its own.
-        if reading.provider == Provider.CLAUDE_WORK:
+    for provider in _WEB_PROVIDER_ORDER:
+        # The work Claude account folds into the Claude card, not its own.  If
+        # only the work account exists, it still gets one correctly named
+        # Claude card rather than disappearing with the folded account.
+        if provider == Provider.CLAUDE:
+            reading = by_provider.get(Provider.CLAUDE) or by_provider.get(
+                Provider.CLAUDE_WORK
+            )
+        else:
+            reading = by_provider.get(provider)
+        if reading is None:
             continue
-        name = html.escape(reading.provider.value.upper()) + _status_badge(reading)
+
+        work = by_provider.get(Provider.CLAUDE_WORK)
+        card_status = _worst_status(
+            reading,
+            work if provider == Provider.CLAUDE and Provider.CLAUDE in by_provider else None,
+        )
+        name = html.escape(_WEB_PROVIDER_NAMES[provider]) + _status_badge_for(card_status)
         # z.ai's plan discounts off-peak use (peak = Mon–Fri 14:00–18:00
         # Singapore time): tint the card header green off-peak / orange peak so
         # "use it now vs wait it out" is glanceable from across the room.
         header_style = ""
         peak_note = ""
-        if reading.provider == Provider.ZAI:
+        if provider == Provider.ZAI:
             offpeak = zai_is_offpeak(now)
             color = _CSS_GREEN if offpeak else _CSS_ORANGE
             header_style = f' style="color:{color}"'
@@ -197,7 +303,7 @@ def _render_dashboard_html(readings: list[Reading], now: datetime) -> str:
                 f'<span class="peak" style="color:{color}">'
                 f"{html.escape(zai_peak_label(now))}</span>"
             )
-        if reading.provider == Provider.CLAUDE and work is not None:
+        if provider == Provider.CLAUDE and Provider.CLAUDE in by_provider and work is not None:
             body = _account_rows(reading, now, "me") + _account_rows(work, now, "work")
         else:
             body = _account_rows(reading, now)
@@ -211,23 +317,19 @@ def _render_dashboard_html(readings: list[Reading], now: datetime) -> str:
                 f"{html.escape(reading.detail)}</div>"
             )
         cards.append(
-            f'<section class="card"><h2{header_style}>{name}{peak_note}</h2>'
+            f'<section class="card status-{card_status}" '
+            f'data-provider="{provider.value}" data-status="{card_status}">'
+            f'<h2{header_style}>{name}{peak_note}</h2>'
             f"{body}</section>"
         )
 
-    # Display-only QWEN tag: no data source, just whether we're inside the Qwen
-    # token plan's off-peak window (22:00–08:00 UTC+8), when credits consume
-    # much less — with a countdown to the next boundary. Replaces the retired
-    # umans card.
-    qwen = qwen_peak_countdown(now)
-    qwen_color = _CSS_GREEN if not qwen.in_peak else _CSS_ORANGE
-    qwen_label = qwen_peak_label(now)
-    cards.append(
-        f'<section class="card"><h2 style="color:{qwen_color}">QWEN</h2>'
-        f'<div class="detail" style="color:{qwen_color}">{qwen_label}</div></section>'
-    )
-
     fetched = max((r.fetched_at for r in readings), default=now)
+    provider_count = len(cards)
+    provider_word = "provider" if provider_count == 1 else "providers"
+    header = (
+        '<header><h1>AI Usage <span class="provider-count">'
+        f"{provider_count} {provider_word}</span></h1></header>"
+    )
     footer = (
         f"fetched {fetched.strftime('%Y-%m-%d %H:%M:%S')} UTC "
         "&middot; refreshes every 5&ndash;30m (adaptive)"
@@ -240,39 +342,60 @@ def _render_dashboard_html(readings: list[Reading], now: datetime) -> str:
 <meta http-equiv="refresh" content="300">
 <title>AI Usage</title>
 <style>
-:root {{ --maxw: 1100px; }}
+:root {{ --maxw: {_WEB_MAX_WIDTH}px; }}
 * {{ box-sizing: border-box; }}
 body {{ background:#000; color:#fff; font-family:-apple-system,system-ui,sans-serif;
-  margin:0; padding:12px; }}
-header, footer, .grid {{ max-width:var(--maxw); margin-inline:auto; }}
+  margin:0; padding:{_WEB_BODY_PADDING}px; min-width:0; }}
+header, footer, .grid {{ width:100%; max-width:var(--maxw); margin-inline:auto; min-width:0; }}
 header h1 {{ margin:4px 4px 12px; font-size:1.1rem; font-weight:600;
   letter-spacing:0.06em; color:#ddd; }}
+/* Count displayed cards, not raw readings: Claude's optional work account is
+   folded into the single Claude card below. */
+.provider-count {{ float:right; color:#969696; font-size:0.78rem; font-weight:400;
+  letter-spacing:0; }}
 /* Fluid grid: 1 column on a phone, 2 on a tablet, up to 4 on a desktop,
    driven by the card min width — no per-device breakpoints needed. */
-.grid {{ display:grid; grid-template-columns:repeat(auto-fit, minmax(280px, 1fr));
-  gap:12px; align-items:start; }}
-.card {{ background:#111; border-radius:12px; padding:14px 16px; }}
+.grid {{ display:grid; grid-template-columns:repeat(auto-fit,
+  minmax(min(100%, {_WEB_GRID_MIN_WIDTH}px), 1fr));
+  gap:{_WEB_GRID_GAP}px; align-items:start; }}
+.card {{ background:#111; border:1px solid #292929; border-left:4px solid #3b3b3b;
+  border-radius:12px; padding:14px 16px; min-width:0; }}
+.card.status-stale {{ background:#17130b; border-color:#a16207;
+  border-left-color:{_CSS_ORANGE}; }}
+.card.status-offline {{ background:#180d0d; border-color:#991b1b;
+  border-left-color:{_CSS_RED}; }}
 h2 {{ margin:0 0 10px; font-size:1.05rem; letter-spacing:0.04em; }}
-.badge {{ font-size:0.7rem; color:#eab308; border:1px solid #eab308;
+.badge {{ font-size:0.7rem; font-weight:700; border:1px solid;
   border-radius:6px; padding:1px 6px; vertical-align:middle; }}
+.badge-stale {{ color:{_CSS_ORANGE}; border-color:{_CSS_ORANGE};
+  background:#2b1c0a; }}
+.badge-offline {{ color:{_CSS_RED}; border-color:{_CSS_RED};
+  background:#301010; }}
 /* Peak-window countdown beside a card title. Floated right so it reads as a
    subtitle rather than part of the provider name, matching the Pi, where it
    sits in the tile's subtitle slot. */
 .peak {{ float:right; font-size:0.78rem; font-weight:400;
   letter-spacing:0; line-height:1.6; }}
-.row {{ display:flex; align-items:center; gap:10px; }}
-.label {{ width:96px; font-size:0.85rem; color:#ccc; }}
+.row {{ display:flex; align-items:center; gap:10px; min-width:0; }}
+.label {{ flex:0 1 96px; min-width:0; overflow:hidden; text-overflow:ellipsis;
+  white-space:nowrap; font-size:0.85rem; color:#ccc; }}
 .track {{ flex:1; height:12px; background:#323232; border-radius:6px; overflow:hidden;
-  display:block; }}
+  display:block; min-width:0; }}
 .fill {{ display:block; height:100%; }}
-.pct {{ width:44px; text-align:right; font-variant-numeric:tabular-nums; }}
-.resets {{ margin:2px 0 8px 106px; font-size:0.75rem; color:#969696; }}
-.detail {{ font-size:1.0rem; color:#ccc; font-variant-numeric:tabular-nums; }}
+.pct {{ flex:0 0 44px; width:44px; text-align:right;
+  font-variant-numeric:tabular-nums; }}
+.resets {{ margin:2px 0 8px 106px; font-size:0.75rem; color:#969696;
+  font-variant-numeric:tabular-nums; }}
+.resets.reset-near, .resets.reset-expired {{ color:{_CSS_YELLOW};
+  font-weight:700; }}
+.resets.reset-distant {{ color:#969696; }}
+.detail {{ font-size:1.0rem; color:#ccc; font-variant-numeric:tabular-nums;
+  overflow-wrap:anywhere; }}
 footer {{ text-align:center; color:#555; font-size:0.7rem; margin-top:12px; }}
 </style>
 </head>
 <body>
-<header><h1>AI Usage</h1></header>
+{header}
 <main class="grid">
 {"".join(cards)}
 </main>

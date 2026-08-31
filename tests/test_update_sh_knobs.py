@@ -70,7 +70,14 @@ class TestKnobResolution:
                             "AUTO_REDEPLOY") == "1"
 
 
-def _run_updater(tmp_path, ref: str, *, auto_redeploy: str = "1", tag=None):
+def _run_updater(
+    tmp_path,
+    ref: str,
+    *,
+    auto_redeploy: str = "1",
+    tag=None,
+    transport_failure: bool = False,
+):
     """Run the real update.sh against a throwaway git repo.
 
     Renders the @APPDIR@/@VENV@ placeholders like install.sh does, and shims
@@ -97,6 +104,11 @@ def _run_updater(tmp_path, ref: str, *, auto_redeploy: str = "1", tag=None):
     subprocess.run(
         ["git", "clone", "--quiet", str(origin), str(appdir)], check=True
     )
+    if transport_failure:
+        subprocess.run(
+            ["git", "-C", str(appdir), "remote", "set-url", "origin", str(tmp_path / "gone")],
+            check=True,
+        )
 
     # A `sudo` shim on PATH records the redeploy hand-off; a `usage-dashboard-
     # redeploy` stub makes the -x test pass.
@@ -172,6 +184,12 @@ class TestUnresolvableRefIsLoudNotSilent:
         assert "up to date (main" in proc.stdout
         assert check.split()[1] == "up-to-date"
 
+    def test_transport_failure_is_not_reported_as_a_bad_ref(self, tmp_path):
+        proc, check, _ = _run_updater(tmp_path, "main", transport_failure=True)
+        assert proc.returncode != 0
+        assert "transport" in proc.stdout or "transport" in proc.stderr
+        assert check.split()[1] == "fetch-failed"
+
 
 class TestTagPinning:
     """deploy/pi/README.md and the env example both advertise pinning a fleet
@@ -196,6 +214,40 @@ class TestTagPinning:
             "an annotated tag must dereference to its commit, else the unit "
             "re-updates forever"
         )
+
+
+class TestMissingCheckoutIsLoudNotSilent:
+    """Same silent-stall family as WI-031, one layer earlier: if the checkout
+    is missing or not a git repo, a bare ``cd``/``rev-parse`` under ``set -e``
+    aborted UPSTREAM of ``write_check``, so the panel kept showing the last
+    good timestamp and the unit looked healthy. It must fail loud and leave a
+    breadcrumb instead."""
+
+    def test_missing_checkout_writes_a_breadcrumb_and_fails(self, tmp_path):
+        # Point APPDIR at a path that does not exist.
+        body = UPDATE_SH.read_text().replace(
+            "@APPDIR@", str(tmp_path / "gone")
+        ).replace("@VENV@", str(tmp_path / "venv"))
+        script = tmp_path / "update-gone.sh"
+        script.write_text(body)
+        script.chmod(0o755)
+        state = tmp_path / "state"
+        gone = subprocess.run(
+            ["bash", str(script)],
+            capture_output=True,
+            text=True,
+            env={
+                "PATH": "/usr/bin:/bin",
+                "HOME": str(tmp_path),
+                "XDG_STATE_HOME": str(state),
+                "UPDATE_REF": "main",
+            },
+        )
+        assert gone.returncode != 0, "a missing checkout must not look like success"
+        assert "STALLED" in gone.stdout
+        check_file = state / "usage-dashboard" / "update-last-check"
+        assert check_file.exists(), "a breadcrumb must be written"
+        assert check_file.read_text().split()[1] == "no-checkout"
 
 
 class TestUnitInjectsTheEnvFile:

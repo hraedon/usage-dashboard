@@ -15,11 +15,11 @@ jobs:
         with:
           python-version: "3.12"
 
-      # setup-uv v7 no longer auto-provisions a project venv (v5 did), so create
-      # one explicitly; uv installs into ./.venv and the steps below invoke tools
-      # via .venv/bin/... . UV_PYTHON=3.12 (set by setup-uv) pins the version.
-      - run: uv venv
-      - run: uv pip install -e ".[dev]"
+      # Install from uv.lock (WI-027): `--locked` both uses the lockfile and
+      # fails if pyproject.toml has drifted from it. `--frozen` would silently
+      # accept that drift. The GUI extra is included so the pygame smoke tests
+      # below run under SDL's dummy driver rather than being skipped.
+      - run: uv sync --locked --extra dev --extra gui
 
       - name: ruff
         run: .venv/bin/ruff check .
@@ -31,4 +31,7 @@ jobs:
         # The login extra (Playwright) is intentionally omitted: the interactive
         # ollama-login flow is browser-driven and not unit-tested; its pure
         # helpers are, and they do not import Playwright.
+        env:
+          SDL_VIDEODRIVER: dummy
+          SDL_AUDIODRIVER: dummy
         run: .venv/bin/pytest

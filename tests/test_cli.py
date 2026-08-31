@@ -281,6 +281,26 @@ class TestCallbackHandler:
         assert _CallbackHandler.error == "access_denied"
 
 
+class TestWaitForCodeTimeout:
+    def setup_method(self) -> None:
+        _CallbackHandler.code = None
+        _CallbackHandler.state = None
+        _CallbackHandler.error = None
+
+    def test_times_out_instead_of_blocking_forever(self) -> None:
+        # Regression: the loop used to re-arm ``handle_request`` indefinitely,
+        # so an operator who never completed the browser flow hung the login and
+        # the callers' "Timed out" branches were unreachable. With a tiny
+        # timeout and no callback arriving, _wait_for_code must return (None,
+        # None, None) promptly instead of blocking.
+        from usage_dashboard.cli import _wait_for_code
+
+        code, state, error = _wait_for_code(port=0, timeout=0.2)
+        assert code is None
+        assert state is None
+        assert error is None
+
+
 class TestOllamaCookieHelpers:
     def test_filters_to_ollama_domain(self) -> None:
         cookies = [

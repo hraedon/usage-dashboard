@@ -15,6 +15,7 @@ import re
 import secrets
 import string
 import sys
+import time
 import webbrowser
 from collections.abc import Iterable, Mapping
 from typing import Any
@@ -183,14 +184,21 @@ def _parse_pasted_input(raw: str) -> tuple[str | None, str | None]:
     return (raw or None), None
 
 
-def _wait_for_code(port: int) -> tuple[str | None, str | None, str | None]:
+def _wait_for_code(port: int, timeout: float = 300.0) -> tuple[str | None, str | None, str | None]:
     """Start a local HTTP server and wait for the OAuth callback.
 
-    Returns ``(code, state, error)``.
+    Returns ``(code, state, error)``. Gives up after *timeout* seconds: the
+    server's own timeout only bounds a single ``handle_request`` call, so the
+    loop must enforce the overall deadline itself — otherwise an operator who
+    never completes the browser flow hangs the login forever (the callers'
+    "Timed out" branches used to be unreachable).
     """
     server = http.server.HTTPServer(("127.0.0.1", port), _CallbackHandler)
-    server.timeout = 300  # 5 minutes
+    server.timeout = 1.0
+    deadline = time.monotonic() + timeout
     while _CallbackHandler.code is None and _CallbackHandler.error is None:
+        if time.monotonic() >= deadline:
+            break
         server.handle_request()
     server.server_close()
     return _CallbackHandler.code, _CallbackHandler.state, _CallbackHandler.error

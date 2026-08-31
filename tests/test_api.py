@@ -1,11 +1,20 @@
 from __future__ import annotations
 
 import asyncio
+import re
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock
 
 import httpx
 
-from usage_dashboard.server.api import create_app
+from usage_dashboard.server.api import (
+    _WEB_BODY_PADDING,
+    _WEB_GRID_GAP,
+    _WEB_GRID_MIN_WIDTH,
+    _WEB_MAX_WIDTH,
+    _render_dashboard_html,
+    create_app,
+)
 from usage_dashboard.server.db import Database
 from usage_dashboard.shared.models import ALERT_CRIT, ALERT_WARN, Provider, Reading, ReadingStatus
 
@@ -211,7 +220,7 @@ class TestDashboardEndpoint:
                 response = await client.get("/dashboard")
             assert response.status_code == 200
             assert "text/html" in response.headers["content-type"]
-            assert "CLAUDE" in response.text
+            assert "Claude" in response.text
 
         asyncio.run(_test())
 
@@ -272,17 +281,30 @@ class TestDashboardEndpoint:
 
         asyncio.run(_test())
 
-    def test_dashboard_shows_qwen_offpeak_card(self, tmp_path):
-        # Display-only QWEN tag: always present, coloured green/orange by whether
-        # the Qwen token plan's off-peak window (22:00–08:00 UTC+8) is open.
-        app, db = _create_app_with_db(tmp_path)
+    def test_dashboard_has_no_extra_plan_card(self, tmp_path):
+        app, db = _create_app_with_db(
+            tmp_path, configured_providers=[Provider.CLAUDE]
+        )
         db.store_reading(_make_reading())
 
         async def _test():
             async with _client(app) as client:
                 response = await client.get("/dashboard")
-            assert ">QWEN</h2>" in response.text
-            assert "color:#22c55e" in response.text or "color:#f97316" in response.text
+            assert response.text.count('class="card status-current"') == 1
+
+        asyncio.run(_test())
+
+    def test_dashboard_keeps_opencode_web_card(self, tmp_path):
+        app, db = _create_app_with_db(
+            tmp_path, configured_providers=[Provider.OPENCODE]
+        )
+        db.store_reading(_make_reading(provider=Provider.OPENCODE))
+
+        async def _test():
+            async with _client(app) as client:
+                response = await client.get("/dashboard")
+            assert response.text.count('class="card status-current"') == 1
+            assert ">OpenCode Go<" in response.text
 
         asyncio.run(_test())
 
@@ -296,7 +318,7 @@ class TestDashboardEndpoint:
             assert "<h2 style=\"color:" in response.text
             # The heading now carries the peak countdown as a trailing span
             # (WI-030), so ZAI is no longer the whole element body.
-            assert ">ZAI<" in response.text
+            assert ">ZAI<span" in response.text
             assert 'class="peak"' in response.text
 
         asyncio.run(_test())
@@ -338,9 +360,31 @@ class TestDashboardEndpoint:
                 response = await client.get("/dashboard")
             text = response.text
             # One CLAUDE card with both accounts' rows; no CLAUDE_WORK header.
-            assert text.count("<h2>CLAUDE") == 1
+            assert text.count("<h2>Claude") == 1
             assert "CLAUDE_WORK" not in text
             assert "me Session" in text and "work Session" in text
+            assert 'class="provider-count">1 provider</span>' in text
+
+        asyncio.run(_test())
+
+    def test_dashboard_count_keeps_opencode_while_folding_claude_work(self, tmp_path):
+        app, db = _create_app_with_db(
+            tmp_path,
+            configured_providers=[
+                Provider.CLAUDE,
+                Provider.CLAUDE_WORK,
+                Provider.OPENCODE,
+            ],
+        )
+        db.store_reading(_make_reading(provider=Provider.CLAUDE))
+        db.store_reading(_make_reading(provider=Provider.CLAUDE_WORK))
+        db.store_reading(_make_reading(provider=Provider.OPENCODE))
+
+        async def _test():
+            async with _client(app) as client:
+                response = await client.get("/dashboard")
+            assert 'class="provider-count">2 providers</span>' in response.text
+            assert ">OpenCode Go<" in response.text
 
         asyncio.run(_test())
 
@@ -438,10 +482,132 @@ class TestDashboardEndpoint:
             async with _client(app) as client:
                 response = await client.get("/dashboard")
             assert response.status_code == 200
-            assert "CLAUDE" in response.text
+            assert "Claude" in response.text
             assert "ZAI" not in response.text
             assert "OLLAMA" not in response.text
             assert "CODEX" not in response.text
+
+        asyncio.run(_test())
+
+    def test_dashboard_has_stable_order_human_names_and_folded_count(self, tmp_path):
+        configured = [
+            Provider.OPENCODE,
+            Provider.OLLAMA,
+            Provider.CLAUDE_WORK,
+            Provider.ZAI,
+            Provider.CODEX,
+            Provider.CLAUDE,
+        ]
+        app, db = _create_app_with_db(tmp_path, configured_providers=configured)
+        for provider in configured:
+            db.store_reading(_make_reading(provider=provider))
+
+        async def _test():
+            async with _client(app) as client:
+                response = await client.get("/dashboard")
+            text = response.text
+            providers = re.findall(
+                r'<section class="card status-\w+" data-provider="([^"]+)"',
+                text,
+            )
+            names = [
+                re.sub(r"<[^>]+>", "", heading)
+                for heading in re.findall(r"<h2[^>]*>(.*?)</h2>", text)
+            ]
+            assert providers == ["claude", "codex", "zai", "ollama", "opencode"]
+            assert [name.split("peak", 1)[0].strip() for name in names] == [
+                "Claude",
+                "Codex",
+                "ZAI",
+                "Ollama",
+                "OpenCode Go",
+            ]
+            # Six readings produce five visible cards because the two Claude
+            # accounts intentionally share one card.
+            assert 'class="provider-count">5 providers</span>' in text
+            assert "OpenCode Go" in text
+
+        asyncio.run(_test())
+
+    def test_dashboard_shows_work_only_as_one_claude_card(self, tmp_path):
+        app, db = _create_app_with_db(
+            tmp_path, configured_providers=[Provider.CLAUDE_WORK]
+        )
+        db.store_reading(_make_reading(provider=Provider.CLAUDE_WORK))
+
+        async def _test():
+            async with _client(app) as client:
+                response = await client.get("/dashboard")
+            assert response.text.count('data-provider="claude"') == 1
+            assert ">Claude<" in response.text
+            assert 'class="provider-count">1 provider</span>' in response.text
+
+        asyncio.run(_test())
+
+    def test_dashboard_reset_states_are_present_in_html(self, tmp_path):
+        now = datetime(2026, 1, 10, 12, 0, tzinfo=timezone.utc)
+        reading = _make_reading(
+            session_resets_at=now - timedelta(minutes=1),
+            weekly_resets_at=now + timedelta(days=1),
+        )
+        html_out = _render_dashboard_html([reading], now)
+
+        assert 'class="resets reset-expired" data-reset-state="expired"' in html_out
+        assert 'class="resets reset-near" data-reset-state="near"' in html_out
+        assert 'data-reset-state="distant"' not in html_out
+
+    def test_dashboard_statuses_have_distinct_glanceable_styles(self):
+        now = datetime(2026, 1, 10, 12, 0, tzinfo=timezone.utc)
+        html_out = _render_dashboard_html(
+            [
+                _make_reading(
+                    provider=Provider.ZAI,
+                    status=ReadingStatus.STALE,
+                    stale=True,
+                ),
+                _make_reading(
+                    provider=Provider.OLLAMA,
+                    status=ReadingStatus.OFFLINE,
+                    stale=True,
+                ),
+            ],
+            now,
+        )
+
+        assert 'data-provider="zai" data-status="stale"' in html_out
+        assert '<span class="badge badge-stale">stale</span>' in html_out
+        assert 'data-provider="ollama" data-status="offline"' in html_out
+        assert '<span class="badge badge-offline">offline</span>' in html_out
+        assert ".card.status-stale" in html_out
+        assert ".card.status-offline" in html_out
+        assert "#f97316" in html_out and "#ef4444" in html_out
+
+    def test_dashboard_css_viewport_contract(self, tmp_path):
+        app, db = _create_app_with_db(tmp_path, configured_providers=[Provider.CLAUDE])
+        db.store_reading(_make_reading())
+
+        async def _test():
+            async with _client(app) as client:
+                text = (await client.get("/dashboard")).text
+
+            assert f"--maxw: {_WEB_MAX_WIDTH}px" in text
+            assert (
+                f"minmax(min(100%, {_WEB_GRID_MIN_WIDTH}px), 1fr)" in text
+            )
+            assert "min-width:0" in text
+
+            def columns(viewport: int) -> int:
+                content = min(viewport - 2 * _WEB_BODY_PADDING, _WEB_MAX_WIDTH)
+                return max(
+                    1,
+                    (content + _WEB_GRID_GAP)
+                    // (_WEB_GRID_MIN_WIDTH + _WEB_GRID_GAP),
+                )
+
+            assert columns(1280) == 4
+            assert columns(1440) == 4
+            assert columns(320) == 1
+            assert columns(390) == 1
 
         asyncio.run(_test())
 

@@ -101,15 +101,52 @@ if [ -z "${_INSTALL_SH_REEXECED:-}" ]; then
 fi
 trap 'rm -f "${_STABLE_COPY:-}"' EXIT
 
-if [ -d "$APPDIR/.git" ]; then
+update_existing_checkout() {
+    local probe_status
     echo "==> updating checkout at $APPDIR"
-    git -C "$APPDIR" fetch --quiet origin "$UPDATE_REF"
-    git -C "$APPDIR" checkout --quiet "$UPDATE_REF"
-    git -C "$APPDIR" reset --hard --quiet "origin/$UPDATE_REF"
+    # Resolve via FETCH_HEAD, exactly like update.sh: a remote-tracking
+    # "origin/$UPDATE_REF" only exists for branches, so resetting to
+    # "origin/v0.2.0" killed every re-run pinned to a tag — the very fleet
+    # workflow deploy/pi/README.md advertises. ^{commit} dereferences an
+    # annotated tag to its commit.
+    if ! git -C "$APPDIR" fetch --quiet origin "$UPDATE_REF"; then
+        # `git fetch` uses the same remote query for both a missing ref and a
+        # transport failure. Probe the remote separately so a temporary outage
+        # is not reported as a permanently deleted/typo'd pin.
+        if git -C "$APPDIR" ls-remote --exit-code origin "$UPDATE_REF" >/dev/null 2>&1; then
+            echo "ERROR: git fetch for ref '$UPDATE_REF' failed although origin still advertises it (network/transport or local git error)." >&2
+        else
+            probe_status=$?
+            if [ "$probe_status" -eq 2 ]; then
+                echo "ERROR: ref '$UPDATE_REF' not found on origin (deleted or a typo)." >&2
+            else
+                echo "ERROR: git fetch for ref '$UPDATE_REF' failed and origin could not be queried (network/transport failure)." >&2
+            fi
+        fi
+        exit 1
+    fi
+    if ! git -C "$APPDIR" checkout --quiet "$UPDATE_REF"; then
+        echo "ERROR: fetched ref '$UPDATE_REF' could not be checked out locally." >&2
+        exit 1
+    fi
+    if ! git -C "$APPDIR" reset --hard --quiet "FETCH_HEAD^{commit}"; then
+        echo "ERROR: checkout reset to fetched ref '$UPDATE_REF' failed." >&2
+        exit 1
+    fi
+}
+
+if [ -d "$APPDIR/.git" ]; then
+    update_existing_checkout
 else
     echo "==> cloning $REPO_URL -> $APPDIR"
-    git clone --quiet "$REPO_URL" "$APPDIR"
-    git -C "$APPDIR" checkout --quiet "$UPDATE_REF"
+    if ! git clone --quiet "$REPO_URL" "$APPDIR"; then
+        echo "ERROR: clone failed (network/transport failure or repository unavailable)." >&2
+        exit 1
+    fi
+    if ! git -C "$APPDIR" checkout --quiet "$UPDATE_REF"; then
+        echo "ERROR: ref '$UPDATE_REF' not found in the cloned repository." >&2
+        exit 1
+    fi
 fi
 
 # --- 5. venv + install ------------------------------------------------------

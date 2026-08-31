@@ -47,6 +47,8 @@ from usage_dashboard.client.layout import (
     build_status_overlay,
     refresh_hit_test,
     rotate_touch_norm,
+    status_overlay_footer_height,
+    status_overlay_padding,
     tap_transition,
 )
 from usage_dashboard.client.schedule import ScheduleResolver, SleepSchedule
@@ -61,6 +63,14 @@ _BTN_BG = (45, 45, 45)
 _REFRESH_PENDING_BG = (92, 72, 10)
 # How long the refresh result ("refreshed"/"refresh failed") stays on screen.
 _REFRESH_FEEDBACK_MS = 6000
+_MIN_BAR_TRACK_W = 24
+
+# Nominal pygame font sizes are not glyph sizes: the default font renders an
+# 18px request with a 12px line height.  These are minimum *rendered* line
+# heights for the three text tiers on the smallest audited display.
+_MIN_BODY_GLYPH_H = 16
+_MIN_SMALL_GLYPH_H = 14
+_MIN_TITLE_GLYPH_H = 20
 
 
 def _env_int(name: str, default: int) -> int:
@@ -114,6 +124,26 @@ class DoubleTapDetector:
 class DashboardGui:
     """Owns the pygame window, fonts, view state, and render loop."""
 
+    @staticmethod
+    def _readable_font(nominal_size: int, min_height: int) -> Any:
+        """Create a font whose actual line and ``Ag`` glyph heights meet *min_height*.
+
+        ``pygame.font.Font`` accepts a nominal point size, not a guaranteed
+        pixel height.  Measuring the resulting font is important on the small
+        fallback display (and keeps this contract stable if the bundled font
+        changes between pygame builds).
+        """
+        size = max(1, nominal_size)
+        font = pygame.font.Font(None, size)
+        while (
+            font.get_height() < min_height
+            or font.render("Ag", True, (255, 255, 255)).get_bounding_rect().height
+            < min_height
+        ):
+            size += 1
+            font = pygame.font.Font(None, size)
+        return font
+
     def __init__(
         self,
         fetcher: ClientFetcher,
@@ -126,13 +156,8 @@ class DashboardGui:
         brightness_state_file: Path | None = None,
         server_url: str = "",
         status_dir: Path | None = None,
-        show_opencode: bool = True,
     ) -> None:
         self._fetcher = fetcher
-        # Revert switch for the OpenCode Go tile (GUI_OPENCODE_TILE=0). Kept as
-        # a plain flag rather than an env read in the draw path so tests drive
-        # it directly and a unit can flip it without a code change.
-        self._show_opencode = show_opencode
         screen = pygame.display.get_surface()
         if screen is None:
             raise RuntimeError("no pygame display surface; call set_mode() first")
@@ -188,21 +213,30 @@ class DashboardGui:
         self._refresh_thread: threading.Thread | None = None
         # While dark we tick slowly to save CPU but still pump touch events.
         self._sleep_fps = 4
-        # Fonts scaled to the panel so the same code reads on any resolution.
-        # Sized for a 5" panel read at arm's length — bigger than a desktop UI.
-        unit = max(18, self._height // 15)
-        self._font = pygame.font.Font(None, unit)
-        self._font_small = pygame.font.Font(None, max(14, unit * 4 // 5))
-        self._font_title = pygame.font.Font(None, unit * 5 // 4)
+        # Fonts scale from the short edge.  Height-only scaling made the
+        # portrait 720x1280 framebuffer select an 85px unit and left its
+        # half-width tiles with no room for labels or tracks.  The short edge
+        # keeps the established 48px unit at both 1280x720 and 720x1280 while
+        # still giving the 240x320 fallback a readable rendered body glyph.
+        unit = max(24, min(self._width, self._height) // 15)
+        self._font = self._readable_font(unit, _MIN_BODY_GLYPH_H)
+        self._font_small = self._readable_font(
+            max(22, unit * 4 // 5), _MIN_SMALL_GLYPH_H
+        )
+        self._font_title = self._readable_font(
+            max(32, unit * 5 // 4), _MIN_TITLE_GLYPH_H
+        )
         # Oversized glyphs for the brightness overlay's +/- buttons and readout.
-        self._font_big = pygame.font.Font(None, unit * 2)
+        self._font_big = self._readable_font(unit * 2, 28)
+        # Below this width the layout stacks the paired providers.  Full-width
+        # rows let the narrow fallback keep the reset countdown visible instead
+        # of squeezing it into a zero-width track.
+        self._narrow = self._width < 480
         # Fixed width reserved on the right of every bar row for the reset text,
         # sized to a worst-case countdown so the bar track always ends at the
         # same x and never bleeds into the countdown. Full-width tiles show
         # "resets 23d 23h"; compact (paired) tiles show a bare "23d 23h", so
         # their column is narrower and the bar track extends further.
-        self._reset_col_w = self._font.size("resets 23d 23h")[0]
-        self._compact_reset_col_w = self._font.size("23d 23h")[0]
         # Tile padding derived from the screen, not per-tile height, so a
         # 3-bar tile gets the same padding as a 2-bar tile — the taller row
         # accommodates the extra bar, not extra padding.
@@ -213,7 +247,7 @@ class DashboardGui:
         # equal bottom padding.
         self._tile_overhead = (
             self._tile_pad
-            + self._font_title.get_height()
+            + self._font_title.get_linesize()
             + self._tile_pad // 2
             + self._tile_pad
         )
@@ -417,7 +451,6 @@ class DashboardGui:
                 refresh_interval=self._fetcher.current_interval,
                 tile_overhead=self._tile_overhead,
                 refresh_pending=self._refresh_pending,
-                show_opencode=self._show_opencode,
             )
             # While dark, a tap wakes (sets _wake_until) instead of navigating.
             self._handle_events(layout, swallow_wake=dark, now=now)
@@ -438,6 +471,37 @@ class DashboardGui:
 
     # -- rendering ----------------------------------------------------------
 
+    @staticmethod
+    def _fit_text(font: Any, text: str, max_width: int) -> str:
+        """Return *text* shortened to a pixel width without clipping it.
+
+        Pygame blits happily clip a surface at the edge of the display, which
+        is particularly easy to miss on the small fallback display.  All text
+        that has a bounded column goes through this helper.  ASCII dots are
+        used for the fallback marker because the bundled pygame font is not
+        guaranteed to contain every Unicode ellipsis glyph.
+        """
+        if max_width <= 0:
+            return ""
+        if font.size(text)[0] <= max_width:
+            return text
+        marker = "..."
+        marker_width = font.size(marker)[0]
+        if marker_width > max_width:
+            # Keep as much of the text as can be drawn when even the marker is
+            # wider than the column.  The loop is tiny (labels are short) and
+            # avoids relying on font metrics being monotonic across glyphs.
+            for end in range(len(text), 0, -1):
+                candidate = text[:end]
+                if font.size(candidate)[0] <= max_width:
+                    return candidate
+            return ""
+        for end in range(len(text), 0, -1):
+            candidate = text[:end].rstrip() + marker
+            if font.size(candidate)[0] <= max_width:
+                return candidate
+        return marker if marker_width <= max_width else ""
+
     def _bar_label(self, bar: BarSpec) -> str:
         """The left-column text for a bar: ``[account · ]Label NN%``."""
         return (
@@ -445,18 +509,59 @@ class DashboardGui:
             f"{bar.label} {bar.percent_text}"
         )
 
+    def _bar_font(self, compact: bool = False) -> Any:
+        """Font for bar rows, shrinking compact columns on portrait panels.
+
+        The title remains the large glanceable font.  A paired 339px tile on a
+        720px portrait screen, however, cannot spend the same 48px unit on both
+        its labels and reset countdown that a 601px landscape tile can.  The
+        small font is still intentionally larger than a desktop body font and
+        is only used for genuinely constrained compact rows.
+        """
+        if compact and self._width < 900:
+            return self._font_small
+        return self._font
+
+    def _reset_width(self, compact: bool = False) -> int:
+        """Width reserved for a reset countdown in the requested mode.
+
+        On a genuinely narrow display the ``resets`` prefix costs more than it
+        communicates.  Dropping that prefix for full-width fallback rows gives
+        the track a useful minimum width while retaining the countdown itself.
+        """
+        font = self._bar_font(compact)
+        text = "23d 23h" if compact or self._narrow else "resets 23d 23h"
+        return int(font.size(text)[0])
+
+    def _reset_label(self, bar: BarSpec, compact: bool = False) -> str:
+        text = bar.reset_text if compact or self._narrow else f"resets {bar.reset_text}"
+        return text
+
     def _label_col_widths(self, tiles: list[TileSpec]) -> dict[bool, int]:
         """Widest bar label per tile group (compact vs full-width).
 
         Full-width tiles (Session/Weekly) and compact tiles (S/W) are sized
         independently so each group's bars start at the same x without the
-        wide labels stealing space from the narrow paired tiles."""
+        wide labels stealing space from the narrow paired tiles.  The natural
+        width is capped by the narrowest tile in each group, leaving room for a
+        reset column and a drawable track."""
         widths: dict[bool, int] = {False: 0, True: 0}
         for tile in tiles:
+            bar_font = self._bar_font(tile.compact)
             for bar in tile.bars:
-                w = self._font.size(self._bar_label(bar))[0]
+                w = bar_font.size(self._bar_label(bar))[0]
                 if w > widths[tile.compact]:
                     widths[tile.compact] = w
+        for compact in (False, True):
+            group = [tile for tile in tiles if tile.compact == compact and tile.bars]
+            if not group or widths[compact] == 0:
+                continue
+            reset_w = self._reset_width(compact)
+            max_width = min(
+                tile.rect.w - 4 * self._tile_pad - reset_w - _MIN_BAR_TRACK_W
+                for tile in group
+            )
+            widths[compact] = min(widths[compact], max(0, max_width))
         return widths
 
     def _bar_track(self, rect: Rect, label_col_w: int, compact: bool = False) -> tuple[int, int]:
@@ -464,44 +569,160 @@ class DashboardGui:
         width. Compact tiles use a narrower reset column (bare countdown, no
         "resets" prefix) so the bar track extends further."""
         pad = self._tile_pad
-        reset_w = self._compact_reset_col_w if compact else self._reset_col_w
+        reset_w = self._reset_width(compact)
         track_x = rect.x + pad + label_col_w + pad
         track_right = rect.x + rect.w - pad - reset_w - pad
         return track_x, track_right
+
+    @staticmethod
+    def _ultra_compact_bar_text(bar: BarSpec) -> str:
+        """Return the smallest useful label for a summary percentage."""
+        label = bar.label.upper()
+        if label.startswith("SESSION"):
+            label = "S"
+        elif label.startswith("WEEKLY"):
+            label = "W"
+        else:
+            label = label[:1]
+        labelled = f"{label}{bar.percent_text}"
+        return labelled
+
+    def _ultra_compact_text_specs(
+        self, tile: TileSpec,
+    ) -> list[tuple[str, Any, str, Color, Rect]]:
+        """Text surfaces and rectangles for a tiny summary tile.
+
+        This is intentionally the single geometry source for both drawing and
+        regression tests. The first two percentage windows remain visible in
+        the summary; reset countdowns, subtitles, and extra scoped/account
+        windows are detail-view information on a frame this small.
+        """
+        r = tile.rect
+        pad = self._tile_pad
+        left = r.x + pad
+        right = r.x + r.w - pad
+        top = r.y + pad
+        inner_w = max(0, right - left)
+        title_font = self._font_title
+        marker_font = title_font
+        marker = (
+            marker_font.render(tile.status_marker, True, tile.status_marker_color)
+            if tile.status_marker else None
+        )
+        marker_gap = max(2, pad // 2)
+        marker_x = right - marker.get_width() if marker is not None else right
+        title_max = inner_w
+        if marker is not None:
+            title_max = max(0, marker_x - marker_gap - left)
+        title_text = self._fit_text(
+            title_font, tile.compact_title or tile.title, title_max,
+        )
+        title = title_font.render(title_text, True, tile.title_color)
+        specs: list[tuple[str, Any, str, Color, Rect]] = [
+            (
+                "title", title_font, title_text, tile.title_color,
+                Rect(left, top, title.get_width(), title.get_height()),
+            ),
+        ]
+        if marker is not None:
+            specs.append(
+                (
+                    "status", marker_font, tile.status_marker,
+                    tile.status_marker_color,
+                    Rect(marker_x, top, marker.get_width(), marker.get_height()),
+                )
+            )
+
+        summary_font = self._font
+        summary_gap = max(2, pad // 2)
+        summary_top = top + title_font.get_linesize() + summary_gap
+        bottom = r.y + r.h - pad
+        if tile.bars:
+            # Session and weekly are the stable aggregate glance. Scoped and
+            # secondary-account bars remain available after tapping the tile.
+            summaries = tile.bars[:2]
+            for index, bar in enumerate(summaries):
+                text = self._ultra_compact_bar_text(bar)
+                if summary_font.size(text)[0] > inner_w:
+                    # Preserve the percentage itself if the S/W prefix would
+                    # make a three-digit value wrap or be truncated.
+                    text = bar.percent_text
+                text = self._fit_text(summary_font, text, inner_w)
+                surface = summary_font.render(text, True, (
+                    fmt.mute(bar.color) if bar.muted else bar.color
+                ))
+                y = summary_top + index * (
+                    summary_font.get_linesize() + summary_gap
+                )
+                if y + surface.get_height() > bottom:
+                    break
+                specs.append(
+                    (
+                        f"summary-{index}", summary_font, text,
+                        fmt.mute(bar.color) if bar.muted else bar.color,
+                        Rect(left, y, surface.get_width(), surface.get_height()),
+                    )
+                )
+        else:
+            # Quota-less providers still get a compact status/detail cue rather
+            # than a blank tile. It is deliberately one line and has no reset
+            # column to collide with it.
+            text = self._fit_text(summary_font, tile.detail or "—", inner_w)
+            surface = summary_font.render(text, True, tile.detail_color)
+            if summary_top + surface.get_height() <= bottom:
+                specs.append(
+                    (
+                        "detail", summary_font, text, tile.detail_color,
+                        Rect(
+                            left, summary_top,
+                            surface.get_width(), surface.get_height(),
+                        ),
+                    )
+                )
+        return specs
+
+    def _draw_ultra_compact_tile(self, tile: TileSpec) -> None:
+        """Draw a tiny tile without bar/reset rows that can share glyph pixels."""
+        for _name, font, text, color, rect in self._ultra_compact_text_specs(tile):
+            surface = font.render(text, True, color)
+            self._screen.blit(surface, (rect.x, rect.y))
 
     def _draw_main(self, layout: MainLayout) -> None:
         label_cols = self._label_col_widths(layout.tiles)
         for tile in layout.tiles:
             self._draw_tile(tile, label_cols[tile.compact])
         sr = layout.status_rect
-        status = self._font_small.render(layout.status_text, True, fmt.GRAY)
-        self._screen.blit(status, (sr.x + 8, sr.y + (sr.h - status.get_height()) // 2))
+        status_x = sr.x + min(8, max(2, sr.w // 20))
+        # Keep the refresh target clear.  At 240px wide the full status string
+        # is wider than the remaining footer, so it must be shortened rather
+        # than blitted through the button.
+        refresh = layout.refresh_rect
+        status_right = (
+            refresh.x - min(8, max(4, refresh.w // 3))
+            if refresh is not None else sr.x + sr.w - status_x
+        )
+        status = self._font_small.render(
+            self._fit_text(self._font_small, layout.status_text,
+                           max(0, status_right - status_x)),
+            True, fmt.GRAY,
+        )
+        status_y = sr.y + (sr.h - status.get_height()) // 2
+        self._screen.blit(status, (status_x, status_y))
         # Refresh outcome rides alongside the status line for a few seconds, so
         # a tap reports back in words rather than only via the button highlight.
         feedback = self._current_refresh_feedback()
         if feedback:
             colour = fmt.RED if feedback == "refresh failed" else fmt.GRAY
-            fb = self._font_small.render(f"· {feedback}", True, colour)
-            self._screen.blit(
-                fb,
-                (sr.x + 8 + status.get_width() + 8,
-                 sr.y + (sr.h - fb.get_height()) // 2),
+            feedback_x = status_x + status.get_width() + min(8, max(4, sr.w // 40))
+            feedback_text = self._fit_text(
+                self._font_small, f"· {feedback}",
+                max(0, status_right - feedback_x),
             )
-        # Off-peak status tag (QWEN) sits in the status bar, next to the timer.
-        # With an on-demand refresh button at the right edge, the tag moves
-        # left of it so the two never overlap.
-        if layout.footer_note:
-            note = self._font_title.render(layout.footer_note, True, layout.footer_color)
-            if layout.refresh_rect is not None:
-                note_x = layout.refresh_rect.x - note.get_width() - 12
-            else:
-                note_x = sr.x + sr.w - note.get_width() - 12
-            self._screen.blit(
-                note,
-                (note_x, sr.y + (sr.h - note.get_height()) // 2),
-            )
-        if layout.refresh_rect is not None:
-            self._draw_refresh_button(layout.refresh_rect, layout.refresh_pending)
+            if feedback_text:
+                fb = self._font_small.render(feedback_text, True, colour)
+                self._screen.blit(fb, (feedback_x, status_y))
+        if refresh is not None:
+            self._draw_refresh_button(refresh, layout.refresh_pending)
 
     def _draw_refresh_button(self, rect: Rect, pending: bool) -> None:
         """The status-bar on-demand refresh tap target: a rounded square with a
@@ -565,24 +786,81 @@ class DashboardGui:
         pygame.draw.rect(self._screen, _TILE_BG, rect, border_radius=8)
         pygame.draw.rect(self._screen, tile.accent, rect, width=2, border_radius=8)
 
+        if tile.ultra_compact:
+            self._draw_ultra_compact_tile(tile)
+            return
+
         # Consistent padding across all tiles (screen-derived, not per-tile
         # height) so 2-bar and 3-bar tiles have identical spacing.
         pad = self._tile_pad
-        title_surf = self._font_title.render(tile.title, True, tile.title_color)
-        self._screen.blit(title_surf, (r.x + pad, r.y + pad))
-        if tile.subtitle:
-            sub_surf = self._font_small.render(tile.subtitle, True, tile.subtitle_color)
-            self._screen.blit(
-                sub_surf,
-                (r.x + r.w - pad - sub_surf.get_width(),
-                 r.y + pad + (title_surf.get_height() - sub_surf.get_height()) // 2),
+        inner_left = r.x + pad
+        inner_right = r.x + r.w - pad
+        header_w = max(0, inner_right - inner_left)
+        bar_font = self._bar_font(tile.compact)
+        subtitle_w = self._font_small.size(tile.subtitle)[0] if tile.subtitle else 0
+        title_w = self._font_title.size(tile.title)[0]
+        stack_requested = bool(tile.subtitle) and (
+            title_w + subtitle_w + pad > header_w
+        )
+        # Keep the two header strings on one line when they fit, as on the
+        # landscape panel.  On a portrait compact tile the stale/offline suffix
+        # is more useful than a clipped title, so move the subtitle below it
+        # instead of shortening the provider name to ``ZAI...``.  A very short
+        # landscape tile may not have a whole bar row left after that extra
+        # line; in that case truncate the subtitle in the title row instead of
+        # letting the stacked header collide with bar text.
+        stack_subtitle = stack_requested
+        if stack_subtitle and tile.bars:
+            stacked_top = (
+                r.y + pad + self._font_title.get_linesize()
+                + self._font_small.get_linesize() + 2 + pad // 2
             )
+            content_bottom = r.y + r.h - pad
+            stack_subtitle = (
+                content_bottom - stacked_top
+                >= len(tile.bars) * bar_font.get_linesize()
+            )
+        if stack_subtitle:
+            title_max = header_w
+        elif tile.subtitle and not stack_requested:
+            title_max = min(title_w, max(0, header_w - subtitle_w - pad))
+        else:
+            title_max = header_w
+        title_text = self._fit_text(self._font_title, tile.title, title_max)
+        title_surf = self._font_title.render(title_text, True, tile.title_color)
+        self._screen.blit(title_surf, (inner_left, r.y + pad))
+        header_extra = 0
+        if tile.subtitle:
+            if stack_subtitle:
+                subtitle_max = header_w
+            else:
+                subtitle_max = max(0, header_w - title_surf.get_width() - pad)
+            subtitle_text = self._fit_text(self._font_small, tile.subtitle, subtitle_max)
+            if subtitle_text:
+                sub_surf = self._font_small.render(
+                    subtitle_text, True, tile.subtitle_color
+                )
+                if stack_subtitle:
+                    subtitle_y = r.y + pad + title_surf.get_height() + 2
+                    self._screen.blit(sub_surf, (inner_left, subtitle_y))
+                    header_extra = sub_surf.get_height() + 2
+                else:
+                    self._screen.blit(
+                        sub_surf,
+                        (
+                            inner_right - sub_surf.get_width(),
+                            r.y + pad
+                            + (title_surf.get_height() - sub_surf.get_height()) // 2,
+                        ),
+                    )
 
         # One horizontal row per bar: "Session 49%" | track | "resets 3h 38m".
-        content_top = r.y + pad + title_surf.get_height() + pad // 2
+        content_top = (
+            r.y + pad + title_surf.get_height() + header_extra + pad // 2
+        )
         bottom = r.y + r.h - pad
         n = max(len(tile.bars), 1)
-        row_h = (bottom - content_top) // n
+        row_h = max(1, (bottom - content_top) // n)
         bar_h = max(8, row_h // 3)
 
         # Fixed columns so bars are uniform across *all* tiles: the label column
@@ -591,7 +869,13 @@ class DashboardGui:
         # ends at the same x. The track ends before the reset column, so a 100%
         # bar lands at that edge and never bleeds into it.
         labels = [
-            self._font.render(self._bar_label(bar), True, fmt.TEXT)
+            bar_font.render(
+                self._fit_text(
+                    bar_font, self._bar_label(bar), label_col_w
+                ),
+                True,
+                fmt.TEXT,
+            )
             for bar in tile.bars
         ]
         track_x, track_right = self._bar_track(r, label_col_w, compact=tile.compact)
@@ -600,29 +884,115 @@ class DashboardGui:
         track_w = track_right - track_x
 
         for i, bar in enumerate(tile.bars):
-            cy = content_top + i * row_h + row_h // 2  # vertical centre of row
-            self._screen.blit(labels[i], (r.x + pad, cy - labels[i].get_height() // 2))
+            row_top = content_top + i * row_h
+            cy = row_top + row_h // 2  # vertical centre of row
 
-            if track_w > 20:
-                track_y = cy - bar_h // 2
-                pygame.draw.rect(
-                    self._screen, fmt.BAR_BG,
-                    pygame.Rect(track_x, track_y, track_w, bar_h), border_radius=4,
+            if track_w < _MIN_BAR_TRACK_W:
+                # Last-resort geometry for an unusually narrow/custom window:
+                # put the track across the tile and keep the two text columns
+                # on the row's upper edge.  The normal 240px fallback avoids
+                # this path by stacking paired tiles and using bare resets, but
+                # this guard keeps arbitrary small dev windows drawable too.
+                text_gap = max(2, pad // 2)
+                reset_w = min(
+                    self._reset_width(tile.compact), max(0, r.w - 2 * pad)
                 )
-                fill_w = max(0, int(track_w * bar.fraction))
+                label_w = max(0, r.w - 2 * pad - reset_w - text_gap)
+                label_text = self._fit_text(
+                    bar_font, self._bar_label(bar), label_w
+                )
+                label = bar_font.render(label_text, True, fmt.TEXT)
+                reset_text = self._fit_text(
+                    bar_font, self._reset_label(bar, tile.compact), reset_w
+                )
+                reset = bar_font.render(
+                    reset_text,
+                    True,
+                    fmt.YELLOW if bar.reset_highlight else fmt.GRAY,
+                )
+                self._screen.blit(label, (r.x + pad, row_top))
+                self._screen.blit(
+                    reset, (r.x + r.w - pad - reset.get_width(), row_top)
+                )
+                row_bottom = min(bottom, row_top + row_h)
+                text_bottom = row_top + max(label.get_height(), reset.get_height())
+                fallback_track_y = text_bottom + text_gap
+                fallback_track_h = min(
+                    bar_h, max(0, row_bottom - fallback_track_y)
+                )
+                if fallback_track_h <= 0:
+                    # There is no room for a track below the two text columns.
+                    # Omitting it is preferable to painting a bar through the
+                    # next row's text on an arbitrarily tiny custom window.
+                    continue
+                fallback_track_w = max(1, r.w - 2 * pad)
+                pygame.draw.rect(
+                    self._screen,
+                    fmt.BAR_BG,
+                    pygame.Rect(
+                        r.x + pad, fallback_track_y,
+                        fallback_track_w, fallback_track_h,
+                    ),
+                    border_radius=4,
+                )
+                fill_w = max(0, int(fallback_track_w * bar.fraction))
                 if fill_w > 0:
                     fill_color = fmt.mute(bar.color) if bar.muted else bar.color
                     pygame.draw.rect(
-                        self._screen, fill_color,
-                        pygame.Rect(track_x, track_y, fill_w, bar_h), border_radius=4,
+                        self._screen,
+                        fill_color,
+                        pygame.Rect(
+                            r.x + pad, fallback_track_y, fill_w, fallback_track_h
+                        ),
+                        border_radius=4,
                     )
+                continue
+
+            self._screen.blit(labels[i], (r.x + pad, cy - labels[i].get_height() // 2))
+
+            track_y = cy - bar_h // 2
+            pygame.draw.rect(
+                self._screen,
+                fmt.BAR_BG,
+                pygame.Rect(track_x, track_y, track_w, bar_h),
+                border_radius=4,
+            )
+            fill_w = max(0, int(track_w * bar.fraction))
+            if fill_w > 0:
+                fill_color = fmt.mute(bar.color) if bar.muted else bar.color
+                pygame.draw.rect(
+                    self._screen,
+                    fill_color,
+                    pygame.Rect(track_x, track_y, fill_w, bar_h),
+                    border_radius=4,
+                )
 
             if bar.reset_text:
                 rc = fmt.YELLOW if bar.reset_highlight else fmt.GRAY
-                text = bar.reset_text if tile.compact else f"resets {bar.reset_text}"
-                reset = self._font.render(text, True, rc)
+                reset_text = self._fit_text(
+                    bar_font,
+                    self._reset_label(bar, tile.compact),
+                    self._reset_width(tile.compact),
+                )
+                reset = bar_font.render(reset_text, True, rc)
                 # Left-aligned at a fixed x just past the bar, so resets line up.
                 self._screen.blit(reset, (reset_x, cy - reset.get_height() // 2))
+
+        # Quota-less providers carry their signal in ``detail`` instead of bars;
+        # without this the tile would render as a bare title. Vertically centred
+        # in the content area, coloured by the volume alert (see layout).
+        if tile.detail and not tile.bars:
+            detail_text = self._fit_text(
+                self._font, tile.detail, max(0, inner_right - inner_left)
+            )
+            detail_surf = self._font.render(detail_text, True, tile.detail_color)
+            self._screen.blit(
+                detail_surf,
+                (
+                    inner_left,
+                    content_top + (bottom - content_top - detail_surf.get_height()) // 2,
+                ),
+            )
 
     def _draw_detail(self, readings: list[Reading]) -> None:
         by_provider = {r.provider: r for r in readings}
@@ -638,26 +1008,50 @@ class DashboardGui:
                 secondary = ("work", work)
         detail: DetailLayout = build_detail_layout(reading, secondary=secondary)
         pad = max(10, self._width // 30)
-        self._screen.blit(
-            self._font_title.render(detail.title, True, fmt.TEXT), (pad, pad)
+        content_w = max(0, self._width - 2 * pad)
+        title_text = self._fit_text(self._font_title, detail.title, content_w)
+        title = self._font_title.render(title_text, True, fmt.TEXT)
+        self._screen.blit(title, (pad, pad))
+        y = pad + title.get_height() + pad
+        hint_text = self._fit_text(
+            self._font_small, "tap anywhere to go back", content_w
         )
-        y = pad + self._font_title.get_height() + pad
-        bottom_limit = self._height - self._font_small.get_height() - pad * 2
+        hint = self._font_small.render(hint_text, True, fmt.GRAY)
+        bottom_limit = self._height - hint.get_height() - pad * 2
+        line_gap = max(3, min(6, self._font.get_linesize() // 5))
+        font_h = self._font.get_linesize()
         for line in detail.lines:
-            if y + self._font.get_height() > bottom_limit:
-                self._screen.blit(
-                    self._font.render("…", True, fmt.GRAY), (pad, y)
+            raw_label = f"{line.label}:" if line.label else ""
+            label_text = self._fit_text(self._font, raw_label, content_w)
+            label_surf = self._font.render(label_text, True, line.color)
+            value_text = self._fit_text(self._font, line.value, content_w)
+            value_surf = self._font.render(value_text, True, line.color)
+            inline = bool(line.value) and (
+                not line.label
+                or label_surf.get_width() + line_gap + value_surf.get_width()
+                <= content_w
+            )
+            needed = font_h if inline or not line.value else 2 * font_h + line_gap
+            if y + needed > bottom_limit:
+                ellipsis = self._font.render(
+                    self._fit_text(self._font, "...", content_w), True, fmt.GRAY
                 )
+                if y + ellipsis.get_height() <= bottom_limit:
+                    self._screen.blit(ellipsis, (pad, y))
                 break
-            label_surf = self._font.render(f"{line.label}:", True, line.color)
             self._screen.blit(label_surf, (pad, y))
             if line.value:
-                val_surf = self._font.render(line.value, True, line.color)
-                self._screen.blit(
-                    val_surf, (self._width - pad - val_surf.get_width(), y)
-                )
-            y += self._font.get_height() + 6
-        hint = self._font_small.render("tap anywhere to go back", True, fmt.GRAY)
+                if inline:
+                    self._screen.blit(
+                        value_surf,
+                        (self._width - pad - value_surf.get_width(), y),
+                    )
+                else:
+                    # A long value (model names and timestamps are common
+                    # examples) gets its own line instead of being painted over
+                    # the label or clipped past the right edge.
+                    self._screen.blit(value_surf, (pad, y + font_h + line_gap))
+            y += needed + line_gap
         self._screen.blit(hint, (pad, self._height - hint.get_height() - pad))
 
     def _draw_status_overlay(self) -> None:
@@ -666,49 +1060,84 @@ class DashboardGui:
         panel_rect = pygame.Rect(p.x, p.y, p.w, p.h)
         pygame.draw.rect(self._screen, _OVERLAY_BG, panel_rect, border_radius=12)
         pygame.draw.rect(self._screen, fmt.TEXT, panel_rect, width=2, border_radius=12)
-        pad = max(8, min(p.w, p.h) // 14)
+        pad = status_overlay_padding((self._width, self._height))
         # A hairline divider between the diagnostics and brightness columns.
         div_x = overlay.brightness.region.x - pad
         pygame.draw.line(
-            self._screen, _BTN_BG, (div_x, p.y + pad), (div_x, p.y + p.h - pad), 1
+            self._screen,
+            _BTN_BG,
+            (div_x, overlay.diag_rect.y),
+            (div_x, overlay.diag_rect.y + overlay.diag_rect.h),
+            1,
         )
         self._draw_diagnostics(overlay.diag_rect)
         self._draw_brightness_controls(overlay.brightness)
 
-        hint = self._font_small.render("tap outside to close", True, fmt.GRAY)
+        footer_h = max(
+            status_overlay_footer_height((self._width, self._height)),
+            self._font_small.get_height() + 4,
+        )
+        hint = self._font_small.render(
+            self._fit_text(self._font_small, "tap outside to close", max(0, p.w - 2 * pad)),
+            True,
+            fmt.GRAY,
+        )
+        hint_y = p.y + p.h - pad - footer_h + max(0, (footer_h - hint.get_height()) // 2)
         self._screen.blit(
             hint,
-            (p.x + (p.w - hint.get_width()) // 2, p.y + p.h - hint.get_height() - 4),
+            (p.x + (p.w - hint.get_width()) // 2, hint_y),
         )
 
     def _draw_diagnostics(self, rect: Rect) -> None:
         """Left column: how to reach this unit and whether the updater is happy."""
-        title = self._font_title.render("This unit", True, fmt.TEXT)
+        title = self._font_title.render(
+            self._fit_text(self._font_title, "This unit", rect.w), True, fmt.TEXT
+        )
         self._screen.blit(title, (rect.x, rect.y))
-        y = rect.y + title.get_height() + 6
+        y = rect.y + title.get_height() + max(3, min(6, self._font.get_linesize() // 5))
         lines = (
             diag.diagnostic_lines(self._diag, datetime.now(timezone.utc))
             if self._diag is not None else []
         )
+        line_gap = max(3, min(6, self._font.get_linesize() // 5))
+        font_h = self._font.get_linesize()
         for line in lines:
-            if y + self._font.get_height() > rect.y + rect.h:
-                break
             value_color = fmt.RED if line.warn else fmt.TEXT
+            label = self._font.render(
+                self._fit_text(self._font, line.label, rect.w), True, fmt.GRAY
+            )
+            value = self._font.render(
+                self._fit_text(self._font, line.value, rect.w), True, value_color
+            )
+            inline = bool(line.value) and (
+                not line.label
+                or label.get_width() + line_gap + value.get_width() <= rect.w
+            )
+            needed = font_h if inline or not line.value else 2 * font_h + line_gap
+            if y + needed > rect.y + rect.h:
+                ellipsis = self._font.render(
+                    self._fit_text(self._font, "...", rect.w), True, fmt.GRAY
+                )
+                if y + ellipsis.get_height() <= rect.y + rect.h:
+                    self._screen.blit(ellipsis, (rect.x, y))
+                break
             if line.label:
-                self._screen.blit(
-                    self._font.render(f"{line.label}", True, fmt.GRAY), (rect.x, y)
-                )
+                self._screen.blit(label, (rect.x, y))
             if line.value:
-                val = self._font.render(line.value, True, value_color)
-                self._screen.blit(
-                    val, (rect.x + rect.w - val.get_width(), y)
-                )
-            y += self._font.get_height() + 6
+                if inline:
+                    self._screen.blit(
+                        value, (rect.x + rect.w - value.get_width(), y)
+                    )
+                else:
+                    self._screen.blit(value, (rect.x, y + font_h + line_gap))
+            y += needed + line_gap
 
     def _draw_brightness_controls(self, controls: BrightnessOverlay) -> None:
         """Right column: ``−`` | step readout + gauge | ``+``."""
         region = controls.region
-        title = self._font_title.render("Brightness", True, fmt.TEXT)
+        title = self._font_title.render(
+            self._fit_text(self._font_title, "Brightness", region.w), True, fmt.TEXT
+        )
         self._screen.blit(
             title, (region.x + (region.w - title.get_width()) // 2, region.y)
         )
@@ -717,33 +1146,80 @@ class DashboardGui:
             br = pygame.Rect(rect.x, rect.y, rect.w, rect.h)
             pygame.draw.rect(self._screen, _BTN_BG, br, border_radius=10)
             pygame.draw.rect(self._screen, fmt.GRAY, br, width=2, border_radius=10)
-            g = self._font_big.render(glyph, True, fmt.TEXT)
-            self._screen.blit(
-                g,
-                (rect.x + (rect.w - g.get_width()) // 2,
-                 rect.y + (rect.h - g.get_height()) // 2),
-            )
+            glyph_text = self._fit_text(self._font_big, glyph, rect.w)
+            g = self._font_big.render(glyph_text, True, fmt.TEXT)
+            self._screen.blit(g, (rect.x + (rect.w - g.get_width()) // 2,
+                                  rect.y + (rect.h - g.get_height()) // 2))
 
         # Centre readout: current step over a filled-segment gauge. "—" when
         # there's no controllable backlight, so the inert +/- read as inert.
         lr = controls.level_rect
         cx = lr.x + lr.w // 2
         available = self._backlight.available
-        num_text = str(self._brightness_step) if available else "—"
-        num = self._font_big.render(num_text, True, fmt.TEXT)
-        den = self._font_small.render(f"of {self._brightness_steps}", True, fmt.GRAY)
-        self._screen.blit(num, (cx - num.get_width() // 2, lr.y + 4))
-        if available:
-            self._screen.blit(
-                den, (cx - den.get_width() // 2, lr.y + 4 + num.get_height())
-            )
         steps = self._brightness_steps
         gap = 3
+        # Four pixels is enough for the gauge on the very short 320x240 card;
+        # preserving that space lets the actual step glyph remain visible.
+        seg_h = min(max(4, lr.h // 8), max(1, lr.h))
+        seg_y = lr.y + lr.h - seg_h
+
+        # Reserve the gauge before placing the readout.  On a short landscape
+        # card the denominator is deliberately dropped when it cannot fit; a
+        # clipped ``of 10`` is less readable than the step number and would
+        # overlap the gauge.
+        num_text = str(self._brightness_step) if available else "—"
+        readout_font = (
+            self._font
+            if lr.h
+            < self._font_big.get_linesize() + self._font_small.get_linesize() + 12
+            else self._font_big
+        )
+        num = readout_font.render(
+            self._fit_text(readout_font, num_text, max(0, lr.w)), True, fmt.TEXT
+        )
+        denominator = f"of {self._brightness_steps}" if available else ""
+        if denominator and self._font_small.size(denominator)[0] > lr.w:
+            # The centre column can be only a few pixels wide on a 240px
+            # display.  The step count alone still explains the gauge without
+            # spilling into the +/- targets.
+            denominator = str(self._brightness_steps)
+        den = self._font_small.render(
+            self._fit_text(self._font_small, denominator, max(0, lr.w)),
+            True,
+            fmt.GRAY,
+        )
+        text_bottom = seg_y - 2
+        num_y = lr.y + max(0, (text_bottom - lr.y - num.get_height()) // 2)
+        num_fits = num_y + num.get_height() <= text_bottom
+        if num_fits:
+            self._screen.blit(num, (cx - num.get_width() // 2, num_y))
+        if available and num_fits:
+            den_y = num_y + num.get_height() + 2
+            if den_y + den.get_height() <= text_bottom:
+                self._screen.blit(den, (cx - den.get_width() // 2, den_y))
+
+        required = steps * 2 + (steps - 1) * gap
+        if lr.w < required:
+            # A segmented gauge cannot fit in the narrow centre column.  Use a
+            # single filled track instead of letting the segment math overlap
+            # the +/- controls.
+            gauge = pygame.Rect(lr.x, seg_y, max(1, lr.w), seg_h)
+            pygame.draw.rect(
+                self._screen, fmt.BAR_BG, gauge, border_radius=2
+            )
+            if available:
+                fill_w = max(0, int(gauge.w * self._brightness_step / steps))
+                if fill_w:
+                    pygame.draw.rect(
+                        self._screen, fmt.GREEN,
+                        pygame.Rect(gauge.x, gauge.y, fill_w, gauge.h),
+                        border_radius=2,
+                    )
+            return
+
         seg_w = max(2, (lr.w - (steps - 1) * gap) // steps)
-        seg_h = max(6, lr.h // 8)
         total_w = seg_w * steps + gap * (steps - 1)
         seg_x = lr.x + (lr.w - total_w) // 2
-        seg_y = lr.y + lr.h - seg_h
         for i in range(steps):
             lit = available and i < self._brightness_step
             color = fmt.GREEN if lit else fmt.BAR_BG
@@ -828,9 +1304,6 @@ def main() -> None:
         brightness_state_file=brightness_state_file,
         server_url=server_url,
         status_dir=diag.default_state_dir(),
-        # Default on; GUI_OPENCODE_TILE=0 reverts a unit to the pre-OpenCode
-        # layout (CODEX full-width) without a code change or a redeploy.
-        show_opencode=os.environ.get("GUI_OPENCODE_TILE", "1") != "0",
     )
 
     def _handle_sigterm(signum: int, frame: Any) -> None:

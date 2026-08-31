@@ -10,13 +10,16 @@ from usage_dashboard.server.fetch_types import FetchAuthError, FetchError
 from usage_dashboard.server.scheduler import FetchScheduler
 from usage_dashboard.server.token_store import TokenStore
 from usage_dashboard.shared.models import (
+    ALERT_WARN,
     THROTTLE_BOXED,
     THROTTLE_LOW,
     THROTTLE_LOW_INTERACTIVITY,
     THROTTLE_NONE,
+    ModelUsage,
     Provider,
     Reading,
     ReadingStatus,
+    ScopedLimit,
 )
 
 
@@ -588,6 +591,40 @@ class TestIdleLadder:
         scheduler._fetch_one(Provider.OLLAMA, MagicMock(return_value=r2))
         assert _interval(scheduler, Provider.OLLAMA) == 300
 
+    def test_alert_model_and_scoped_limit_changes_reset_to_floor(self, tmp_path):
+        db = Database(str(tmp_path / "sched.db"))
+        db.initialize()
+        scheduler = FetchScheduler(db, interval_seconds=300)
+        base = _make_reading(
+            provider=Provider.ZAI,
+            models=[ModelUsage(name="glm", requests=10, share_percent=100.0)],
+            scoped_limits=[
+                ScopedLimit(
+                    name="Monthly",
+                    percent=10.0,
+                    resets_at=datetime(2026, 1, 20, 0, 0, 0),
+                )
+            ],
+        )
+        scheduler._fetch_one(Provider.ZAI, MagicMock(return_value=base))
+        scheduler._fetch_one(Provider.ZAI, MagicMock(return_value=base))
+        assert _interval(scheduler, Provider.ZAI) == 600
+
+        changed = replace(
+            base,
+            alert=ALERT_WARN,
+            models=[ModelUsage(name="glm", requests=11, share_percent=100.0)],
+            scoped_limits=[
+                ScopedLimit(
+                    name="Monthly",
+                    percent=11.0,
+                    resets_at=datetime(2026, 1, 20, 0, 0, 0),
+                )
+            ],
+        )
+        scheduler._fetch_one(Provider.ZAI, MagicMock(return_value=changed))
+        assert _interval(scheduler, Provider.ZAI) == 300
+
     def test_boxed_reading_stays_at_floor(self, tmp_path):
         # An unchanged reading normally lets the idle ladder widen the gap, but a
         # boxed (penalty-box) reading must keep polling at the floor so the box
@@ -876,6 +913,128 @@ class TestRelativeCountdownIdleLadder:
         assert scheduler._reading_changed(
             replace(base, weekly_resets_at=None), base
         ) is True
+
+
+class TestCoarseCountdownGranularity:
+    """WI-026: a countdown only known at displayed-unit resolution must idle.
+
+    Ollama scrapes rounded text ("Resets in 5 hours"), so the absolute reset
+    recomputed from ``now`` drifts forward by ~the whole poll gap until the
+    text ticks over — far more than the tight reset epsilon. The reading
+    carries the countdown's smallest displayed unit (``*_reset_granularity``),
+    and the scheduler compares such resets with a tolerance of one unit, which
+    sits between the poll-gap drift and a real window rollover.
+    """
+
+    @staticmethod
+    def _poll_series(scheduler, polls, session_text_hours=5, weekly_text_days=3):
+        """Drive *polls* fetches of an ollama-shaped coarse countdown.
+
+        Each poll recomputes the absolute reset from the poll's own ``now``
+        using the SAME rounded text (the countdown hasn't ticked over), so the
+        absolute instant drifts forward by exactly the poll gap — the precise
+        shape that used to read as "changed" every poll.
+        """
+        start = datetime(2026, 8, 7, 0, 0, 0)
+        elapsed = 0.0
+        intervals = []
+        for _ in range(polls):
+            now = start + timedelta(seconds=elapsed)
+            reading = _make_reading(
+                provider=Provider.OLLAMA,
+                session_percent=42.0,
+                session_resets_at=now + timedelta(hours=session_text_hours),
+                weekly_percent=17.0,
+                weekly_resets_at=now + timedelta(days=weekly_text_days),
+                fetched_at=now,
+                session_reset_granularity=3600,
+                weekly_reset_granularity=86400,
+            )
+            scheduler._fetch_one(Provider.OLLAMA, MagicMock(return_value=reading))
+            interval = scheduler.schedule_snapshot()[Provider.OLLAMA]["interval_seconds"]
+            intervals.append(interval)
+            elapsed += interval
+        return intervals
+
+    def _scheduler(self, tmp_path):
+        db = Database(str(tmp_path / "sched.db"))
+        db.initialize()
+        return db, FetchScheduler(db, ollama_cookie="cookie")
+
+    def test_unchanged_coarse_countdown_climbs_the_idle_ladder(self, tmp_path):
+        # Pre-fix this was [300, 300, 300, 300] — pinned to the floor forever.
+        _, scheduler = self._scheduler(tmp_path)
+        assert self._poll_series(scheduler, 4) == [300, 600, 900, 1800]
+
+    def test_drift_up_to_a_full_idle_rung_is_not_a_change(self, tmp_path):
+        # The widest idle rung is 1800s; a drift that large (the whole poll gap
+        # at the top of the ladder) must still read as unchanged.
+        _, scheduler = self._scheduler(tmp_path)
+        base = _make_reading(
+            provider=Provider.OLLAMA,
+            session_resets_at=datetime(2026, 8, 7, 5, 0, 0),
+            weekly_resets_at=datetime(2026, 8, 10, 0, 0, 0),
+            session_reset_granularity=3600,
+            weekly_reset_granularity=86400,
+        )
+        drifted = replace(
+            base,
+            session_resets_at=base.session_resets_at + timedelta(seconds=1800),
+            weekly_resets_at=base.weekly_resets_at + timedelta(seconds=1800),
+            fetched_at=base.fetched_at + timedelta(seconds=1800),
+        )
+        assert scheduler._reading_changed(base, drifted) is False
+
+    def test_countdown_text_tick_is_not_a_change(self, tmp_path):
+        # When the rounded text ticks over ("5 hours" -> "4 hours") the absolute
+        # reset jumps back by ~one unit; that is still the same window, so it
+        # must not snap back to the floor.
+        _, scheduler = self._scheduler(tmp_path)
+        base = _make_reading(
+            provider=Provider.OLLAMA,
+            session_resets_at=datetime(2026, 8, 7, 5, 0, 0),
+            weekly_resets_at=datetime(2026, 8, 10, 0, 0, 0),
+            session_reset_granularity=3600,
+            weekly_reset_granularity=86400,
+        )
+        ticked = replace(
+            base,
+            # ~1 unit back, net of a 300s poll gap advancing now.
+            session_resets_at=base.session_resets_at - timedelta(hours=1) + timedelta(seconds=300),
+            fetched_at=base.fetched_at + timedelta(seconds=300),
+        )
+        assert scheduler._reading_changed(base, ticked) is False
+
+    def test_a_real_window_rollover_still_snaps_back_to_the_floor(self, tmp_path):
+        # The per-unit tolerance must not swallow an actual reset: a new 5h
+        # session window moves the reset by hours, beyond the hour granularity.
+        _, scheduler = self._scheduler(tmp_path)
+        self._poll_series(scheduler, 4)
+        now = datetime(2026, 8, 7, 2, 0, 0)
+        rolled = _make_reading(
+            provider=Provider.OLLAMA,
+            session_percent=5.0,
+            session_resets_at=now + timedelta(hours=5),
+            weekly_percent=17.0,
+            weekly_resets_at=now + timedelta(days=3),
+            fetched_at=now,
+            session_reset_granularity=3600,
+            weekly_reset_granularity=86400,
+        )
+        scheduler._fetch_one(Provider.OLLAMA, MagicMock(return_value=rolled))
+        assert scheduler.schedule_snapshot()[Provider.OLLAMA]["interval_seconds"] == 300
+
+    def test_absolute_providers_ignore_granularity(self, tmp_path):
+        # A provider without granularity keeps the tight reset epsilon: a 1800s
+        # drift that would be "unchanged" for ollama is a real change here.
+        _, scheduler = self._scheduler(tmp_path)
+        base = _make_reading(provider=Provider.ZAI)
+        moved = replace(
+            base,
+            session_resets_at=base.session_resets_at + timedelta(seconds=1800),
+            fetched_at=base.fetched_at + timedelta(seconds=1800),
+        )
+        assert scheduler._reading_changed(base, moved) is True
 
 
 class TestOllamaAuthFailureSignal:

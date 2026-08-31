@@ -93,7 +93,16 @@ def _parse_percent(block: str) -> float | None:
     return None
 
 
-def _parse_relative_reset(block: str, now: datetime) -> datetime | None:
+def _parse_relative_reset(block: str, now: datetime) -> tuple[datetime, int] | None:
+    """Parse "Resets in …" into (absolute reset instant, granularity seconds).
+
+    The granularity is the *smallest* displayed unit named in the countdown
+    text — the resolution the value actually carries. The scheduler compares
+    such resets with a tolerance of one unit rather than the tight
+    absolute-reset epsilon: the absolute instant here is recomputed from
+    ``now`` on every poll, so it drifts forward by ~the poll gap even when the
+    text is unchanged (WI-026).
+    """
     phrase = _RESET_IN_RE.search(block)
     if phrase is None:
         return None
@@ -104,12 +113,21 @@ def _parse_relative_reset(block: str, now: datetime) -> datetime | None:
     for amount, unit in tokens:
         key = _DURATION_UNITS[unit.lower()]
         delta[key] = delta.get(key, 0) + int(amount)
-    return now + timedelta(**delta)
+    unit_seconds = {
+        "weeks": 604800,
+        "days": 86400,
+        "hours": 3600,
+        "minutes": 60,
+    }
+    granularity = min(unit_seconds[_DURATION_UNITS[unit.lower()]] for _, unit in tokens)
+    return now + timedelta(**delta), granularity
 
 
-def _parse_resets_at(block: str, now: datetime) -> datetime | None:
+def _parse_resets_at(block: str, now: datetime) -> tuple[datetime | None, int | None]:
     # Prefer an explicit absolute timestamp if the markup ever carries one;
     # otherwise fall back to the relative "Resets in ..." countdown text.
+    # Returns (resets_at, granularity); granularity is only set for the
+    # relative path — an absolute timestamp needs no coarse tolerance.
     match = _DATA_TIME_RE.search(block)
     if match is not None:
         raw = match.group(1)
@@ -120,20 +138,24 @@ def _parse_resets_at(block: str, now: datetime) -> datetime | None:
         if parsed is not None:
             if parsed.tzinfo is not None:
                 parsed = parsed.astimezone(timezone.utc)
-            return parsed.replace(tzinfo=None)
-    return _parse_relative_reset(block, now)
+            return parsed.replace(tzinfo=None), None
+    relative = _parse_relative_reset(block, now)
+    if relative is None:
+        return None, None
+    return relative
 
 
 def _parse_usage_block(
     labels: tuple[str, ...], html: str, now: datetime
-) -> tuple[float, datetime | None] | None:
+) -> tuple[float, datetime | None, int | None] | None:
     for label in labels:
         block = _block_after(label, html)
         if block is None:
             continue
         percent = _parse_percent(block)
         if percent is not None:
-            return percent, _parse_resets_at(block, now)
+            resets_at, granularity = _parse_resets_at(block, now)
+            return percent, resets_at, granularity
     return None
 
 
@@ -205,4 +227,6 @@ def fetch_ollama_usage(cookie: str) -> Reading:
         fetched_at=now,
         stale=False,
         models=models if models else None,
+        session_reset_granularity=session[2] if session else None,
+        weekly_reset_granularity=weekly[2] if weekly else None,
     )

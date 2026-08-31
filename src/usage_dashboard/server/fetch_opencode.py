@@ -100,14 +100,28 @@ _DURATION_UNITS = {
     "second": 1.0,
     "sec": 1.0,
 }
+_DURATION_GRANULARITY = {
+    "day": 86400,
+    "hour": 3600,
+    "hr": 3600,
+    "minute": 60,
+    "min": 60,
+    "second": 1,
+    "sec": 1,
+}
 
 
 class _Window:
     """One parsed usage window: a percentage and seconds until it resets."""
 
-    __slots__ = ("percent", "reset_in_seconds")
+    __slots__ = ("percent", "reset_in_seconds", "reset_granularity")
 
-    def __init__(self, percent: float, reset_in_seconds: float | None) -> None:
+    def __init__(
+        self,
+        percent: float,
+        reset_in_seconds: float | None,
+        reset_granularity: int | None = None,
+    ) -> None:
         # The site has no reason to report a negative percentage or countdown,
         # but clamping keeps a glitched value from rendering as a bar running
         # backwards or a reset time in the past.
@@ -115,6 +129,7 @@ class _Window:
         self.reset_in_seconds = (
             None if reset_in_seconds is None else max(0.0, reset_in_seconds)
         )
+        self.reset_granularity = reset_granularity
 
     def resets_at(self, now: datetime) -> datetime | None:
         if self.reset_in_seconds is None:
@@ -153,6 +168,21 @@ def _parse_duration_seconds(text: str) -> float | None:
     return sum(float(amount) * _DURATION_UNITS[unit.lower()] for amount, unit in tokens)
 
 
+def _parse_duration_granularity(text: str) -> int | None:
+    """Return the smallest unit carried by a rendered countdown.
+
+    The hydration values are exact ``resetInSec`` numbers. The markup fallback
+    is rounded to the units it displays (for example, ``4 hours 47 minutes``
+    has minute resolution), so the scheduler needs that resolution to avoid
+    treating the recomputed absolute timestamp as usage movement on every
+    poll. ``None`` means the text had no duration token.
+    """
+    tokens = _DURATION_TOKEN_RE.findall(text)
+    if not tokens:
+        return None
+    return min(_DURATION_GRANULARITY[unit.lower()] for _amount, unit in tokens)
+
+
 def _window_key_for_label(label: str) -> str | None:
     lowered = label.strip().lower()
     for key in _WINDOW_KEYS:
@@ -173,17 +203,21 @@ def _parse_markup_windows(html: str) -> dict[str, _Window]:
         if key is None or key in windows:
             continue
         reset_seconds: float | None = None
+        reset_granularity: int | None = None
         reset_m = _ITEM_RESET_RE.search(chunk)
         if reset_m is not None:
             if reset_m.group(1) == "reset-now":
                 reset_seconds = 0.0
+                reset_granularity = None
             else:
                 text = _HYDRATION_COMMENT_RE.sub("", reset_m.group(2))
-                reset_seconds = _parse_duration_seconds(
-                    _RESETS_IN_PREFIX_RE.sub("", text).strip()
-                )
+                countdown = _RESETS_IN_PREFIX_RE.sub("", text).strip()
+                reset_seconds = _parse_duration_seconds(countdown)
+                reset_granularity = _parse_duration_granularity(countdown)
         windows[key] = _Window(
-            percent=float(percent_m.group(1)), reset_in_seconds=reset_seconds
+            percent=float(percent_m.group(1)),
+            reset_in_seconds=reset_seconds,
+            reset_granularity=reset_granularity,
         )
     return windows
 
@@ -212,7 +246,8 @@ def fetch_opencode_usage(workspace_id: str, cookie: str) -> Reading:
         # Signed out / unknown workspace: the site 302s to its auth host and
         # serves the sign-in page with a 200, so the redirect target is the
         # only reliable signal.
-        if response.url.host.endswith(_AUTH_HOST_SUFFIX):
+        host = response.url.host
+        if host == _AUTH_HOST_SUFFIX or host.endswith("." + _AUTH_HOST_SUFFIX):
             raise FetchAuthError(
                 "OpenCode Go redirected to sign-in — the auth cookie has "
                 "expired or the workspace id is wrong (the site does not "
@@ -251,6 +286,7 @@ def fetch_opencode_usage(workspace_id: str, cookie: str) -> Reading:
                 name="Monthly",
                 percent=monthly.percent,
                 resets_at=monthly.resets_at(now),
+                reset_granularity=monthly.reset_granularity,
             )
         ]
         if monthly is not None
@@ -267,4 +303,6 @@ def fetch_opencode_usage(workspace_id: str, cookie: str) -> Reading:
         fetched_at=now,
         stale=False,
         scoped_limits=scoped_limits,
+        session_reset_granularity=rolling.reset_granularity if rolling else None,
+        weekly_reset_granularity=weekly.reset_granularity if weekly else None,
     )

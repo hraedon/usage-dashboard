@@ -11,7 +11,8 @@ writes on every run — there's no daemon to query, so the updater leaves a
 breadcrumb and we read it:
 
 * ``update-last-check``  — ``<iso8601> <result> <short-commit>`` every run
-  (``result`` ∈ up-to-date / updated / pip-failed / import-failed / bad-ref)
+  (``result`` ∈ up-to-date / updated / pip-failed / import-failed / bad-ref /
+  no-checkout / reset-failed / fetch-failed)
 * ``update-last-change`` — ``<iso8601> <old-short> <new-short>`` only when the
   code actually moved.
 
@@ -39,8 +40,28 @@ _RESULT_LABELS = {
     # merely old timestamp: the unit is not going to update again on its own,
     # so it must read as a failure here rather than as quiet staleness.
     "bad-ref": "ref gone — stalled",
+    # Same class, caught earlier in the run: the checkout is missing/corrupt,
+    # or git could not move it. Either way the unit cannot update on its own.
+    "no-checkout": "checkout gone — stalled",
+    "reset-failed": "git reset failed — stalled",
+    # The remote could not be fetched or queried. Unlike bad-ref, this may clear
+    # on the next timer tick when connectivity returns.
+    "fetch-failed": "git fetch failed — offline",
 }
-_FAILED_RESULTS = frozenset({"pip-failed", "import-failed", "bad-ref"})
+_FAILED_RESULTS = frozenset(
+    {
+        "pip-failed",
+        "import-failed",
+        "bad-ref",
+        "no-checkout",
+        "reset-failed",
+        "fetch-failed",
+    }
+)
+# Only these failures happen after the updater has reset the checkout back to
+# the previously running revision. Git/ref/setup failures leave the current
+# checkout in place; they are warnings, not rollback reports.
+_ROLLED_BACK_RESULTS = frozenset({"pip-failed", "import-failed"})
 
 
 @dataclass(frozen=True)
@@ -147,9 +168,13 @@ def format_ago(when: datetime | None, now: datetime) -> str:
 
 
 def diagnostic_lines(diag: Diagnostics, now: datetime) -> list[DiagLine]:
-    """Label/value rows for the overlay's left column. An unhealthy updater (a
-    rolled-back install, or no record at all) is flagged so the GUI can colour
-    it — that's the line worth noticing on a stale panel."""
+    """Label/value rows for the overlay's left column.
+
+    Any known updater failure is flagged, but only install/import failures that
+    actually ran the rollback path are marked ``(rolled back)``. Ref, checkout,
+    reset, and transport failures leave the current checkout in place and are
+    therefore marked ``(current)``.
+    """
     lines = [DiagLine("Host", diag.hostname or "—")]
     if diag.addresses:
         lines.append(DiagLine("IP", diag.addresses[0]))
@@ -161,7 +186,8 @@ def diagnostic_lines(diag: Diagnostics, now: datetime) -> list[DiagLine]:
 
     if diag.check is not None:
         failed = diag.check.result in _FAILED_RESULTS
-        state = "(rolled back)" if failed else "(current)"
+        rolled_back = diag.check.result in _ROLLED_BACK_RESULTS
+        state = "(rolled back)" if rolled_back else "(current)"
         lines.append(
             DiagLine("Commit", f"{diag.running_commit or '—'} {state}".strip())
         )

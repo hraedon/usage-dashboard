@@ -25,6 +25,7 @@ from usage_dashboard.shared.models import (
     Provider,
     Reading,
     ReadingStatus,
+    ScopedLimit,
     make_offline_reading,
     make_stale_reading,
 )
@@ -192,28 +193,38 @@ class FetchScheduler:
         ``detail`` is compared verbatim because quota-less providers carry
         their movement there rather than in the percent fields.
 
-        Reset times compare with their own epsilon, for the same reason. A
-        provider reporting a *relative* countdown has its absolute reset instant
-        recomputed from ``now`` on every poll, so it lands slightly off the last
-        one even when nothing changed (and the DB round-trip truncates it to
-        whole seconds besides). Exact comparison called that "changed" on every
-        poll, pinning the provider to the floor forever. The tolerance is safe
-        by orders of magnitude: the shortest window is 5 h, so a real rollover
-        moves the reset by hours.
+        Reset times compare with a per-field tolerance. Absolute-reset
+        providers (claude/zai/codex and OpenCode's exact hydration path) use the
+        tight ``reset_epsilon``:
+        a provider reporting a *relative* countdown has its absolute reset
+        instant recomputed from ``now`` on every poll, so it lands slightly off
+        the last one even when nothing changed. Exact comparison called that
+        "changed" on every poll, pinning the provider to the floor forever.
 
-        This fixes **opencode**, whose ``resetInSec`` is exact and decrements in
-        lockstep with real time, so consecutive polls agree to within a second.
-        It does **not** fix **ollama**, whose countdown is scraped as rounded
-        text ("Resets in 5 hours"): its computed reset drifts by roughly the
-        whole poll gap until the text ticks over, which no sane epsilon covers.
-        Ollama stays pinned to the floor — pre-existing, tracked separately;
-        fixing it means comparing at the resolution the text actually carries.
+        A provider whose countdown is only known at coarse resolution (Ollama
+        scrapes rounded text like "Resets in 5 hours"; OpenCode's markup
+        fallback does the same at the units it displays) carries that
+        resolution in ``session_reset_granularity`` /
+        ``weekly_reset_granularity`` and compares with a tolerance of one unit.
+        That unit sits between
+        the poll-gap drift (≤ the widest idle rung, well under an hour) and a
+        real window rollover (≥ 5 h), so drift reads as "unchanged" while a
+        genuine rollover still snaps back to the floor. A single global epsilon
+        cannot do this: the weekly sawtooth (≤ 1 day) exceeds the session
+        rollover (5 h), so any epsilon big enough to quiet one suppresses the
+        other (WI-026).
         """
         if prev.status is not new.status:
             return True
         if (prev.detail or "") != (new.detail or ""):
             return True
         if prev.throttle != new.throttle:
+            return True
+        if prev.alert != new.alert:
+            return True
+        if prev.models != new.models:
+            return True
+        if self._scoped_limits_changed(prev.scoped_limits, new.scoped_limits):
             return True
         pairs = (
             (prev.session_percent, new.session_percent),
@@ -225,17 +236,62 @@ class FetchScheduler:
             if old is not None and cur is not None and abs(old - cur) >= self._change_epsilon:
                 return True
         resets = (
-            (prev.session_resets_at, new.session_resets_at),
-            (prev.weekly_resets_at, new.weekly_resets_at),
+            (prev.session_resets_at, new.session_resets_at, new.session_reset_granularity),
+            (prev.weekly_resets_at, new.weekly_resets_at, new.weekly_reset_granularity),
         )
-        for old_reset, cur_reset in resets:
+        for old_reset, cur_reset, granularity in resets:
             if (old_reset is None) != (cur_reset is None):
                 return True
+            if old_reset is None or cur_reset is None:
+                continue
+            tolerance = (
+                max(self._reset_epsilon, timedelta(seconds=granularity))
+                if granularity
+                else self._reset_epsilon
+            )
+            if abs(cur_reset - old_reset) >= tolerance:
+                return True
+        return False
+
+    def _scoped_limits_changed(
+        self, previous: list[ScopedLimit] | None, current: list[ScopedLimit] | None
+    ) -> bool:
+        """Compare extra windows without treating countdown drift as usage.
+
+        Scoped limits are absolute for Claude and exact in OpenCode's hydration
+        blob, but OpenCode's markup fallback reports rounded countdown text.
+        Compare the useful identity/usage fields directly and apply the same
+        reset tolerance policy as the aggregate windows, using the current
+        reading's server-only countdown resolution when it has one.
+        """
+        old_limits = previous or []
+        new_limits = current or []
+        if len(old_limits) != len(new_limits):
+            return True
+        for old, cur in zip(old_limits, new_limits):
+            if old.name != cur.name or old.is_active != cur.is_active:
+                return True
+            if (old.percent is None) != (cur.percent is None):
+                return True
             if (
-                old_reset is not None
-                and cur_reset is not None
-                and abs(cur_reset - old_reset) >= self._reset_epsilon
+                old.percent is not None
+                and cur.percent is not None
+                and abs(cur.percent - old.percent) >= self._change_epsilon
             ):
+                return True
+            if (old.resets_at is None) != (cur.resets_at is None):
+                return True
+            if old.resets_at is None or cur.resets_at is None:
+                continue
+            tolerance = (
+                max(
+                    self._reset_epsilon,
+                    timedelta(seconds=cur.reset_granularity),
+                )
+                if cur.reset_granularity
+                else self._reset_epsilon
+            )
+            if abs(cur.resets_at - old.resets_at) >= tolerance:
                 return True
         return False
 
@@ -559,7 +615,15 @@ class FetchScheduler:
 
     def _maybe_prune(self, now: datetime) -> None:
         if self._last_prune is None or (now - self._last_prune).total_seconds() >= 3600:
-            self._db.prune_old_readings(self._retention_days)
+            # Contain prune failures exactly like _fetch_one contains fetch
+            # failures: an exception escaping _run_loop kills the scheduler
+            # thread and stops every provider for the life of the pod.
+            try:
+                self._db.prune_old_readings(self._retention_days)
+            except Exception:
+                logger.exception(
+                    "Pruning old readings failed; will retry on the next prune window"
+                )
             self._last_prune = now
 
     def start(self) -> None:

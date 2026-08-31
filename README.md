@@ -1,6 +1,6 @@
 # usage-dashboard
 
-A two-component system for monitoring AI usage across [Claude](https://claude.ai), [z.ai](https://z.ai), [Ollama](https://ollama.com), [Codex](https://chatgpt.com/codex), and [OpenCode Go](https://opencode.ai). A server fetches usage data from all configured providers, normalizes it into a unified format, stores in SQLite, and serves it via an authenticated API. A client polls the server and renders usage as color-coded progress bars — a fullscreen touch GUI for a **Raspberry Pi 4B + Touch Display 2** (with optional scheduled backlight-sleep + tap-to-wake, and a tap-the-status-line overlay for unit diagnostics + brightness). Plans that discount off-peak use get glanceable hints: the z.ai tile title tints green off-peak / orange during peak hours, and a display-only `QWEN` tag in the status bar shows whether the Qwen token plan's off-peak window (22:00–08:00 UTC+8) is open. The server also serves a mobile-friendly HTML view at `/dashboard`.
+A two-component system for monitoring AI usage across [Claude](https://claude.ai), [z.ai](https://z.ai), [Ollama](https://ollama.com), [Codex](https://chatgpt.com/codex), and [OpenCode Go](https://opencode.ai). A server fetches usage data from all configured providers, normalizes it into a unified format, stores in SQLite, and serves it via an authenticated API. A client polls the server and renders usage as color-coded progress bars — a fullscreen touch GUI for a **Raspberry Pi 4B + Touch Display 2** (with optional scheduled backlight-sleep + tap-to-wake, and a tap-the-status-line overlay for unit diagnostics + brightness). Plans that discount off-peak use get a glanceable z.ai hint: its tile title tints green off-peak / orange during peak hours, with a countdown to the next boundary. The server also serves a mobile-friendly HTML view at `/dashboard`.
 
 ## Architecture
 
@@ -84,8 +84,7 @@ provider is currently configured, so `throttle` stays `none`.
 
 Peak-window hints: the z.ai tile title tint (green off-peak / orange peak) is
 joined by a countdown in the tile's name bar (`peak in 3h 24m` while off-peak,
-`ends in 1h 24m` in peak), and the QWEN footer tag carries the same countdown
-for the Qwen token plan's window.
+`ends in 1h 24m` in peak).
 
 ## Clients
 

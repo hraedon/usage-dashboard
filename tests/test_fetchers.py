@@ -9,7 +9,10 @@ import pytest
 from usage_dashboard.server.fetch_claude import fetch_claude_usage, refresh_claude_token
 from usage_dashboard.server.fetch_codex import fetch_codex_usage
 from usage_dashboard.server.fetch_ollama import _parse_relative_reset, fetch_ollama_usage
-from usage_dashboard.server.fetch_opencode import fetch_opencode_usage
+from usage_dashboard.server.fetch_opencode import (
+    _parse_duration_granularity,
+    fetch_opencode_usage,
+)
 from usage_dashboard.server.fetch_types import (
     FetchAuthError,
     FetchError,
@@ -317,6 +320,26 @@ class TestFetchClaude:
         assert reading.status is ReadingStatus.CURRENT
         assert reading.session_percent is None
         assert reading.session_resets_at is None
+
+    @patch("usage_dashboard.server.fetch_claude.httpx.Client")
+    def test_fetch_claude_converts_non_utc_offset(self, mock_client_cls):
+        # A non-UTC offset must be CONVERTED to UTC, not stamped as UTC. The
+        # aggregate path used to .replace(tzinfo=utc) the parsed wall-clock,
+        # which would misplace such a value by the offset.
+        data = _claude_response_data()
+        data["five_hour"]["resets_at"] = "2026-01-15T15:00:00+05:00"
+        mock_response = MagicMock()
+        mock_response.json.return_value = data
+        mock_response.raise_for_status = MagicMock()
+        mock_client = MagicMock()
+        mock_client.get.return_value = mock_response
+        mock_client.__enter__ = MagicMock(return_value=mock_client)
+        mock_client.__exit__ = MagicMock(return_value=False)
+        mock_client_cls.return_value = mock_client
+
+        reading = fetch_claude_usage("test-token")
+        # 15:00+05:00 == 10:00 UTC.
+        assert reading.session_resets_at == datetime(2026, 1, 15, 10, 0, 0)
 
     @patch("usage_dashboard.server.fetch_claude.httpx.Client")
     def test_fetch_claude_sends_authorization_header(self, mock_client_cls):
@@ -911,6 +934,25 @@ class TestFetchOllama:
         assert sess is not None and wk is not None
         assert before + timedelta(hours=5) <= sess <= after + timedelta(hours=5)
         assert before + timedelta(days=2) <= wk <= after + timedelta(days=2)
+        assert reading.session_reset_granularity == 3600
+        assert reading.weekly_reset_granularity == 86400
+
+    @patch("usage_dashboard.server.fetch_ollama.httpx.Client")
+    def test_fetch_ollama_uses_smallest_displayed_reset_unit(self, mock_client_cls):
+        html = """
+        <html><body><span>Cloud Usage</span><span>Pro</span>
+        <div><h3>Session usage</h3><span>10.0% used</span>
+          <span>Resets in 1 day 3 hours</span></div>
+        <div><h3>Weekly usage</h3><span>20.0% used</span>
+          <span>Resets in 2 days 4 hours 30 minutes</span></div>
+        </body></html>
+        """
+        self._mock_get(mock_client_cls, text=html)
+
+        reading = fetch_ollama_usage("session=abc123")
+
+        assert reading.session_reset_granularity == 3600
+        assert reading.weekly_reset_granularity == 60
 
     @patch("usage_dashboard.server.fetch_ollama.httpx.Client")
     def test_fetch_ollama_sends_cookie_header(self, mock_client_cls):
@@ -1112,31 +1154,91 @@ class TestZaiResetTimes:
         assert reading.session_resets_at == datetime(2026, 6, 13, 0, 35, 23, 670000)
         assert reading.weekly_resets_at == datetime(2026, 6, 17, 2, 29, 32, 979000)
 
+    @patch("usage_dashboard.server.fetch_zai.httpx.Client")
+    def test_float_counters_do_not_fail_the_fetch(self, mock_client_cls):
+        # JSON numbers with a fractional part parse to Python floats; the old
+        # int(str(x)) idiom raised ValueError on "…670.0" and failed the whole
+        # fetch. Whole-valued floats must parse identically to ints.
+        data = _zai_response_data()
+        limits = data["data"]["limits"]
+        limits[0]["nextResetTime"] = 1781310923670.0  # session reset as float
+        limits[1]["nextResetTime"] = 1781663372979.0  # weekly reset as float
+        limits[2]["currentValue"] = 37.0
+        for detail in limits[2]["usageDetails"]:
+            detail["usage"] = float(detail["usage"])
+        mock_response = MagicMock()
+        mock_response.json.return_value = data
+        mock_response.raise_for_status = MagicMock()
+        mock_client = MagicMock()
+        mock_client.get.return_value = mock_response
+        mock_client.__enter__ = MagicMock(return_value=mock_client)
+        mock_client.__exit__ = MagicMock(return_value=False)
+        mock_client_cls.return_value = mock_client
+
+        reading = fetch_zai_usage("key")
+        assert reading.session_resets_at == datetime(2026, 6, 13, 0, 35, 23, 670000)
+        assert reading.weekly_resets_at == datetime(2026, 6, 17, 2, 29, 32, 979000)
+        assert reading.models is not None
+        assert reading.models[0].requests == 24
+
+    @pytest.mark.parametrize("bad_epoch", ["not-a-time", "", True, 1.5])
+    @patch("usage_dashboard.server.fetch_zai.httpx.Client")
+    def test_malformed_nonempty_epoch_does_not_become_1970(
+        self, mock_client_cls, bad_epoch
+    ):
+        data = _zai_response_data()
+        data["data"]["limits"][0]["nextResetTime"] = bad_epoch
+        mock_response = MagicMock()
+        mock_response.json.return_value = data
+        mock_response.raise_for_status = MagicMock()
+        mock_client = MagicMock()
+        mock_client.get.return_value = mock_response
+        mock_client.__enter__ = MagicMock(return_value=mock_client)
+        mock_client.__exit__ = MagicMock(return_value=False)
+        mock_client_cls.return_value = mock_client
+
+        with pytest.raises(FetchError):
+            fetch_zai_usage("key")
+
 
 class TestParseRelativeReset:
     _NOW = datetime(2026, 6, 14, 12, 0, 0)
 
     def test_hours(self):
         got = _parse_relative_reset("Resets in 5 hours", self._NOW)
-        assert got == self._NOW + timedelta(hours=5)
+        assert got == (self._NOW + timedelta(hours=5), 3600)
 
     def test_days(self):
         got = _parse_relative_reset("resets in 2 days", self._NOW)
-        assert got == self._NOW + timedelta(days=2)
+        assert got == (self._NOW + timedelta(days=2), 86400)
 
     def test_combined_day_and_hours(self):
+        # Granularity is the SMALLEST unit named: "1 day 3 hours" carries
+        # hour-resolution even though days also appear.
         got = _parse_relative_reset("Resets in 1 day 3 hours", self._NOW)
-        assert got == self._NOW + timedelta(days=1, hours=3)
+        assert got == (self._NOW + timedelta(days=1, hours=3), 3600)
 
     def test_minutes_abbreviated(self):
         got = _parse_relative_reset("resets in 45 min", self._NOW)
-        assert got == self._NOW + timedelta(minutes=45)
+        assert got == (self._NOW + timedelta(minutes=45), 60)
+
+    def test_weeks(self):
+        got = _parse_relative_reset("resets in 1 week", self._NOW)
+        assert got == (self._NOW + timedelta(weeks=1), 604800)
 
     def test_no_match_returns_none(self):
         assert _parse_relative_reset("no countdown here", self._NOW) is None
 
     def test_phrase_without_duration_returns_none(self):
         assert _parse_relative_reset("resets in a moment", self._NOW) is None
+
+
+class TestOpenCodeMarkupResolution:
+    def test_resolution_uses_smallest_displayed_unit(self):
+        assert _parse_duration_granularity("4 hours 47 minutes") == 60
+        assert _parse_duration_granularity("2 days 23 hours") == 3600
+        assert _parse_duration_granularity("26 days") == 86400
+        assert _parse_duration_granularity("soon") is None
 
 
 # ---------------------------------------------------------------------------
@@ -1298,6 +1400,10 @@ class TestFetchOpenCode:
         assert timedelta(seconds=17220) <= (
             reading.session_resets_at - before
         ) <= timedelta(seconds=17220 + 60)
+        assert reading.session_reset_granularity == 60
+        assert reading.weekly_reset_granularity == 3600
+        assert reading.scoped_limits is not None
+        assert reading.scoped_limits[0].reset_granularity == 3600
 
     @patch("usage_dashboard.server.fetch_opencode.httpx.Client")
     def test_ssr_wins_over_markup_when_both_present(self, mock_client_cls):
@@ -1310,6 +1416,7 @@ class TestFetchOpenCode:
 
         reading = fetch_opencode_usage("wrk_TEST", "cookie-value")
         assert reading.session_percent == 0.0
+        assert reading.session_reset_granularity is None
 
     @patch("usage_dashboard.server.fetch_opencode.httpx.Client")
     def test_markup_reset_now_is_zero_not_missing(self, mock_client_cls):
@@ -1357,6 +1464,21 @@ class TestFetchOpenCode:
             fetch_opencode_usage("wrk_TEST", "stale-cookie")
         # Both causes are indistinguishable, so both must be named.
         assert "workspace id" in str(excinfo.value)
+
+    @patch("usage_dashboard.server.fetch_opencode.httpx.Client")
+    def test_lookalike_auth_host_is_not_an_auth_error(self, mock_client_cls):
+        # The redirect check must match the auth host exactly, not any host that
+        # merely ends with the same string: "subauth.opencode.ai" endswith
+        # "auth.opencode.ai", but it is not the sign-in host and a parseable
+        # page served from it is a normal fetch.
+        self._mock_get(
+            mock_client_cls,
+            text=_opencode_ssr_html(),
+            status_code=200,
+            url="https://subauth.opencode.ai/workspace/wrk_TEST/go",
+        )
+        reading = fetch_opencode_usage("wrk_TEST", "cookie-value")
+        assert reading.provider is Provider.OPENCODE
 
     @patch("usage_dashboard.server.fetch_opencode.httpx.Client")
     def test_http_401_is_an_auth_error(self, mock_client_cls):

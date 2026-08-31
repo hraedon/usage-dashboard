@@ -19,10 +19,9 @@ from usage_dashboard.shared.models import (
     ModelUsage,
     Provider,
     Reading,
+    ReadingStatus,
 )
 from usage_dashboard.shared.offpeak import (
-    qwen_peak_countdown,
-    qwen_peak_label,
     zai_is_peak,
     zai_peak_label,
 )
@@ -30,43 +29,32 @@ from usage_dashboard.shared.offpeak import (
 # Fixed tile order so a provider always lands in the same place frame to frame.
 # A provider absent from this list gets no tile: CLAUDE_WORK folds into the
 # CLAUDE tile as a second, muted set of bars.
-#
-# OPENCODE earns a tile by *pairing with CODEX* rather than taking a row of its
-# own. A 5th full-width row would push the grid to 4 rows, and since the fixed
-# per-tile overhead (title + padding) is charged once per row, the height left
-# for bars would drop by roughly two thirds. Pairing keeps the grid at 3 rows,
-# and it costs nothing: CODEX carries a single weekly bar, so it was spending a
-# full-width row on one bar.
 _PROVIDER_ORDER: list[Provider] = [
     Provider.CLAUDE,
     Provider.CODEX,
-    Provider.OPENCODE,
     Provider.ZAI,
     Provider.OLLAMA,
 ]
 
-# Providers rendered half-width so the two members of a group share a row,
-# freeing vertical space. CLAUDE stays full-width on its own (it carries an
-# extra Fable bar and can fold in a work account).
-#
-# These are explicit *pair groups*, not one flat set of "pairable" providers.
-# A flat set pairs any two adjacent members, so with OpenCode Go unconfigured
-# the order collapses to CLAUDE, CODEX, ZAI, OLLAMA and CODEX would wrongly
-# pair with ZAI — leaving OLLAMA stranded on its own row and silently changing
-# a layout that has nothing to do with OpenCode. Grouping keeps a partner
-# absence local: CODEX simply goes full-width, exactly as it does today.
-_PAIR_GROUPS: tuple[frozenset[Provider], ...] = (
-    frozenset({Provider.CODEX, Provider.OPENCODE}),
-    frozenset({Provider.ZAI, Provider.OLLAMA}),
-)
+# Providers rendered half-width so two consecutive ones share a row, freeing
+# vertical space. Claude/Codex stay full-width; z.ai + ollama pair up beneath.
+_PAIRED_PROVIDERS: frozenset[Provider] = frozenset({Provider.ZAI, Provider.OLLAMA})
+# Below this per-cell width, the label/reset columns leave an unhelpful sliver
+# for a bar even with compact labels.
+_MIN_PAIRED_TILE_WIDTH = 150
 
+# The two smallest supported fallback framebuffers cannot give four normal
+# tiles a full text row each. At this size the renderer switches to a summary
+# tile (percentages only, reset countdowns omitted) and this module lays the
+# tiles out according to the orientation instead of allowing bar rows to
+# collapse into one another.
+_ULTRA_COMPACT_MAX_EDGE = 320
 
-def _pair_group(provider: Provider) -> frozenset[Provider] | None:
-    """The pair group *provider* belongs to, or None if it never pairs."""
-    for group in _PAIR_GROUPS:
-        if provider in group:
-            return group
-    return None
+# Pygame coordinates are pixels, so this is also the minimum useful finger
+# target on the touch panel.  Keeping it in the geometry module lets the
+# renderer and layout tests use the same contract.
+MIN_TOUCH_TARGET = 44
+_NARROW_OVERLAY_PAD = 8
 
 Color = tuple[int, int, int]
 
@@ -105,12 +93,24 @@ class TileSpec:
     subtitle: str = ""   # right-aligned model breakdown for the tile header
     compact: bool = False  # half-width paired tile: S/W labels, bare countdown
     title_color: Color = fmt.TEXT  # off-peak tint for plans with peak windows
+    # Colour for the quota-less ``detail`` line, tinted by the volume alert the
+    # same way the detail view tints it. Irrelevant when ``detail`` is None.
+    detail_color: Color = fmt.TEXT
     # Subtitle tint. Defaults to gray (Ollama's model breakdown is neutral
     # information), but the z.ai subtitle is the peak-window countdown — the
     # same signal as title_color — so it matches the title rather than reading
     # as unrelated grey text. Quota reset countdowns are deliberately NOT
     # tinted this way: they answer a different question.
     subtitle_color: Color = fmt.GRAY
+    # Tiny (240x320 / 320x240) displays draw a two-line percentage summary
+    # instead of individual bars and reset columns. Keep ``bars`` populated so
+    # the detail view and status colouring retain the complete reading.
+    ultra_compact: bool = False
+    # Short provider label and status marker used only by the tiny summary tile.
+    # ``title`` remains the full, semantic title for normal rendering/tests.
+    compact_title: str = ""
+    status_marker: str = ""
+    status_marker_color: Color = fmt.GRAY
 
 
 @dataclass(frozen=True)
@@ -119,8 +119,6 @@ class MainLayout:
     tiles: list[TileSpec]
     status_text: str
     status_rect: Rect
-    footer_note: str = ""  # off-peak status tag (QWEN), shown by the status bar
-    footer_color: Color = fmt.TEXT  # green=off-peak, orange=peak
     refresh_rect: Rect | None = None  # on-demand refresh tap target (WI-012)
     refresh_pending: bool = False  # True while a refresh POST is in flight
 
@@ -148,6 +146,53 @@ def _grid_dimensions(n: int) -> tuple[int, int]:
     return cols, rows
 
 
+def _is_ultra_compact(size: tuple[int, int]) -> bool:
+    """Whether *size* needs the tiny-display summary treatment.
+
+    The fallback is intentionally bounded to frames no larger than the two
+    audited 240/320 orientations. The established responsive layout remains
+    unchanged for the real panel and ordinary development windows.
+    """
+    return max(size) <= _ULTRA_COMPACT_MAX_EDGE
+
+
+def _ultra_compact_columns(size: tuple[int, int], tile_count: int) -> int:
+    """Choose a tiny fallback column count from the display orientation.
+
+    Portrait gets a two-column matrix so each tile has enough width for its
+    provider marker and percentage summary. Landscape has room for one column
+    per provider, keeping the short vertical dimension to one touchable row.
+    """
+    if tile_count <= 1:
+        return 1
+    width, height = size
+    if height > width:
+        return min(2, tile_count)
+    return min(4, tile_count)
+
+
+_ULTRA_COMPACT_TITLES: dict[Provider, str] = {
+    Provider.CLAUDE: "CLD",
+    Provider.CODEX: "CDX",
+    Provider.ZAI: "ZAI",
+    Provider.OLLAMA: "OLL",
+}
+
+
+def _compact_title(provider: Provider) -> str:
+    """Return a short, unambiguous provider marker for a tiny tile."""
+    return _ULTRA_COMPACT_TITLES.get(provider, provider.value[:3].upper())
+
+
+def _status_marker(reading: Reading) -> tuple[str, Color]:
+    """Return a compact status marker and its colour for a summary tile."""
+    if reading.status is ReadingStatus.OFFLINE:
+        return "X", fmt.RED
+    if reading.status is ReadingStatus.STALE or reading.stale:
+        return "!", fmt.ORANGE
+    return "", fmt.GRAY
+
+
 def _bars_for(
     reading: Reading,
     now: datetime | None,
@@ -167,10 +212,9 @@ def _bars_for(
     # Per-model scoped windows (e.g. Fable) render as extra bars after the
     # aggregate two; the label is the model name so the tile stays legible.
     # On a compact tile the scoped label is cut to its initial, matching the
-    # S/W abbreviations beside it (OpenCode Go's "Monthly" -> "M"). The label
-    # column is sized to the widest label *in the compact group*, so leaving a
-    # full word here would shrink the bars on every paired tile, not just this
-    # one.
+    # S/W abbreviations beside it. The label column is sized to the widest label
+    # in the compact group, so leaving a full word here would shrink the bars on
+    # every paired tile, not just this one.
     for sl in reading.scoped_limits or []:
         label = sl.name[:1].upper() if compact and sl.name else sl.name
         windows.append((label, sl.percent, sl.resets_at))
@@ -229,6 +273,15 @@ def _accent(bars: list[BarSpec], detail: str | None) -> Color:
     return max((b.color for b in bars), key=lambda c: rank.get(c, 0))
 
 
+def _alert_color(alert: str) -> Color:
+    """Colour for a provider's ``detail`` line, tinted by its volume alert."""
+    if alert == ALERT_CRIT:
+        return fmt.RED
+    if alert == ALERT_WARN:
+        return fmt.ORANGE
+    return fmt.TEXT
+
+
 def _model_subtitle(models: list[ModelUsage] | None, top_n: int = 2) -> str:
     """Compact 'top N models' string for the tile title.
 
@@ -246,10 +299,16 @@ def _estimate_tile_overhead(size: tuple[int, int]) -> int:
     :class:`DashboardGui` so tile heights give every bar the same row height.
     The GUI passes the *exact* overhead (from the rendered font height); this
     fallback is used by layout-only tests and when no GUI is involved."""
-    w, h = size
-    pad = max(8, min(w, h) // 40)
-    unit = max(18, h // 15)
-    title_h = unit * 5 // 4
+    short_edge = min(size)
+    pad = max(8, short_edge // 40)
+    # The GUI scales from the short edge.  Scaling from height alone makes a
+    # portrait framebuffer choose a desktop-sized font and leaves no room for
+    # the paired tiles' bars.
+    unit = max(24, short_edge // 15)
+    # pygame's default font surface is roughly three quarters of the nominal
+    # title size (and the GUI passes its exact measured value).
+    title_nominal = max(32, unit * 5 // 4)
+    title_h = max(24, title_nominal * 3 // 4)
     # top: pad + title + pad//2;  bottom: pad
     return pad + title_h + pad // 2 + pad
 
@@ -261,7 +320,6 @@ def build_main_layout(
     refresh_interval: int | None = None,
     tile_overhead: int | None = None,
     refresh_pending: bool = False,
-    show_opencode: bool = True,
 ) -> MainLayout:
     """Lay out provider tiles in a grid plus a bottom status bar.
 
@@ -271,11 +329,6 @@ def build_main_layout(
     tile's bars get the same row height regardless of bar count.  When None,
     an estimate from the screen size is used.
 
-    *show_opencode* is the revert switch for the OpenCode Go tile (driven by
-    ``GUI_OPENCODE_TILE`` in the unit's env file). Setting it False drops the
-    tile, and because pairing is group-scoped CODEX then returns to full width
-    on its own row — i.e. exactly the layout that shipped before the tile
-    existed, with no code revert and no redeploy.
     """
     width, height = size
     by_provider = {r.provider: r for r in readings}
@@ -285,8 +338,6 @@ def build_main_layout(
     # from the personal account when present (else the work account).
     tile_plan: list[tuple[Provider, Reading]] = []
     for provider in _PROVIDER_ORDER:
-        if provider is Provider.OPENCODE and not show_opencode:
-            continue
         if provider is Provider.CLAUDE:
             primary = by_provider.get(Provider.CLAUDE) or by_provider.get(Provider.CLAUDE_WORK)
             if primary is not None:
@@ -294,35 +345,47 @@ def build_main_layout(
         elif provider in by_provider:
             tile_plan.append((provider, by_provider[provider]))
 
-    # Peak-window countdown for the status-bar footer (QWEN token plan): how
-    # long until the next boundary — peak start when currently off-peak, peak
-    # end when in peak. Replaces the retired umans slot.
-    qwen = qwen_peak_countdown(now)
-    footer_note = f"QWEN {qwen_peak_label(now)}"
-    footer_color = fmt.GREEN if not qwen.in_peak else fmt.ORANGE
-
     margin = max(4, round(width * 0.02))
     # A slim status band leaves more height for the tiles (the Claude tile in
     # particular needs room for its third bar).
-    status_h = max(16, round(height * 0.085))
+    # The status line owns the refresh button.  Reserve a full touch target at
+    # the shortest resolutions rather than putting a visually large button in
+    # a target that is too short to tap reliably.
+    status_h = max(MIN_TOUCH_TARGET, round(height * 0.085))
     grid_h = height - status_h - margin
 
-    # Pack tiles into rows: two consecutive PAIRED providers share a row
-    # (half-width each); everything else spans the full width on its own row.
+    ultra_compact = _is_ultra_compact(size)
     rows_plan: list[list[tuple[Provider, Reading]]] = []
-    idx = 0
-    while idx < len(tile_plan):
-        provider = tile_plan[idx][0]
-        nxt = tile_plan[idx + 1][0] if idx + 1 < len(tile_plan) else None
-        group = _pair_group(provider)
-        # Pair only with the *same group's* partner, so an absent partner leaves
-        # this provider full-width instead of pairing it with whoever follows.
-        if group is not None and nxt is not None and nxt in group:
-            rows_plan.append([tile_plan[idx], tile_plan[idx + 1]])
-            idx += 2
-        else:
-            rows_plan.append([tile_plan[idx]])
-            idx += 1
+    if ultra_compact:
+        # At 240x320 four full bar rows give each row less than one body line.
+        # Use a deliberately different grid for the two tiny orientations: a
+        # 2x2 matrix in portrait and one row of four in landscape. The tile
+        # renderer turns these into percentage summaries without reset columns.
+        cols = _ultra_compact_columns(size, len(tile_plan))
+        rows_plan = [
+            tile_plan[start:start + cols]
+            for start in range(0, len(tile_plan), cols)
+        ]
+    else:
+        # Pack normal tiles into rows: two consecutive PAIRED providers share a
+        # row (half-width each); everything else spans the full width on its
+        # own row.
+        pair_cell_w = (width - margin * 3) // 2
+        can_pair = pair_cell_w >= _MIN_PAIRED_TILE_WIDTH
+        idx = 0
+        while idx < len(tile_plan):
+            provider = tile_plan[idx][0]
+            nxt = tile_plan[idx + 1][0] if idx + 1 < len(tile_plan) else None
+            if (
+                can_pair
+                and provider in _PAIRED_PROVIDERS
+                and nxt in _PAIRED_PROVIDERS
+            ):
+                rows_plan.append([tile_plan[idx], tile_plan[idx + 1]])
+                idx += 2
+            else:
+                rows_plan.append([tile_plan[idx]])
+                idx += 1
 
     n_rows = max(len(rows_plan), 1)
 
@@ -339,8 +402,17 @@ def build_main_layout(
         is_paired = len(row_tiles) > 1
         for provider, reading in row_tiles:
             # Quota-less providers have no percentages — show detail instead.
+            # But a reading whose only windows are scoped ones is NOT
+            # quota-less: it has bars to draw, and treating it as quota-less
+            # would drop them and render a blank tile. Only go quota-less when
+            # there is genuinely nothing bar-shaped to show.
+            has_scoped = any(
+                sl.percent is not None for sl in reading.scoped_limits or []
+            )
             is_quotaless = (
-                reading.session_percent is None and reading.weekly_percent is None
+                reading.session_percent is None
+                and reading.weekly_percent is None
+                and not has_scoped
             )
             if provider is Provider.CLAUDE:
                 bars = _claude_tile_bars(by_provider, now, compact=is_paired)
@@ -372,7 +444,9 @@ def build_main_layout(
             built.append((provider, reading, bars, detail, title, subtitle, is_paired, title_color))
             weight = max(weight, len(bars))
         built_rows.append(built)
-        row_weights.append(weight)
+        # Summary tiles need equal-sized touch regions even when one provider
+        # has no percentage bars (for example quota-less Ollama).
+        row_weights.append(1 if ultra_compact else weight)
 
     total_weight = sum(row_weights)
 
@@ -404,6 +478,7 @@ def build_main_layout(
         cell_w = (width - margin * (ncols + 1)) // ncols
         for col_idx, built_tile in enumerate(built):
             provider, reading, bars, detail, title, subtitle, compact, title_color = built_tile
+            marker, marker_color = _status_marker(reading)
             rect = Rect(
                 x=margin + col_idx * (cell_w + margin),
                 y=y,
@@ -421,8 +496,17 @@ def build_main_layout(
                     subtitle=subtitle,
                     compact=compact,
                     title_color=title_color,
+                    detail_color=_alert_color(reading.alert),
                     subtitle_color=(
                         title_color if provider is Provider.ZAI else fmt.GRAY
+                    ),
+                    ultra_compact=ultra_compact,
+                    compact_title=(
+                        _compact_title(provider) if ultra_compact else ""
+                    ),
+                    status_marker=marker if ultra_compact else "",
+                    status_marker_color=(
+                        marker_color if ultra_compact else fmt.GRAY
                     ),
                 )
             )
@@ -432,10 +516,8 @@ def build_main_layout(
     return MainLayout(
         size=size,
         tiles=tiles,
-        status_text=_status_text(readings, now, refresh_interval),
+        status_text=_status_text(readings, len(tiles), now, refresh_interval),
         status_rect=status_rect,
-        footer_note=footer_note,
-        footer_color=footer_color,
         refresh_rect=refresh_button_rect(status_rect),
         refresh_pending=refresh_pending,
     )
@@ -446,16 +528,21 @@ def refresh_button_rect(status_rect: Rect) -> Rect:
 
     The on-demand refresh button (WI-012): sized to a finger target where the
     slim status bar allows (a share of the bar height), anchored to the bar's
-    right edge so the QWEN footer note sits to its left without overlap.
+    right edge of the status bar.
     """
-    side = max(24, status_rect.h - 12)
-    x = status_rect.x + status_rect.w - side - 10
+    # Keep the target inside the footer even on a short landscape dev window.
+    # ``build_main_layout`` reserves MIN_TOUCH_TARGET pixels, so the minimum
+    # is feasible for every audited resolution.
+    side = min(max(MIN_TOUCH_TARGET, status_rect.h - 12), status_rect.h)
+    inset = min(10, max(4, side // 3))
+    x = status_rect.x + status_rect.w - side - inset
     y = status_rect.y + (status_rect.h - side) // 2
     return Rect(x, y, side, side)
 
 
 def _status_text(
     readings: list[Reading],
+    provider_count: int,
     now: datetime | None,
     refresh_interval: int | None = None,
 ) -> str:
@@ -466,7 +553,8 @@ def _status_text(
     text = f"Updated {local.strftime('%H:%M:%S')}"
     if refresh_interval is not None:
         text += f" · refresh {fmt.format_interval(refresh_interval)}"
-    text += f" · {len(readings)} providers"
+    provider_word = "provider" if provider_count == 1 else "providers"
+    text += f" · {provider_count} {provider_word}"
     return text
 
 
@@ -541,12 +629,77 @@ class StatusOverlay:
     brightness: BrightnessOverlay
 
 
+def status_overlay_padding(size: tuple[int, int]) -> int:
+    """Return the panel inset used by the overlay and its renderer.
+
+    The old inset was based on the overlay's height.  That made a portrait
+    screen spend most of its horizontal room on padding before splitting the
+    card into columns.  Base it on the short edge instead so the same card has
+    useful columns in both orientations.
+    """
+    return max(8, min(size) // 30)
+
+
+def status_overlay_footer_height(size: tuple[int, int]) -> int:
+    """Reserve a bottom band for the overlay's close hint."""
+    return max(18, min(size) // 24)
+
+
 def build_brightness_overlay(region: Rect) -> BrightnessOverlay:
     """Lay the ``−`` | readout | ``+`` controls into *region* as three columns,
-    so the same code sizes finger targets on the 5" panel and the dev window."""
-    pad = max(8, min(region.w, region.h) // 12)
-    title_h = region.h // 5
+    so the same code sizes finger targets on the 5" panel and the dev window.
+    A narrow region gets a readout row above two wider +/- targets instead."""
+    # Keep a small, stable inset in the narrow stacked/readout arrangement so
+    # two 44px buttons plus their gap have a predictable minimum width.
+    pad = (
+        _NARROW_OVERLAY_PAD
+        if region.w < 160
+        else max(_NARROW_OVERLAY_PAD, min(region.w, region.h) // 12)
+    )
+    # Keep the actual rendered title below the control row even on the short
+    # 320x240 landscape fallback.  The GUI's smallest title surface is 24px
+    # high, so a 26px header gives it a couple of pixels of breathing room.
+    title_h = max(26, region.h // 5)
     row_y = region.y + title_h
+    if (region.w - 2 * pad) // 3 < MIN_TOUCH_TARGET:
+        # Three columns leave only ~20px-wide buttons on the 240px fallback
+        # display.  Give the readout its own short row and make +/- broad
+        # side-by-side touch targets below it instead.
+        # At the audited 240/320-wide screens this is exactly 44px or wider.
+        # If a caller supplies a still narrower custom region, side-by-side
+        # targets are no longer geometrically feasible; stack them vertically
+        # instead of letting them overlap or escape the card.
+        if region.w >= 2 * MIN_TOUCH_TARGET + 3 * pad:
+            button_h = max(MIN_TOUCH_TARGET, region.h // 3)
+            level_h = max(1, region.h - title_h - 2 * pad - button_h)
+            level_rect = Rect(
+                region.x + pad, row_y, max(1, region.w - 2 * pad), level_h
+            )
+            button_y = row_y + level_h + pad
+            button_w = (region.w - 3 * pad) // 2
+            minus = Rect(region.x + pad, button_y, button_w, button_h)
+            plus = Rect(
+                region.x + region.w - pad - button_w, button_y, button_w, button_h
+            )
+        else:
+            usable = max(1, region.h - title_h - 3 * pad)
+            button_h = max(1, min(MIN_TOUCH_TARGET, usable // 2))
+            level_h = max(1, usable - 2 * button_h)
+            level_rect = Rect(
+                region.x + pad, row_y, max(1, region.w - 2 * pad), level_h
+            )
+            button_y = row_y + level_h + pad
+            button_w = max(1, region.w - 2 * pad)
+            minus = Rect(region.x + pad, button_y, button_w, button_h)
+            plus = Rect(
+                region.x + pad,
+                button_y + button_h + pad,
+                button_w,
+                button_h,
+            )
+        return BrightnessOverlay(
+            region=region, minus=minus, plus=plus, level_rect=level_rect
+        )
     row_h = region.h - title_h - pad
     col_w = (region.w - 2 * pad) // 3
     minus = Rect(region.x + pad, row_y, col_w, row_h)
@@ -563,15 +716,30 @@ def build_status_overlay(size: tuple[int, int]) -> StatusOverlay:
     """Centred status card sized as a fraction of the screen, split into a wider
     left column for diagnostics text and a right column for brightness."""
     width, height = size
-    pw, ph = int(width * 0.82), int(height * 0.6)
+    # A 240px-wide fallback display can still fit the diagnostics column and
+    # two 44px brightness buttons if the card uses the available width.  Keep
+    # the usual 82% card on larger screens.
+    pw = min(width, max(int(width * 0.82), 240))
+    ph = int(height * 0.6)
     px, py = (width - pw) // 2, (height - ph) // 2
     panel = Rect(px, py, pw, ph)
-    pad = max(10, min(pw, ph) // 14)
+    pad = status_overlay_padding(size)
     inner = Rect(px + pad, py + pad, pw - 2 * pad, ph - 2 * pad)
-    left_w = int(inner.w * 0.56)
+    # Brightness has a title plus three touch columns.  Give it enough of the
+    # narrow card that those controls don't collide with the diagnostics side;
+    # the diagnostics renderer truncates or stacks its own label/value rows.
+    min_brightness_w = 2 * MIN_TOUCH_TARGET + 3 * _NARROW_OVERLAY_PAD
+    right_w = min(
+        max(min_brightness_w, int(inner.w * 0.44)),
+        max(1, inner.w - pad - 1),
+    )
+    left_w = max(1, inner.w - pad - right_w)
     diag_rect = Rect(inner.x, inner.y, left_w, inner.h)
     right_x = inner.x + left_w + pad
-    right = Rect(right_x, inner.y, inner.x + inner.w - right_x, inner.h)
+    footer_h = min(status_overlay_footer_height(size), max(0, inner.h - 1))
+    content_h = max(1, inner.h - footer_h)
+    right = Rect(right_x, inner.y, inner.x + inner.w - right_x, content_h)
+    diag_rect = Rect(diag_rect.x, diag_rect.y, diag_rect.w, content_h)
     return StatusOverlay(
         panel=panel, diag_rect=diag_rect, brightness=build_brightness_overlay(right)
     )
@@ -623,12 +791,7 @@ def _detail_lines(reading: Reading, now: datetime | None) -> list[DetailLine]:
         # rendered `alert` at all, so z.ai's warn/crit tiers were computed and
         # then thrown away; the detail view is where the number lives, so it is
         # where the "close to the wall" cue belongs.
-        detail_color = fmt.TEXT
-        if reading.alert == ALERT_CRIT:
-            detail_color = fmt.RED
-        elif reading.alert == ALERT_WARN:
-            detail_color = fmt.ORANGE
-        lines.append(DetailLine("Detail", reading.detail, detail_color))
+        lines.append(DetailLine("Detail", reading.detail, _alert_color(reading.alert)))
     if reading.models:
         label = "API tools" if reading.provider is Provider.ZAI else "Models"
         lines.append(DetailLine(label, "", fmt.GRAY))

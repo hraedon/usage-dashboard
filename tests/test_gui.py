@@ -24,9 +24,11 @@ from usage_dashboard.client.gui import (  # noqa: E402
     DoubleTapDetector,
 )
 from usage_dashboard.client.layout import (  # noqa: E402
+    MIN_TOUCH_TARGET,
     ViewState,
     build_main_layout,
     build_status_overlay,
+    hit_test,
 )
 from usage_dashboard.shared.models import (  # noqa: E402
     Provider,
@@ -36,6 +38,13 @@ from usage_dashboard.shared.models import (  # noqa: E402
 )
 
 _NOW = datetime(2026, 1, 10, 12, 0, 0)
+# Include both orientations of the two phone-sized fallbacks and the real
+# 720x1280 panel.  In particular, 390x844 is a real render regression rather
+# than a layout-only smoke check: its stacked tile headers used to overlap bars.
+_AUDIT_SIZES = (
+    (240, 320), (390, 844), (720, 1280),
+    (320, 240), (844, 390), (1280, 720),
+)
 
 
 def _readings() -> list[Reading]:
@@ -58,6 +67,21 @@ def _readings() -> list[Reading]:
         r(Provider.ZAI, status=ReadingStatus.STALE, stale=True),
         r(Provider.OLLAMA, session_percent=None, weekly_percent=None),
     ]
+
+
+def _four_provider_readings() -> list[Reading]:
+    """A real four-tile fleet, including one quota-less provider."""
+    codex = Reading(
+        provider=Provider.CODEX,
+        status=ReadingStatus.CURRENT,
+        session_percent=100.0,
+        session_resets_at=_NOW.replace(tzinfo=timezone.utc),
+        weekly_percent=100.0,
+        weekly_resets_at=_NOW.replace(tzinfo=timezone.utc),
+        fetched_at=_NOW,
+        stale=False,
+    )
+    return [*_readings(), codex]
 
 
 class _FakeFetcher:
@@ -93,6 +117,18 @@ class _FakeBacklight:
         self.levels.append(level)
 
 
+class _RecordingSurface:
+    """Delegate to a real pygame surface while recording text blits."""
+
+    def __init__(self, surface) -> None:
+        self.surface = surface
+        self.blit_rects: list[pygame.Rect] = []
+
+    def blit(self, source, dest):
+        self.blit_rects.append(source.get_rect(topleft=dest))
+        return self.surface.blit(source, dest)
+
+
 @pytest.fixture
 def gui():
     pygame.display.init()
@@ -116,6 +152,50 @@ def test_draw_detail_does_not_raise(gui) -> None:
 def test_draw_detail_quotaless_provider(gui) -> None:
     gui._state = ViewState(detail_provider=Provider.OLLAMA)
     gui._draw_detail(_readings())
+
+
+def test_quotaless_tile_paints_its_detail_line(gui) -> None:
+    """Regression: a quota-less tile used to render as a bare title because
+    ``_draw_tile`` never drew ``tile.detail``. The detail text must paint
+    pixels in the tile body, not leave it empty."""
+    from usage_dashboard.client.gui import _TILE_BG
+
+    readings = [
+        Reading(
+            provider=Provider.OLLAMA,
+            status=ReadingStatus.CURRENT,
+            session_percent=None,
+            session_resets_at=None,
+            weekly_percent=None,
+            weekly_resets_at=None,
+            fetched_at=_NOW,
+            stale=False,
+            detail="week req 9 tok 2M",
+        )
+    ]
+    layout = build_main_layout(readings, (480, 320))
+    gui._screen.fill((0, 0, 0))
+    gui._draw_main(layout)
+
+    tile = layout.tiles[0]
+    assert tile.bars == [] and tile.detail is not None
+    # Sample the body of the tile (below the title band): at least one pixel
+    # must differ from the tile background, i.e. the detail text painted.
+    body = pygame.Rect(
+        tile.rect.x + 4,
+        tile.rect.y + tile.rect.h // 3,
+        tile.rect.w - 8,
+        tile.rect.h // 2,
+    )
+    painted = False
+    for x in range(body.x, body.x + body.w, 3):
+        for y in range(body.y, body.y + body.h, 3):
+            if gui._screen.get_at((x, y))[:3] != tuple(_TILE_BG):
+                painted = True
+                break
+        if painted:
+            break
+    assert painted
 
 
 def test_detail_for_absent_provider_falls_back_to_main(gui) -> None:
@@ -178,7 +258,7 @@ def _bottom_pad(tile, gui) -> int:
     """Distance from the last bar's bottom edge to the tile's bottom inner
     edge, computed with the same geometry as ``_draw_tile``."""
     pad = gui._tile_pad
-    title_h = gui._font_title.get_height()
+    title_h = gui._font_title.get_linesize()
     content_top = tile.rect.y + pad + title_h + pad // 2
     bottom = tile.rect.y + tile.rect.h - pad
     n = max(len(tile.bars), 1)
@@ -237,7 +317,7 @@ def test_equal_bottom_padding_across_bar_counts() -> None:
         # integer division).
         def row_h(tile) -> int:
             pad = gui._tile_pad
-            t_h = gui._font_title.get_height()
+            t_h = gui._font_title.get_linesize()
             ct = tile.rect.y + pad + t_h + pad // 2
             bt = tile.rect.y + tile.rect.h - pad
             return (bt - ct) // max(len(tile.bars), 1)
@@ -254,6 +334,204 @@ def test_smaller_resolution_renders(gui) -> None:
     layout = build_main_layout(_readings(), (240, 320))
     gui._width, gui._height = 240, 320
     gui._draw_main(layout)
+
+
+def test_responsive_main_detail_and_overlay_render_at_audit_sizes() -> None:
+    """Exercise real pygame paths for four providers at tiny and normal sizes.
+
+    The 240px cases use a summary tile rather than trying to squeeze reset
+    columns beside 16px glyphs. Long detail/diagnostic values still exercise
+    the truncation paths without weakening the readable font floors.
+    """
+    long_detail = Reading(
+        provider=Provider.OLLAMA,
+        status=ReadingStatus.CURRENT,
+        session_percent=50.0,
+        session_resets_at=_NOW.replace(tzinfo=timezone.utc),
+        weekly_percent=90.0,
+        weekly_resets_at=_NOW.replace(tzinfo=timezone.utc),
+        fetched_at=_NOW,
+        stale=False,
+        detail="week req 123456789 tok 987654321.0M",
+    )
+    diag_snapshot = diagnostics.Diagnostics(
+        hostname="usage-dashboard-pi-with-a-long-hostname",
+        addresses=["192.168.100.123", "10.0.0.123"],
+        server_host="usage-dashboard.example.internal",
+        running_commit="abcdef123456",
+        check=diagnostics.UpdateCheck(
+            when=_NOW.replace(tzinfo=timezone.utc),
+            result="pip-failed",
+            commit="abcdef123456",
+        ),
+        change=None,
+    )
+
+    for size in _AUDIT_SIZES:
+        pygame.display.init()
+        pygame.font.init()
+        screen = pygame.display.set_mode(size)
+        try:
+            readings = _four_provider_readings()
+            gui = DashboardGui(_FakeFetcher(readings), size)  # type: ignore[arg-type]
+            layout = build_main_layout(
+                readings, size, tile_overhead=gui._tile_overhead,
+            )
+            assert [tile.provider for tile in layout.tiles] == [
+                Provider.CLAUDE, Provider.CODEX, Provider.ZAI, Provider.OLLAMA,
+            ]
+            screen.fill((0, 0, 0))
+            gui._draw_main(layout)
+
+            # Every actual bar track has positive room after the responsive
+            # label/reset allocation, and all geometry stays on the screen.
+            label_cols = gui._label_col_widths(layout.tiles)
+            for i, first in enumerate(layout.tiles):
+                for second in layout.tiles[i + 1:]:
+                    assert not (
+                        first.rect.x < second.rect.x + second.rect.w
+                        and second.rect.x < first.rect.x + first.rect.w
+                        and first.rect.y < second.rect.y + second.rect.h
+                        and second.rect.y < first.rect.y + first.rect.h
+                    )
+            for tile in layout.tiles:
+                assert tile.rect.x >= 0 and tile.rect.y >= 0
+                assert tile.rect.x + tile.rect.w <= size[0]
+                assert tile.rect.y + tile.rect.h <= layout.status_rect.y
+                if tile.ultra_compact:
+                    specs = gui._ultra_compact_text_specs(tile)
+                    rects = [spec[4] for spec in specs]
+                    for first_index, first in enumerate(rects):
+                        assert first.x >= tile.rect.x
+                        assert first.y >= tile.rect.y
+                        assert first.x + first.w <= tile.rect.x + tile.rect.w
+                        assert first.y + first.h <= tile.rect.y + tile.rect.h
+                        for second in rects[first_index + 1:]:
+                            overlap_x = first.x < second.x + second.w
+                            overlap_y = first.y < second.y + second.h
+                            overlap_x = overlap_x and second.x < first.x + first.w
+                            overlap_y = overlap_y and second.y < first.y + first.h
+                            assert not (overlap_x and overlap_y)
+                    # Each quota-bearing tile keeps both aggregate percentages;
+                    # the quota-less tile keeps a one-line detail placeholder.
+                    summary_specs = [
+                        spec for spec in specs if spec[0].startswith("summary-")
+                    ]
+                    if tile.bars:
+                        assert len(summary_specs) == min(2, len(tile.bars))
+                        assert all(
+                            bar.percent_text in spec[2]
+                            for bar, spec in zip(tile.bars[:2], summary_specs)
+                        )
+                    else:
+                        assert summary_specs == []
+                    if tile.provider is Provider.ZAI:
+                        assert tile.status_marker == "!"
+                        assert any(spec[0] == "status" for spec in specs)
+                    assert hit_test(
+                        layout,
+                        (tile.rect.x + tile.rect.w // 2,
+                         tile.rect.y + tile.rect.h // 2),
+                    ) is tile.provider
+                elif tile.bars:
+                    track_x, track_right = gui._bar_track(
+                        tile.rect, label_cols[tile.compact], tile.compact,
+                    )
+                    assert track_right - track_x > 20
+                    bar_font = gui._bar_font(tile.compact)
+                    assert all(
+                        bar_font.size(
+                            gui._fit_text(
+                                bar_font, gui._bar_label(bar), label_cols[tile.compact]
+                            )
+                        )[0] <= label_cols[tile.compact]
+                        for bar in tile.bars
+                    )
+            refresh = layout.refresh_rect
+            assert refresh is not None
+            assert refresh.w >= MIN_TOUCH_TARGET
+            assert refresh.h >= MIN_TOUCH_TARGET
+            assert layout.status_rect.contains(refresh.x, refresh.y)
+            assert layout.status_rect.contains(
+                refresh.x + refresh.w - 1, refresh.y + refresh.h - 1
+            )
+
+            # Check the metrics pygame actually renders, not just the nominal
+            # point sizes passed to Font().  These floors keep the smallest
+            # audit view legible while the renderer truncates to its columns.
+            for font, line_floor, glyph_floor in (
+                (gui._font_small, 14, 13),
+                (gui._font, 16, 15),
+                (gui._font_title, 20, 19),
+            ):
+                assert font.get_height() >= line_floor
+                glyph = font.render("Ag", True, (255, 255, 255))
+                assert glyph.get_bounding_rect().height >= glyph_floor
+
+            # Detail values use the same surface and font metrics rather than a
+            # mock renderer.  The long value forces the narrow two-line path.
+            gui._state = ViewState(detail_provider=Provider.OLLAMA)
+            detail_readings = [
+                reading for reading in readings
+                if reading.provider is not Provider.OLLAMA
+            ] + [long_detail]
+            recorder = _RecordingSurface(screen)
+            gui._screen = recorder  # type: ignore[assignment]
+            gui._draw_detail(detail_readings)
+            gui._screen = screen
+            for first_index, first in enumerate(recorder.blit_rects):
+                assert first.x >= 0 and first.y >= 0
+                assert first.right <= size[0] and first.bottom <= size[1]
+                for second in recorder.blit_rects[first_index + 1:]:
+                    assert not first.colliderect(second)
+            assert gui._state.detail_provider is Provider.OLLAMA
+
+            gui._diag = diag_snapshot
+            gui._state = ViewState(overlay=True)
+            gui._draw_status_overlay()
+            overlay = build_status_overlay(size)
+            assert overlay.panel.x >= 0 and overlay.panel.y >= 0
+            assert overlay.panel.x + overlay.panel.w <= size[0]
+            assert overlay.panel.y + overlay.panel.h <= size[1]
+            assert (
+                overlay.diag_rect.x + overlay.diag_rect.w
+                <= overlay.brightness.region.x
+            )
+            for control in (
+                overlay.brightness.minus,
+                overlay.brightness.plus,
+                overlay.brightness.level_rect,
+            ):
+                assert overlay.brightness.region.contains(control.x, control.y)
+                assert overlay.brightness.region.contains(
+                    control.x + control.w - 1, control.y + control.h - 1
+                )
+            for control in (overlay.brightness.minus, overlay.brightness.plus):
+                assert control.w >= MIN_TOUCH_TARGET
+                assert control.h >= MIN_TOUCH_TARGET
+            minus = overlay.brightness.minus
+            plus = overlay.brightness.plus
+            level = overlay.brightness.level_rect
+            assert not (
+                minus.x < plus.x + plus.w
+                and plus.x < minus.x + minus.w
+                and minus.y < plus.y + plus.h
+                and plus.y < minus.y + minus.h
+            )
+            assert not (
+                level.x < minus.x + minus.w
+                and minus.x < level.x + level.w
+                and level.y < minus.y + minus.h
+                and minus.y < level.y + level.h
+            )
+            assert not (
+                level.x < plus.x + plus.w
+                and plus.x < level.x + level.w
+                and level.y < plus.y + plus.h
+                and plus.y < level.y + level.h
+            )
+        finally:
+            pygame.display.quit()
 
 
 def test_compact_bar_track_wider_than_full_width(gui) -> None:

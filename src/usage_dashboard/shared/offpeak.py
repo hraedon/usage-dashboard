@@ -7,8 +7,6 @@ is irrelevant to which side of a UTC+8 window it is.
 
 z.ai (GLM Coding Plan): peak is Monday–Friday 14:00–18:00 Singapore time
 (UTC+8); outside that window usage is off-peak (quota burns at a discount).
-Qwen token plan: off-peak is 22:00–08:00 daily UTC+8 (credits consume much
-less), i.e. peak is 08:00–22:00 daily UTC+8.
 
 The countdown helpers give the time until the *next* boundary — peak start
 when currently off-peak, peak end when currently in peak — so clients can
@@ -30,14 +28,6 @@ _UTC8 = timezone(timedelta(hours=8))
 _ZAI_PEAK_START_HOUR = 14
 _ZAI_PEAK_END_HOUR = 18  # exclusive
 _ZAI_PEAK_DAYS = (0, 1, 2, 3, 4)  # Monday..Friday (Python weekday)
-
-# Qwen token plan off-peak window (22:00–08:00 daily UTC+8); peak is the
-# complement (08:00–22:00 daily UTC+8).
-_QWEN_OFFPEAK_START_HOUR = 22
-_QWEN_OFFPEAK_END_HOUR = 8  # next day, exclusive
-_QWEN_PEAK_START_HOUR = _QWEN_OFFPEAK_END_HOUR
-_QWEN_PEAK_END_HOUR = _QWEN_OFFPEAK_START_HOUR
-
 
 @dataclass(frozen=True, slots=True)
 class PeakWindow:
@@ -73,13 +63,6 @@ def zai_is_offpeak(now: datetime | None = None) -> bool:
     return not zai_is_peak(now)
 
 
-def qwen_is_offpeak(now: datetime | None = None) -> bool:
-    """True when *now* falls inside the Qwen token plan's off-peak window
-    (22:00–08:00 daily, UTC+8)."""
-    local = _to_utc8(now)
-    return local.hour >= _QWEN_OFFPEAK_START_HOUR or local.hour < _QWEN_OFFPEAK_END_HOUR
-
-
 def _next_or_same_utc8(now_utc8: datetime, hour: int) -> datetime:
     """The next occurrence of *hour* UTC+8 strictly after *now_utc8*."""
     candidate = now_utc8.replace(hour=hour, minute=0, second=0, microsecond=0)
@@ -113,20 +96,6 @@ def zai_peak_countdown(now: datetime | None = None) -> PeakWindow:
     return PeakWindow(in_peak=False, seconds_to_boundary=(boundary - local).total_seconds())
 
 
-def qwen_peak_countdown(now: datetime | None = None) -> PeakWindow:
-    """Peak state + seconds until the next Qwen boundary.
-
-    Off-peak (22:00–08:00 UTC+8): boundary is the next 08:00 (peak start).
-    In peak (08:00–22:00): boundary is the next 22:00 (peak end).
-    """
-    local = _to_utc8(now)
-    if qwen_is_offpeak(local):
-        boundary = _next_or_same_utc8(local, _QWEN_PEAK_START_HOUR)
-        return PeakWindow(in_peak=False, seconds_to_boundary=(boundary - local).total_seconds())
-    boundary = _next_or_same_utc8(local, _QWEN_PEAK_END_HOUR)
-    return PeakWindow(in_peak=True, seconds_to_boundary=(boundary - local).total_seconds())
-
-
 def peak_label(window: PeakWindow) -> str:
     """The user-facing countdown text for a peak window.
 
@@ -146,10 +115,3 @@ def peak_label(window: PeakWindow) -> str:
 def zai_peak_label(now: datetime | None = None) -> str:
     """z.ai peak countdown text, e.g. 'peak in 3h 24m' / 'ends in 1h 24m'."""
     return peak_label(zai_peak_countdown(now))
-
-
-def qwen_peak_label(now: datetime | None = None) -> str:
-    """Qwen peak countdown text. Callers prefix the provider name themselves
-    (the Pi's status bar writes 'QWEN <label>'; the web card's header already
-    says QWEN)."""
-    return peak_label(qwen_peak_countdown(now))

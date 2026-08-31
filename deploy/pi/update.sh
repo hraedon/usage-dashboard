@@ -72,8 +72,41 @@ write_change() {  # old, new
 REF="$(env_or_file UPDATE_REF)"
 [ -n "$REF" ] || REF="main"
 
-cd "$APPDIR"
-local_rev="$(git rev-parse HEAD)"
+report_fetch_failure() {  # ref
+    local ref="$1" probe_status
+    # `git fetch` reports a missing remote ref and a broken transport through
+    # the same non-zero status. Probe the remote separately so a temporary
+    # outage is not mislabeled as a permanently deleted/typo'd pin.
+    if git ls-remote --exit-code origin "$ref" >/dev/null 2>&1; then
+        log "ERROR: git fetch for ref '$ref' failed although origin still advertises it (network/transport or local git error)"
+        log "       this unit is STALLED at ${local_rev:0:8}"
+        write_check fetch-failed "$local_rev"
+    else
+        probe_status=$?
+        if [ "$probe_status" -eq 2 ]; then
+            log "ERROR: tracked ref '$ref' cannot be resolved on origin"
+            log "       (deleted upstream, or a typo). This unit is STALLED at"
+            log "       ${local_rev:0:8} and will not update until UPDATE_REF is fixed"
+            log "       in $ENV_FILE. Merged PR branches are deleted — pin to a tag."
+            write_check bad-ref "$local_rev"
+        else
+            log "ERROR: git fetch for ref '$ref' failed and origin could not be queried (network/transport failure)"
+            log "       this unit is STALLED at ${local_rev:0:8}"
+            write_check fetch-failed "$local_rev"
+        fi
+    fi
+}
+
+# A missing or corrupt checkout is the same class of silent stall WI-031 closed
+# for bad refs: bare under `set -e`, cd/rev-parse abort UPSTREAM of write_check,
+# so the panel keeps showing the last good timestamp and the unit looks healthy.
+# Make it loud and leave a breadcrumb instead.
+if ! cd "$APPDIR" 2>/dev/null || ! local_rev="$(git rev-parse HEAD 2>/dev/null)"; then
+    log "ERROR: checkout at $APPDIR is missing or not a git repo — STALLED"
+    write_check no-checkout ""
+    maybe_redeploy  # infra self-correction does not depend on the app checkout
+    exit 1
+fi
 
 # Resolve the tracked ref BEFORE anything that can abort the run (WI-031).
 #
@@ -93,11 +126,7 @@ local_rev="$(git rev-parse HEAD)"
 # auto-redeploy still runs, because infra self-correction has nothing to do
 # with whether the app ref resolves.
 if ! git fetch --quiet origin "$REF"; then
-    log "ERROR: tracked ref '$REF' cannot be resolved on origin"
-    log "       (deleted upstream, or a typo). This unit is STALLED at"
-    log "       ${local_rev:0:8} and will not update until UPDATE_REF is fixed"
-    log "       in $ENV_FILE. Merged PR branches are deleted — pin to a tag."
-    write_check bad-ref "$local_rev"
+    report_fetch_failure "$REF"
     maybe_redeploy  # a bad app pin must not disable infra self-correction
     exit 1
 fi
@@ -109,7 +138,12 @@ fi
 # ("pin to a tag to freeze a fleet on a known-good release") could never have
 # worked: rev-parse would fail on origin/v0.2.0 and kill the updater. ^{commit}
 # dereferences an annotated tag to the commit it points at.
-remote_rev="$(git rev-parse "FETCH_HEAD^{commit}")"
+if ! remote_rev="$(git rev-parse "FETCH_HEAD^{commit}" 2>/dev/null)"; then
+    log "ERROR: fetched ref '$REF' did not resolve to a commit — STALLED at ${local_rev:0:8}"
+    write_check fetch-failed "$local_rev"
+    maybe_redeploy
+    exit 1
+fi
 
 if [ "$local_rev" = "$remote_rev" ]; then
     log "up to date ($REF @ ${local_rev:0:8})"
@@ -119,12 +153,19 @@ if [ "$local_rev" = "$remote_rev" ]; then
 fi
 
 log "updating $REF: ${local_rev:0:8} -> ${remote_rev:0:8}"
-git reset --hard --quiet "$remote_rev"
+if ! git reset --hard --quiet "$remote_rev"; then
+    log "ERROR: git reset to ${remote_rev:0:8} failed — STALLED at ${local_rev:0:8}"
+    write_check reset-failed "$local_rev"
+    maybe_redeploy
+    exit 1
+fi
 
 rollback() {
     log "rolling back to ${local_rev:0:8}"
     git reset --hard --quiet "$local_rev"
-    "$VENV/bin/pip" install --quiet -e '.[gui]' || true
+    "$VENV/bin/pip" install --quiet -e '.[gui]' \
+        || log "WARNING: rollback reinstall FAILED — venv inconsistent with" \
+               "${local_rev:0:8}; next GUI restart boots it broken"
 }
 
 if ! "$VENV/bin/pip" install --quiet -e '.[gui]'; then

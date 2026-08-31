@@ -113,6 +113,11 @@ class ScopedLimit:
     percent: float | None
     resets_at: datetime | None
     is_active: bool = False
+    # Server-internal only: a relative countdown's reported resolution.
+    # OpenCode's markup fallback reports rounded text for its monthly window;
+    # keeping that resolution out of the API/DB prevents the idle scheduler
+    # from mistaking normal countdown drift for usage movement.
+    reset_granularity: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -172,6 +177,18 @@ class Reading:
     # e.g. Fable). Rendered as additional bars; None/absent for providers that
     # don't report scoped limits.
     scoped_limits: list[ScopedLimit] | None = None
+    # Countdown resolution (in seconds) each reset time was actually reported at, for
+    # providers that publish a *relative* countdown rather than an absolute
+    # instant (ollama scrapes "Resets in 5 hours"). The fetcher recomputes an
+    # absolute instant from ``now`` every poll, so it drifts forward by ~the
+    # poll gap even when nothing changed. The scheduler compares such resets
+    # with a tolerance of one unit (which sits between that drift and a real
+    # window rollover) instead of the tight absolute-reset epsilon. None = an
+    # an exact/absolute-reset path (including OpenCode's hydration blob).
+    # Server-internal only — deliberately not serialized, so it never leaks into
+    # the API or the DB.
+    session_reset_granularity: int | None = None
+    weekly_reset_granularity: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {

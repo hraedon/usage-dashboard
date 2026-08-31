@@ -48,7 +48,11 @@ def _extract_window(block: object) -> tuple[float | None, datetime | None]:
     percent = float(util) if util is not None else None
     resets_raw = block.get("resets_at")
     resets_at = (
-        _to_naive_utc(datetime.fromisoformat(resets_raw).replace(tzinfo=timezone.utc))
+        # _to_naive_utc CONVERTS a non-UTC offset rather than discarding it —
+        # fromisoformat parses the offset; replace(tzinfo=utc) would stamp UTC
+        # onto the wall-clock time instead (the scoped-limit path already did
+        # this correctly).
+        _to_naive_utc(datetime.fromisoformat(resets_raw))
         if resets_raw is not None
         else None
     )

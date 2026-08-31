@@ -4,9 +4,11 @@ from datetime import datetime, timedelta, timezone
 
 from usage_dashboard.client import format as fmt
 from usage_dashboard.client.layout import (
+    MIN_TOUCH_TARGET,
     ViewState,
     build_detail_layout,
     build_main_layout,
+    build_status_overlay,
     hit_test,
     refresh_hit_test,
     rotate_touch_norm,
@@ -82,77 +84,36 @@ class TestMainLayout:
             < by[Provider.ZAI].rect.y
         )
 
-    def test_opencode_pairs_with_codex_keeping_three_rows(self) -> None:
+    def test_opencode_is_not_rendered_on_pi(self) -> None:
+        """OpenCode remains available to the server and web dashboard only."""
         readings = _all_configured() + [
             _reading(Provider.CODEX), _reading(Provider.OPENCODE),
         ]
         layout = build_main_layout(readings, _SIZE, now=_NOW)
         by = {t.provider: t for t in layout.tiles}
-        codex, opencode = by[Provider.CODEX], by[Provider.OPENCODE]
-        # Codex and OpenCode share one row, side by side, no overlap.
-        assert codex.rect.y == opencode.rect.y
-        assert codex.rect.x < opencode.rect.x
-        assert codex.rect.x + codex.rect.w <= opencode.rect.x
-        # Both go compact (half width) rather than Codex keeping a full row.
-        assert codex.compact is True
-        assert opencode.compact is True
-        assert codex.rect.w < by[Provider.CLAUDE].rect.w
-        # Still three rows: Claude, Codex|OpenCode, zai|ollama.
-        assert len({t.rect.y for t in layout.tiles}) == 3
-
-    def test_codex_stays_full_width_when_opencode_absent(self) -> None:
-        """The regression group-scoped pairing exists to prevent.
-
-        With a flat "pairable" set, dropping OpenCode leaves CODEX adjacent to
-        ZAI and the two pair up — stranding OLLAMA on its own row and silently
-        restyling a layout that has nothing to do with OpenCode.
-        """
-        readings = _all_configured() + [_reading(Provider.CODEX)]
-        layout = build_main_layout(readings, _SIZE, now=_NOW)
-        by = {t.provider: t for t in layout.tiles}
         assert Provider.OPENCODE not in by
-        # Codex full-width and alone on its row...
+        # Codex remains full-width and alone on its row...
         assert by[Provider.CODEX].rect.w == by[Provider.CLAUDE].rect.w
         assert by[Provider.CODEX].compact is False
         assert by[Provider.CODEX].rect.y != by[Provider.ZAI].rect.y
         # ...and the zai/ollama pair is untouched.
         assert by[Provider.ZAI].rect.y == by[Provider.OLLAMA].rect.y
 
-    def test_show_opencode_false_restores_the_previous_layout(self) -> None:
-        """The revert switch must reproduce the pre-OpenCode layout exactly."""
-        readings = _all_configured() + [
-            _reading(Provider.CODEX), _reading(Provider.OPENCODE),
-        ]
-        reverted = build_main_layout(readings, _SIZE, now=_NOW, show_opencode=False)
-        # Byte-for-byte the same geometry as a fleet that never reported OpenCode.
-        without = build_main_layout(
-            _all_configured() + [_reading(Provider.CODEX)], _SIZE, now=_NOW,
-        )
-        assert [t.provider for t in reverted.tiles] == [
-            t.provider for t in without.tiles
-        ]
-        assert [t.rect for t in reverted.tiles] == [t.rect for t in without.tiles]
-        assert [t.compact for t in reverted.tiles] == [
-            t.compact for t in without.tiles
-        ]
-
     def test_compact_scoped_limit_label_is_abbreviated(self) -> None:
-        """OpenCode's monthly window is a ScopedLimit; on a paired tile its
-        label must shrink to an initial so it doesn't widen the compact label
-        column (which is shared by every paired tile, not just this one)."""
-        opencode = _reading(
-            Provider.OPENCODE,
+        """A scoped label on a compact tile shrinks to its initial."""
+        ollama = _reading(
+            Provider.OLLAMA,
             scoped_limits=[ScopedLimit(
                 name="Monthly", percent=9.0,
                 resets_at=_NOW + timedelta(days=22), is_active=False,
             )],
         )
         layout = build_main_layout(
-            [_reading(Provider.CODEX), opencode], _SIZE, now=_NOW,
+            [_reading(Provider.ZAI), ollama], _SIZE, now=_NOW,
         )
         by = {t.provider: t for t in layout.tiles}
-        assert by[Provider.OPENCODE].compact is True
-        assert [b.label for b in by[Provider.OPENCODE].bars] == ["S", "W", "M"]
+        assert by[Provider.OLLAMA].compact is True
+        assert [b.label for b in by[Provider.OLLAMA].bars] == ["S", "W", "M"]
 
     def test_full_width_scoped_limit_label_is_not_abbreviated(self) -> None:
         """Claude is never paired, so its Fable bar keeps the readable name."""
@@ -167,6 +128,41 @@ class TestMainLayout:
         assert [b.label for b in layout.tiles[0].bars] == [
             "Session", "Weekly", "Fable",
         ]
+
+    def test_scoped_only_reading_keeps_its_bars(self) -> None:
+        """A reading whose only windows are scoped ones is NOT quota-less."""
+        zai = _reading(
+            Provider.ZAI,
+            session_percent=None, session_resets_at=None,
+            weekly_percent=None, weekly_resets_at=None,
+            scoped_limits=[ScopedLimit(
+                name="Monthly", percent=9.0,
+                resets_at=_NOW + timedelta(days=22), is_active=False,
+            )],
+        )
+        layout = build_main_layout(
+            [zai], _SIZE, now=_NOW,
+        )
+        assert [b.label for b in layout.tiles[0].bars] == ["Monthly"]
+        assert layout.tiles[0].detail is None
+
+    def test_quotaless_tile_carries_detail_and_alert_colour(self) -> None:
+        """A genuinely quota-less tile must carry its detail line (rendered by
+        the GUI in place of bars) tinted by the volume alert, so it does not
+        paint as a bare title."""
+        from usage_dashboard.shared.models import ALERT_WARN
+
+        quotaless = _reading(
+            Provider.OLLAMA,
+            session_percent=None, session_resets_at=None,
+            weekly_percent=None, weekly_resets_at=None,
+            detail="week req 9 tok 2M", alert=ALERT_WARN,
+        )
+        layout = build_main_layout([quotaless], _SIZE, now=_NOW)
+        tile = layout.tiles[0]
+        assert tile.bars == []
+        assert tile.detail == "week req 9 tok 2M"
+        assert tile.detail_color == fmt.ORANGE
 
     def test_overhead_gives_equal_row_heights(self) -> None:
         # With tile_overhead specified, a 3-bar tile and a 2-bar tile get
@@ -302,23 +298,6 @@ class TestMainLayout:
         assert "Session" not in labels
         assert "Weekly" in labels
 
-    def test_footer_shows_qwen_peak_countdown_when_in_peak(self) -> None:
-        # _NOW = 2026-01-10 12:00 UTC = Sat 20:00 UTC+8 -> inside Qwen's peak
-        # window (off-peak is 22:00–08:00 UTC+8), which ends at 22:00 UTC+8
-        # (= 14:00 UTC): "ends in 2h 0m".
-        layout = build_main_layout(_all_configured(), _SIZE, now=_NOW)
-        assert layout.footer_note == "QWEN ends in 2h 0m"
-        assert layout.footer_color == fmt.ORANGE
-
-    def test_footer_shows_qwen_peak_countdown_when_offpeak(self) -> None:
-        # 2026-01-10 16:00 UTC = Sat 00:00 UTC+8 -> inside the off-peak
-        # window; peak begins 08:00 UTC+8 (= 00:00 UTC next day): "peak in
-        # 8h 0m".
-        offpeak = datetime(2026, 1, 10, 16, 0, 0, tzinfo=timezone.utc)
-        layout = build_main_layout(_all_configured(), _SIZE, now=offpeak)
-        assert layout.footer_note == "QWEN peak in 8h 0m"
-        assert layout.footer_color == fmt.GREEN
-
     def test_zai_title_green_offpeak(self) -> None:
         # Sat 2026-01-10 (weekend): never peak -> title tints green.
         layout = build_main_layout(_all_configured(), _SIZE, now=_NOW)
@@ -362,6 +341,20 @@ class TestMainLayout:
         layout = build_main_layout(_all_configured(), _SIZE, now=_NOW)
         assert "3 providers" in layout.status_text
 
+    def test_status_count_matches_touch_tiles_not_raw_readings(self) -> None:
+        layout = build_main_layout(
+            [
+                _reading(Provider.CLAUDE),
+                _reading(Provider.CLAUDE_WORK),
+                _reading(Provider.OPENCODE),
+            ],
+            _SIZE,
+            now=_NOW,
+        )
+
+        assert [tile.provider for tile in layout.tiles] == [Provider.CLAUDE]
+        assert "1 provider" in layout.status_text
+
     def test_status_text_shows_refresh_interval(self) -> None:
         layout = build_main_layout(_all_configured(), _SIZE, now=_NOW, refresh_interval=300)
         assert "refresh 5m" in layout.status_text
@@ -392,6 +385,94 @@ class TestMainLayout:
             assert t.rect.x + t.rect.w <= 720
             assert t.rect.y + t.rect.h <= 1280
 
+    def test_narrow_width_stacks_paired_providers(self) -> None:
+        """A tiny portrait panel uses a summary matrix, not collapsed rows."""
+        layout = build_main_layout(_all_configured(), (240, 320), now=_NOW)
+        assert [tile.provider for tile in layout.tiles] == [
+            Provider.CLAUDE, Provider.ZAI, Provider.OLLAMA,
+        ]
+        assert all(tile.ultra_compact for tile in layout.tiles)
+        assert len({tile.rect.y for tile in layout.tiles}) == 2
+        assert len({tile.rect.x for tile in layout.tiles}) == 2
+        for tile in layout.tiles:
+            assert tile.rect.x >= 0
+            assert tile.rect.x + tile.rect.w <= 240
+            assert tile.rect.y + tile.rect.h <= layout.status_rect.y
+
+    def test_four_provider_tiny_grid_is_orientation_aware(self) -> None:
+        readings = _all_configured() + [_reading(Provider.CODEX)]
+
+        portrait = build_main_layout(readings, (240, 320), now=_NOW)
+        assert all(tile.ultra_compact for tile in portrait.tiles)
+        assert len({tile.rect.y for tile in portrait.tiles}) == 2
+        assert all(
+            sum(tile.rect.y == row_y for tile in portrait.tiles) == 2
+            for row_y in {tile.rect.y for tile in portrait.tiles}
+        )
+
+        landscape = build_main_layout(readings, (320, 240), now=_NOW)
+        assert all(tile.ultra_compact for tile in landscape.tiles)
+        assert len({tile.rect.y for tile in landscape.tiles}) == 1
+        assert len({tile.rect.x for tile in landscape.tiles}) == 4
+
+        for layout, size in ((portrait, (240, 320)), (landscape, (320, 240))):
+            for tile in layout.tiles:
+                assert tile.rect.x >= 0 and tile.rect.y >= 0
+                assert tile.rect.x + tile.rect.w <= size[0]
+                assert tile.rect.y + tile.rect.h <= layout.status_rect.y
+                assert tile.rect.w >= MIN_TOUCH_TARGET
+                assert tile.rect.h >= MIN_TOUCH_TARGET
+            for index, first in enumerate(layout.tiles):
+                for second in layout.tiles[index + 1:]:
+                    overlap_x = first.rect.x < second.rect.x + second.rect.w
+                    overlap_y = first.rect.y < second.rect.y + second.rect.h
+                    overlap_x = overlap_x and second.rect.x < first.rect.x + first.rect.w
+                    overlap_y = overlap_y and second.rect.y < first.rect.y + first.rect.h
+                    assert not (overlap_x and overlap_y)
+
+    def test_normal_four_provider_layout_keeps_established_rows(self) -> None:
+        layout = build_main_layout(
+            _all_configured() + [_reading(Provider.CODEX)],
+            (1280, 720),
+            now=_NOW,
+        )
+        by = {tile.provider: tile for tile in layout.tiles}
+        assert not any(tile.ultra_compact for tile in layout.tiles)
+        assert by[Provider.CLAUDE].compact is False
+        assert by[Provider.CODEX].compact is False
+        assert by[Provider.ZAI].compact is True
+        assert by[Provider.OLLAMA].compact is True
+        assert by[Provider.ZAI].rect.y == by[Provider.OLLAMA].rect.y
+
+    def test_status_overlay_regions_fit_portrait_and_narrow_screens(self) -> None:
+        for size in (
+            (240, 320), (390, 844), (720, 1280),
+            (320, 240), (844, 390), (1280, 720),
+        ):
+            width, height = size
+            overlay = build_status_overlay(size)
+            panel = overlay.panel
+            assert panel.x >= 0 and panel.y >= 0
+            assert panel.x + panel.w <= width
+            assert panel.y + panel.h <= height
+            for region in (
+                overlay.diag_rect,
+                overlay.brightness.region,
+                overlay.brightness.minus,
+                overlay.brightness.plus,
+                overlay.brightness.level_rect,
+            ):
+                assert panel.contains(region.x, region.y)
+                assert panel.contains(region.x + region.w - 1, region.y + region.h - 1)
+            assert (
+                overlay.diag_rect.x + overlay.diag_rect.w
+                <= overlay.brightness.region.x
+            )
+            assert overlay.brightness.minus.w >= MIN_TOUCH_TARGET
+            assert overlay.brightness.minus.h >= MIN_TOUCH_TARGET
+            assert overlay.brightness.plus.w >= MIN_TOUCH_TARGET
+            assert overlay.brightness.plus.h >= MIN_TOUCH_TARGET
+
 
 class TestHitTest:
     def test_tap_inside_tile_returns_provider(self) -> None:
@@ -416,6 +497,8 @@ class TestRefreshButton:
         r = layout.refresh_rect
         assert sr.contains(r.x, r.y)
         assert sr.contains(r.x + r.w - 1, r.y + r.h - 1)
+        assert r.w >= MIN_TOUCH_TARGET
+        assert r.h >= MIN_TOUCH_TARGET
 
     def test_refresh_button_anchored_to_right_edge(self) -> None:
         layout = build_main_layout(_all_configured(), _SIZE, now=_NOW)

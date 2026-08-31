@@ -14,8 +14,10 @@ the panel does, for one fixed reading set and clock.
 """
 from __future__ import annotations
 
+import re
 from datetime import datetime, timedelta, timezone
 
+from usage_dashboard.client.format import format_countdown
 from usage_dashboard.client.layout import build_main_layout
 from usage_dashboard.server.api import _render_dashboard_html
 from usage_dashboard.shared.models import (
@@ -24,12 +26,12 @@ from usage_dashboard.shared.models import (
     ReadingStatus,
     ScopedLimit,
 )
-from usage_dashboard.shared.offpeak import qwen_peak_label, zai_peak_label
+from usage_dashboard.shared.offpeak import zai_peak_label
 
 # A Wednesday. 06:00 UTC is 14:00 UTC+8 — inside z.ai's Mon–Fri 14:00–18:00
 # peak window — so the "ends in" branch is exercised, not just "peak in".
 _IN_PEAK = datetime(2026, 8, 12, 6, 30, tzinfo=timezone.utc)
-# 02:00 UTC is 10:00 UTC+8: outside z.ai's window, inside Qwen's peak.
+# 02:00 UTC is 10:00 UTC+8: outside z.ai's peak window.
 _OFF_PEAK = datetime(2026, 8, 12, 2, 0, tzinfo=timezone.utc)
 _SIZE = (1280, 720)
 
@@ -91,15 +93,54 @@ class TestPeakCountdownParity:
             assert zai.subtitle == zai_peak_label(now)
             assert zai.subtitle in _render_dashboard_html(_fleet(now), now)
 
-    def test_panel_and_web_use_the_same_qwen_wording(self) -> None:
-        for now in (_IN_PEAK, _OFF_PEAK):
-            layout = build_main_layout(_fleet(now), _SIZE, now=now)
-            html_out = _render_dashboard_html(_fleet(now), now)
-            label = qwen_peak_label(now)
-            # The panel prefixes the provider name; the web card's header
-            # already says QWEN. The countdown text itself must match.
-            assert layout.footer_note == f"QWEN {label}"
-            assert label in html_out
+
+class TestResetUrgencyParity:
+    """Reset emphasis must mean the same thing on the panel and web view."""
+
+    def test_web_marks_near_and_expired_resets_like_touch(self) -> None:
+        now = _OFF_PEAK
+        resets = (
+            now - timedelta(minutes=1),
+            now + timedelta(days=1),
+            now + timedelta(days=5),
+        )
+        reading = _reading(
+            Provider.CLAUDE,
+            now,
+            session_resets_at=resets[0],
+            weekly_resets_at=resets[1],
+        )
+        html_out = _render_dashboard_html([reading], now)
+        web_states = re.findall(
+            r'class="resets reset-(\w+)" data-reset-state="(\w+)"',
+            html_out,
+        )
+        assert web_states == [("expired", "expired"), ("near", "near")]
+
+        layout = build_main_layout([reading], _SIZE, now=now)
+        assert len(layout.tiles[0].bars) == len(resets) - 1
+        for bar, reset, (state, _data_state) in zip(
+            layout.tiles[0].bars, resets, web_states
+        ):
+            _text, touch_highlight = format_countdown(reset, now=now)
+            assert bar.reset_highlight is touch_highlight
+            assert (state in {"near", "expired"}) is touch_highlight
+
+        # A distant reset is rendered by the web class even though it is not
+        # part of the two-window Claude fixture above.
+        distant = _reading(
+            Provider.CLAUDE,
+            now,
+            session_resets_at=now + timedelta(days=5),
+            weekly_resets_at=None,
+        )
+        distant_html = _render_dashboard_html([distant], now)
+        assert 'class="resets reset-distant" data-reset-state="distant"' in distant_html
+
+    def test_web_uses_the_touch_highlight_colour(self) -> None:
+        html_out = _render_dashboard_html(_fleet(_OFF_PEAK), _OFF_PEAK)
+        assert ".resets.reset-near, .resets.reset-expired" in html_out
+        assert "color:#eab308" in html_out
 
 
 class TestScopedLimitParity:

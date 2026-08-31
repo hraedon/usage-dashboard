@@ -23,13 +23,12 @@ for the planned pieces):
   added directly.)* Extended 2026-07-16 (trailing-24h req/tok line,
   `Reading.alert`, low-interactivity mode) — then **removed 2026-08-03**; the
   provider is no longer in use. `Reading.throttle`/`Reading.alert` remain in
-  the schema for any future quota-less provider, and its status-bar slot is now
-  a display-only off-peak tag for the Qwen token plan.
+  the schema for any future quota-less provider.
 - **z.ai weekly-window token tracking** — follows the retired umans pattern: a
   second GET to `/model-usage` sums the current weekly quota window and the
   reading's `detail` carries `week req N  tok X`, coloured by `alert`
-  (`ZAI_WEEK_TOKENS_WARN`/`CRIT`, defaults ~80%/95% of the Pro cap). The tile
-  name bar / QWEN footer now also count down to the next peak boundary.
+  (`ZAI_WEEK_TOKENS_WARN`/`CRIT`, defaults ~80%/95% of the Pro cap). The z.ai
+  tile name bar also counts down to the next peak boundary.
 - **Second Claude account** (work login) — merged into the Claude tile as a
   muted second set of bars. *(No spec/plan entry.)*
 - **Dedicated Claude OAuth login** replacing the `~/.claude/.credentials.json`
@@ -50,8 +49,7 @@ for the planned pieces):
   explicitly chosen (WI-023) because the reading feeds switchboard's `TruthSource`
   consumption of `/readings` (Plan 003) and the Go plan's dollar-quota bars are
   exposed only via the web dashboard. Rendered on `/dashboard` only — deliberately
-  kept off the Pi panel (a 5th full-width row would collapse bar height; see the
-  `_PROVIDER_ORDER` comment in `client/layout.py`).
+  kept off the Pi panel (a 5th full-width row would collapse bar height).
 
 **Reading schema** now also carries `detail`, `models`, and `throttle` (the §6
 schema shows only the original fields).

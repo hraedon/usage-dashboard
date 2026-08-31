@@ -3,6 +3,8 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from pathlib import Path
 
+import pytest
+
 from usage_dashboard.client import diagnostics as diag
 from usage_dashboard.client.diagnostics import (
     Diagnostics,
@@ -101,6 +103,65 @@ class TestDiagnosticLines:
         assert update.warn is True
         assert "import failed" in update.value
         assert "(rolled back)" in commit.value
+
+    def test_fetch_failure_is_distinct_from_a_deleted_ref(self) -> None:
+        lines = diagnostic_lines(
+            self._diag(check=UpdateCheck(_NOW, "fetch-failed", "a1b2c3d4")), _NOW
+        )
+        update = next(ln for ln in lines if ln.label == "Update")
+        commit = next(ln for ln in lines if ln.label == "Commit")
+        assert update.warn is True
+        assert "git fetch failed" in update.value
+        assert "(rolled back)" not in commit.value
+        assert "(current)" in commit.value
+
+    @pytest.mark.parametrize(
+        ("result", "label", "warn", "rolled_back"),
+        [
+            ("up-to-date", "ok", False, False),
+            ("updated", "updated", False, False),
+            ("pip-failed", "pip failed", True, True),
+            ("import-failed", "import failed", True, True),
+            ("bad-ref", "ref gone — stalled", True, False),
+            ("no-checkout", "checkout gone — stalled", True, False),
+            ("reset-failed", "git reset failed — stalled", True, False),
+            ("fetch-failed", "git fetch failed — offline", True, False),
+        ],
+    )
+    def test_every_known_result_has_label_and_accurate_state(
+        self, result: str, label: str, warn: bool, rolled_back: bool
+    ) -> None:
+        lines = diagnostic_lines(
+            self._diag(check=UpdateCheck(_NOW, result, "a1b2c3d4")), _NOW
+        )
+        update = next(ln for ln in lines if ln.label == "Update")
+        commit = next(ln for ln in lines if ln.label == "Commit")
+        assert update.value.startswith(f"{label} ·")
+        assert update.warn is warn
+        assert ("(rolled back)" in commit.value) is rolled_back
+        assert ("(current)" in commit.value) is not rolled_back
+
+    def test_result_sets_are_exhaustive(self) -> None:
+        expected = {
+            "up-to-date",
+            "updated",
+            "pip-failed",
+            "import-failed",
+            "bad-ref",
+            "no-checkout",
+            "reset-failed",
+            "fetch-failed",
+        }
+        assert set(diag._RESULT_LABELS) == expected
+        assert diag._FAILED_RESULTS == {
+            "pip-failed",
+            "import-failed",
+            "bad-ref",
+            "no-checkout",
+            "reset-failed",
+            "fetch-failed",
+        }
+        assert diag._ROLLED_BACK_RESULTS == {"pip-failed", "import-failed"}
 
     def test_no_record_warns(self) -> None:
         lines = diagnostic_lines(self._diag(check=None), _NOW)

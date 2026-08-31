@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
@@ -72,12 +73,66 @@ def _to_api_clock(moment: datetime) -> str:
     return (moment + _ZAI_API_UTC_OFFSET).strftime("%Y-%m-%d %H:%M:%S")
 
 
+def _to_int(value: object, default: int = 0) -> int:
+    """int() that tolerates the API's numeric strings and whole-valued floats.
+
+    ``int(str(x))`` raises on a float (``int("123.0")`` is a ValueError), so a
+    payload that ever serialises a counter as ``123.0`` would fail the whole
+    fetch; JSON numbers are otherwise handled natively.
+    """
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, int):
+        return int(value)
+    if isinstance(value, float):
+        return int(value) if math.isfinite(value) else default
+    try:
+        return int(float(str(value).strip()))
+    except ValueError:
+        return default
+
+
 def _from_epoch_ms(value: object) -> datetime | None:
+    """Convert a z.ai epoch-millisecond value to naive UTC.
+
+    Missing reset fields are valid for an idle window. A present but malformed
+    value is not: silently defaulting it to zero manufactures a 1970 reset and
+    makes the scheduler/client treat bad provider data as real data. Preserve
+    the fetcher's existing malformed-response path by raising ``ValueError``
+    for nonempty invalid values; ``fetch_zai_usage`` turns that into a
+    ``FetchError``.
+    """
     if value is None:
         return None
-    return datetime.fromtimestamp(int(str(value)) / 1000, tz=timezone.utc).replace(
-        tzinfo=None
-    )
+    if isinstance(value, bool):
+        raise ValueError("epoch milliseconds must be numeric")
+    if isinstance(value, int):
+        epoch_ms = value
+    elif isinstance(value, float):
+        if not math.isfinite(value) or not value.is_integer():
+            raise ValueError("epoch milliseconds must be a finite whole number")
+        epoch_ms = int(value)
+    elif isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            raise ValueError("epoch milliseconds must not be empty")
+        try:
+            parsed = float(raw)
+        except ValueError as exc:
+            raise ValueError("epoch milliseconds must be numeric") from exc
+        if not math.isfinite(parsed) or not parsed.is_integer():
+            raise ValueError("epoch milliseconds must be a finite whole number")
+        epoch_ms = int(parsed)
+    else:
+        raise ValueError("epoch milliseconds must be numeric")
+    try:
+        return datetime.fromtimestamp(epoch_ms / 1000, tz=timezone.utc).replace(
+            tzinfo=None
+        )
+    except (OverflowError, OSError, ValueError) as exc:
+        raise ValueError("epoch milliseconds are outside the datetime range") from exc
 
 
 def _fetch_weekly_sums(
@@ -187,13 +242,13 @@ def fetch_zai_usage(
                 details: list[dict[str, object]] = (
                     details_raw if isinstance(details_raw, list) else []
                 )
-                total_used = int(str(tools_entry.get("currentValue", 0)))
+                total_used = _to_int(tools_entry.get("currentValue"))
                 model_list = [
                     ModelUsage(
                         name=str(d.get("modelCode", "")),
-                        requests=int(str(d.get("usage", 0))),
+                        requests=_to_int(d.get("usage")),
                         share_percent=(
-                            int(str(d.get("usage", 0))) / total_used * 100
+                            _to_int(d.get("usage")) / total_used * 100
                             if total_used > 0
                             else 0.0
                         ),
