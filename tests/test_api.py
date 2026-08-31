@@ -510,12 +510,18 @@ class TestDashboardEndpoint:
                 r'<section class="card status-\w+" data-provider="([^"]+)"',
                 text,
             )
+            # Drop the trailing spans (status badge, z.ai peak countdown)
+            # element-and-all, then strip any remaining tags. Splitting on the
+            # word "peak" instead would be wall-clock dependent: the countdown
+            # reads "peak in 3h 24m" off-peak but "ends in 1h 24m" during peak
+            # (Mon-Fri 14:00-18:00 SGT), so a name-only assertion built on that
+            # word passes or fails depending on when CI happens to run.
             names = [
-                re.sub(r"<[^>]+>", "", heading)
+                re.sub(r"<[^>]+>", "", re.sub(r"<span\b[^>]*>.*?</span>", "", heading))
                 for heading in re.findall(r"<h2[^>]*>(.*?)</h2>", text)
             ]
             assert providers == ["claude", "codex", "zai", "ollama", "opencode"]
-            assert [name.split("peak", 1)[0].strip() for name in names] == [
+            assert [name.strip() for name in names] == [
                 "Claude",
                 "Codex",
                 "ZAI",
