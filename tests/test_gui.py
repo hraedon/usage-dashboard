@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 import threading
 from datetime import datetime, timedelta, timezone
+from typing import Any
 
 import pytest
 
@@ -20,11 +21,14 @@ pygame = pytest.importorskip("pygame")
 from usage_dashboard.client import diagnostics  # noqa: E402
 from usage_dashboard.client.brightness import step_for_level  # noqa: E402
 from usage_dashboard.client.gui import (  # noqa: E402
+    _WALLET_BAND_MARGIN,
+    _WALLET_REFRESH_GAP_MIN,
     DashboardGui,
     DoubleTapDetector,
 )
 from usage_dashboard.client.layout import (  # noqa: E402
     MIN_TOUCH_TARGET,
+    MainLayout,
     ViewState,
     build_main_layout,
     build_status_overlay,
@@ -1122,5 +1126,189 @@ def test_wallet_line_renders_in_status_band_without_collision() -> None:
             rightmost = max(band, key=lambda r: r.right)
             if layout.refresh_rect is not None:
                 assert rightmost.right <= layout.refresh_rect.x
+        finally:
+            pygame.display.quit()
+
+
+
+def _umans_reading() -> Reading:
+    return Reading(
+        provider=Provider.UMANS,
+        status=ReadingStatus.CURRENT,
+        session_percent=None,
+        weekly_percent=None,
+        session_resets_at=None,
+        weekly_resets_at=None,
+        fetched_at=_NOW,
+        stale=False,
+        detail="$15.29",
+    )
+
+
+class _BandCapture:
+    """What ``_draw_main`` actually put in the status band.
+
+    Reads the blitted rects rather than recomputing the layout arithmetic: a
+    test that re-derives the geometry only checks its own copy of the formula
+    and stays green when the renderer stops using it.
+    """
+
+    def __init__(self, gui: DashboardGui, layout: MainLayout, size: tuple[int, int]):
+        rects: list[Any] = []
+        fitted: list[tuple[str, str]] = []
+        real_fit = DashboardGui._fit_text
+
+        class _Recorder(pygame.Surface):
+            def blit(self, source, dest, **kwargs):  # type: ignore[override]
+                rects.append(source.get_rect(topleft=dest))
+                return super().blit(source, dest, **kwargs)
+
+        def _spy(font: Any, text: str, max_width: int) -> str:
+            result = real_fit(font, text, max_width)
+            fitted.append((text, result))
+            return result
+
+        recorder = _Recorder(size)
+        original_screen = gui._screen
+        gui._screen = recorder  # type: ignore[assignment]
+        gui._fit_text = _spy  # type: ignore[method-assign,assignment]
+        try:
+            gui._draw_main(layout)
+        finally:
+            gui._screen = original_screen
+            del gui._fit_text  # type: ignore[attr-defined]
+
+        sr = layout.status_rect
+        band = sorted(
+            (r for r in rects if r.y < sr.y + sr.h and r.y + r.h > sr.y),
+            key=lambda r: r.x,
+        )
+        assert len(band) == 2, f"expected status + wallet in the band, got {len(band)}"
+        self.status, self.wallet = band
+        assert layout.wallet_text is not None
+        self.wallet_shown = next(
+            shown for text, shown in fitted if text == layout.wallet_text
+        )
+
+
+def _draw_at(size: tuple[int, int]) -> tuple[DashboardGui, MainLayout]:
+    readings = [*_readings(), _umans_reading()]
+    gui = DashboardGui(_FakeFetcher(readings), size)  # type: ignore[arg-type]
+    layout = build_main_layout(readings, size, tile_overhead=gui._tile_overhead)
+    return gui, layout
+
+
+def test_wallet_line_is_larger_than_the_status_text_and_fits_the_band() -> None:
+    """The wallet balance renders at up to twice the status text (owner request
+    2026-09-09).  Both clamps must hold at every audited size: it never outgrows
+    the status band, and it never renders smaller than the status text — this
+    change may only ever make the line bigger."""
+    doubled_somewhere = False
+    for size in _AUDIT_SIZES:
+        pygame.display.init()
+        pygame.font.init()
+        pygame.display.set_mode(size)
+        try:
+            gui, layout = _draw_at(size)
+            band = _BandCapture(gui, layout, size)
+            # get_linesize is the height of the surface render() produces, so
+            # it is what the blitted rect is measured against.
+            small_h = gui._font_small.get_linesize()
+            assert band.wallet.h >= small_h, size
+            assert band.wallet.h <= small_h * 2, size
+            assert band.wallet.h <= layout.status_rect.h, size
+            assert layout.status_rect.y <= band.wallet.y, size
+            assert band.wallet.bottom <= layout.status_rect.y + layout.status_rect.h, size
+            if band.wallet.h >= small_h * 1.9:
+                doubled_somewhere = True
+        finally:
+            pygame.display.quit()
+    assert doubled_somewhere, "no audited size reached 2x — the scale is inert"
+
+
+def test_wallet_line_reaches_full_size_on_the_deployed_panel() -> None:
+    """1280x720 is what the units actually run: there the band is tall enough
+    and the column wide enough for the full doubling AND the whole balance, so
+    neither clamp may bind and nothing may be truncated away."""
+    size = (1280, 720)
+    pygame.display.init()
+    pygame.font.init()
+    pygame.display.set_mode(size)
+    try:
+        gui, layout = _draw_at(size)
+        band = _BandCapture(gui, layout, size)
+        small_h = gui._font_small.get_linesize()
+        # ~2x: the band's 4px breathing room is the only thing keeping it off
+        # exactly 2.0 here, so require it to land within that margin.
+        assert small_h * 1.9 <= band.wallet.h <= small_h * 2
+        assert band.wallet.h > band.status.h
+        # Shrink-to-fit, not truncate: the whole balance survives.
+        assert band.wallet_shown == layout.wallet_text
+        assert "..." not in band.wallet_shown
+    finally:
+        pygame.display.quit()
+
+
+def test_wallet_line_stands_further_off_the_refresh_button_than_the_status_text() -> None:
+    """Owner request 2026-09-09: put air between the balance and the refresh
+    button.  The stand-off is scaled from the band, so it must clear the 8px
+    the status text is given at every size, not just the big one."""
+    for size in _AUDIT_SIZES:
+        pygame.display.init()
+        pygame.font.init()
+        pygame.display.set_mode(size)
+        try:
+            gui, layout = _draw_at(size)
+            refresh = layout.refresh_rect
+            assert refresh is not None
+            band = _BandCapture(gui, layout, size)
+            gap = refresh.x - band.wallet.right
+            assert gap >= _WALLET_REFRESH_GAP_MIN, (size, gap)
+            # 8px is the clearance every other status-band text gets; the
+            # wallet line was on exactly that before this change.
+            assert gap > 8, (size, gap)
+            assert band.wallet.right <= refresh.x, size
+        finally:
+            pygame.display.quit()
+
+
+def test_wallet_font_is_clamped_by_a_short_status_band() -> None:
+    """The band clamp, exercised directly: at the audited sizes it only binds
+    by a pixel, so a draw-path test cannot tell it is there.  Given a band too
+    short for the doubled glyph, the font must come back sized to the band."""
+    size = (1280, 720)
+    pygame.display.init()
+    pygame.font.init()
+    pygame.display.set_mode(size)
+    try:
+        gui, layout = _draw_at(size)
+        assert layout.wallet_text is not None
+        small_h = gui._font_small.get_linesize()
+        short_band = 40  # between the status font and its doubling
+        assert small_h < short_band - _WALLET_BAND_MARGIN < small_h * 2
+        font = gui._wallet_font(layout.wallet_text, short_band, 10_000)
+        assert font.get_linesize() <= short_band - _WALLET_BAND_MARGIN
+        # Still an enlargement — the clamp bounds it, it does not cancel it.
+        assert font.get_linesize() > small_h
+    finally:
+        pygame.display.quit()
+
+
+def test_wallet_line_is_never_truncated_on_either_deployed_orientation() -> None:
+    """Both orientations the units run have room for the whole balance at the
+    status font, so growing the text may never cost a digit: the font shrinks
+    to fit its column instead of the balance being cut short.  720x1280 is the
+    case that matters — there the column, not the band, is what binds."""
+    for size in ((1280, 720), (720, 1280)):
+        pygame.display.init()
+        pygame.font.init()
+        pygame.display.set_mode(size)
+        try:
+            gui, layout = _draw_at(size)
+            band = _BandCapture(gui, layout, size)
+            assert band.wallet_shown == layout.wallet_text, size
+            assert "..." not in band.wallet_shown, size
+            # ...and it is still bigger than it was, not shrunk back to safety.
+            assert band.wallet.h > gui._font_small.get_linesize(), size
         finally:
             pygame.display.quit()

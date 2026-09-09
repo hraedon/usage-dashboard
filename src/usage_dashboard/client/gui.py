@@ -71,6 +71,16 @@ _MIN_BAR_TRACK_W = 24
 _MIN_BODY_GLYPH_H = 16
 _MIN_SMALL_GLYPH_H = 14
 _MIN_TITLE_GLYPH_H = 20
+# The wallet corner line renders at up to this multiple of the status text's
+# height (owner request 2026-09-09), band permitting.
+_WALLET_FONT_SCALE = 2
+# Breathing room kept above and below the wallet line inside the status band.
+_WALLET_BAND_MARGIN = 4
+# Stand-off between the wallet line and the refresh button.  Scaled from the
+# band so the gap grows with the panel, with a floor for the 44px fallback
+# bands; deliberately wider than the status text's own clearance.
+_WALLET_REFRESH_GAP_MIN = 12
+_WALLET_REFRESH_GAP_DIVISOR = 3
 
 
 def _env_int(name: str, default: int) -> int:
@@ -125,13 +135,15 @@ class DashboardGui:
     """Owns the pygame window, fonts, view state, and render loop."""
 
     @staticmethod
-    def _readable_font(nominal_size: int, min_height: int) -> Any:
-        """Create a font whose actual line and ``Ag`` glyph heights meet *min_height*.
+    def _readable_font(nominal_size: int, min_height: int) -> tuple[int, Any]:
+        """Build a font meeting *min_height*, returning ``(nominal, font)``.
 
         ``pygame.font.Font`` accepts a nominal point size, not a guaranteed
         pixel height.  Measuring the resulting font is important on the small
         fallback display (and keeps this contract stable if the bundled font
-        changes between pygame builds).
+        changes between pygame builds).  The settled nominal comes back with
+        the font because the wallet line grows from the status font's size and
+        must not re-derive it from an assumed nominal-to-pixel ratio.
         """
         size = max(1, nominal_size)
         font = pygame.font.Font(None, size)
@@ -142,7 +154,7 @@ class DashboardGui:
         ):
             size += 1
             font = pygame.font.Font(None, size)
-        return font
+        return size, font
 
     def __init__(
         self,
@@ -219,15 +231,18 @@ class DashboardGui:
         # keeps the established 48px unit at both 1280x720 and 720x1280 while
         # still giving the 240x320 fallback a readable rendered body glyph.
         unit = max(24, min(self._width, self._height) // 15)
-        self._font = self._readable_font(unit, _MIN_BODY_GLYPH_H)
-        self._font_small = self._readable_font(
+        _, self._font = self._readable_font(unit, _MIN_BODY_GLYPH_H)
+        self._font_small_nominal, self._font_small = self._readable_font(
             max(22, unit * 4 // 5), _MIN_SMALL_GLYPH_H
         )
-        self._font_title = self._readable_font(
+        _, self._font_title = self._readable_font(
             max(32, unit * 5 // 4), _MIN_TITLE_GLYPH_H
         )
         # Oversized glyphs for the brightness overlay's +/- buttons and readout.
-        self._font_big = self._readable_font(unit * 2, 28)
+        _, self._font_big = self._readable_font(unit * 2, 28)
+        # Candidate sizes for the wallet corner line, cached because the line
+        # picks its size every frame and the loop runs at 10fps.
+        self._wallet_font_cache: dict[int, Any] = {}
         # Below this width the layout stacks the paired providers.  Full-width
         # rows let the narrow fallback keep the reset countdown visible instead
         # of squeezing it into a zero-width track.
@@ -471,6 +486,39 @@ class DashboardGui:
 
     # -- rendering ----------------------------------------------------------
 
+    def _wallet_font(self, text: str, band_h: int, max_width: int) -> Any:
+        """The font for the wallet corner line: about twice the status text.
+
+        Two clamps keep the bigger glyphs honest.  Vertically it may not
+        outgrow the status band, which is only 44px on the fallback displays
+        and cannot hold a doubled glyph at all.  Horizontally it shrinks until
+        the whole balance fits its column, because a truncated balance
+        ("Umans: $1...") is worse than a smaller readable one — and the money
+        text is the entire point of the line.  The floor is the status font,
+        so this can only ever render the line larger than it was before, never
+        smaller.
+        """
+        # ``get_linesize`` — not ``get_height`` — is the height of the surface
+        # ``render`` actually produces (57px vs 52px for the doubled font at
+        # 1280x720), and it is the surface that has to fit the band.
+        cap_h = min(
+            self._font_small.get_linesize() * _WALLET_FONT_SCALE,
+            max(1, band_h - _WALLET_BAND_MARGIN),
+        )
+        best = self._font_small
+        nominal = self._font_small_nominal
+        while True:
+            nominal += 1
+            font = self._wallet_font_cache.get(nominal)
+            if font is None:
+                font = pygame.font.Font(None, nominal)
+                self._wallet_font_cache[nominal] = font
+            if font.get_linesize() > cap_h:
+                return best
+            if max_width > 0 and font.size(text)[0] > max_width:
+                return best
+            best = font
+
     @staticmethod
     def _fit_text(font: Any, text: str, max_width: int) -> str:
         """Return *text* shortened to a pixel width without clipping it.
@@ -701,19 +749,26 @@ class DashboardGui:
             refresh.x - min(8, max(4, refresh.w // 3))
             if refresh is not None else sr.x + sr.w - status_x
         )
-        # Umans wallet corner line (Plan 004): right-aligned in the band,
-        # ending at the refresh target.  It claims at most 60% of the line;
-        # the status text and refresh feedback fit into whatever remains, so
-        # the two can never overlap no matter how long either string grows.
+        # Umans wallet corner line (Plan 004): right-aligned in the band.  It
+        # claims at most 60% of its span; the status text and refresh feedback
+        # fit into whatever remains, so the two can never overlap no matter how
+        # long either string grows.  It reads at roughly twice the status text
+        # and stands further off the refresh button than the status text does
+        # (owner request 2026-09-09) — the balance is the number people look up
+        # from across the room, and at the old size it crowded the button.
         line_right = status_right
         if layout.wallet_text:
-            wallet_max = max(0, int((status_right - status_x) * 0.6))
+            wallet_right = status_right - max(
+                _WALLET_REFRESH_GAP_MIN, sr.h // _WALLET_REFRESH_GAP_DIVISOR
+            )
+            wallet_max = max(0, int((wallet_right - status_x) * 0.6))
+            wallet_font = self._wallet_font(layout.wallet_text, sr.h, wallet_max)
             wallet_text = self._fit_text(
-                self._font_small, layout.wallet_text, wallet_max
+                wallet_font, layout.wallet_text, wallet_max
             )
             if wallet_text:
-                wallet = self._font_small.render(wallet_text, True, fmt.GRAY)
-                wallet_x = status_right - wallet.get_width()
+                wallet = wallet_font.render(wallet_text, True, fmt.GRAY)
+                wallet_x = wallet_right - wallet.get_width()
                 line_right = wallet_x - min(8, max(4, sr.w // 40))
                 wallet_y = sr.y + (sr.h - wallet.get_height()) // 2
                 self._screen.blit(wallet, (wallet_x, wallet_y))

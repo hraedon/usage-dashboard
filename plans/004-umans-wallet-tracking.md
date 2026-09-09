@@ -62,6 +62,12 @@ file a WI referencing this plan when it returns.
   umans reading and the GUI renders it **right-aligned in the status bar**
   (the bottom corner, left of the refresh button), shrinking the status
   text's fit region so the two can never collide.
+- **Sizing (owner request 2026-09-09, after the first version shipped)**: the
+  corner line renders at up to **twice** the status text and stands ~28px off
+  the refresh button at 1280x720 (was 8px). Two clamps keep that honest — it
+  may not outgrow the status band, and it shrinks to fit its column rather
+  than truncate the balance, with the status font as the floor. Tunable via
+  `_WALLET_FONT_SCALE` / `_WALLET_REFRESH_GAP_MIN` in `client/gui.py`.
 - **Format lives server-side**: `detail = "$16.32"` or
   `"$16.32, promo: $7.14"`; the layout prefixes `Umans: `. The client never
   reformats money.
