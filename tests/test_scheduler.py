@@ -772,8 +772,22 @@ class TestConfiguredProviders:
             codex_token="cx",
             opencode_workspace_id="wrk_X",
             opencode_cookie="oc",
+            umans_key="u",
         )
         assert scheduler.configured_providers() == list(Provider)
+
+
+class TestUmansWalletProvider:
+    def test_not_registered_without_key(self, tmp_path):
+        db = Database(str(tmp_path / "sched.db"))
+        db.initialize()
+        assert Provider.UMANS not in FetchScheduler(db).configured_providers()
+
+    def test_registered_with_key(self, tmp_path):
+        db = Database(str(tmp_path / "sched.db"))
+        db.initialize()
+        scheduler = FetchScheduler(db, umans_key="sk-test")
+        assert scheduler.configured_providers() == [Provider.UMANS]
 
 
 class TestOpenCodeProvider:

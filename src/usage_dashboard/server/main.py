@@ -120,6 +120,9 @@ def main() -> None:
     codex_refresh_token = os.environ.get("CODEX_REFRESH_TOKEN") or None
     codex_client_id = os.environ.get("CODEX_CLIENT_ID") or None
     codex_account_id = os.environ.get("CODEX_ACCOUNT_ID") or None
+    # Optional Umans wallet key (Plan 004): adds the corner balance line on
+    # the Pi; absent leaves the provider unconfigured.
+    umans_key = os.environ.get("UMANS_API_KEY") or None
     fetch_interval = int(os.environ.get("FETCH_INTERVAL", "300"))
     failure_backoff_cap = int(os.environ.get("FAILURE_BACKOFF_CAP", "3600"))
     port = int(os.environ.get("PORT", "8080"))
@@ -170,6 +173,7 @@ def main() -> None:
         codex_refresh_token=codex_refresh_token,
         codex_client_id=codex_client_id,
         codex_account_id=codex_account_id,
+        umans_key=umans_key,
         interval_seconds=fetch_interval,
         failure_cap_seconds=failure_backoff_cap,
         token_store=token_store,

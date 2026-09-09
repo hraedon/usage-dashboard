@@ -489,6 +489,52 @@ class TestDashboardEndpoint:
 
         asyncio.run(_test())
 
+    def test_dashboard_wallet_capsule_follows_the_shared_rule(self, tmp_path):
+        # Plan 004: the wallet capsule renders when the umans reading has a
+        # detail, and disappears when the provider is unconfigured or offline
+        # (the same show/hide rule as the panel's corner line).
+        app, db = _create_app_with_db(
+            tmp_path,
+            configured_providers=[Provider.CLAUDE, Provider.UMANS],
+        )
+        db.store_reading(_make_reading(provider=Provider.CLAUDE))
+        db.store_reading(
+            _make_reading(
+                provider=Provider.UMANS,
+                session_percent=None,
+                session_resets_at=None,
+                weekly_percent=None,
+                weekly_resets_at=None,
+                detail="$15.94, promo: $7.14",
+            )
+        )
+
+        async def _test():
+            async with _client(app) as client:
+                response = await client.get("/dashboard")
+            assert response.status_code == 200
+            assert 'class="wallet"' in response.text
+            assert "Umans: $15.94, promo: $7.14" in response.text
+            # A capsule, not a card: the wallet is not a quota provider.
+            assert 'data-provider="umans"' not in response.text
+
+        asyncio.run(_test())
+
+    def test_dashboard_offline_wallet_renders_no_capsule(self, tmp_path):
+        # A configured-but-never-reported wallet is fabricated offline
+        # (WI-003); the capsule must hide rather than show an empty figure.
+        app, _db = _create_app_with_db(
+            tmp_path, configured_providers=[Provider.CLAUDE, Provider.UMANS]
+        )
+
+        async def _test():
+            async with _client(app) as client:
+                response = await client.get("/dashboard")
+            assert response.status_code == 200
+            assert 'class="wallet"' not in response.text
+
+        asyncio.run(_test())
+
     def test_dashboard_has_stable_order_human_names_and_folded_count(self, tmp_path):
         configured = [
             Provider.OPENCODE,

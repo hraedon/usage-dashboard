@@ -63,6 +63,12 @@ def _fleet(now: datetime) -> list[Reading]:
         _reading(Provider.CODEX, now, session_percent=None, session_resets_at=None),
         _reading(Provider.ZAI, now, detail="week req 1568 tok 183.0M"),
         _reading(Provider.OLLAMA, now),
+        _reading(
+            Provider.UMANS, now,
+            session_percent=None, session_resets_at=None,
+            weekly_percent=None, weekly_resets_at=None,
+            detail="$15.94, promo: $7.14",
+        ),
     ]
 
 
@@ -164,3 +170,43 @@ class TestDetailParity:
         now = _OFF_PEAK
         html_out = _render_dashboard_html(_fleet(now), now)
         assert "week req 1568 tok 183.0M" in html_out
+
+
+class TestWalletParity:
+    """Plan 004: the wallet balance is one line shown in both corners — the
+    panel's status band and the web header capsule — and must be the same
+    string with the same show/hide rules, or the WI-020/WI-030 gap reopens."""
+
+    def test_web_shows_the_wallet_line_the_panel_shows(self) -> None:
+        now = _OFF_PEAK
+        layout = build_main_layout(_fleet(now), _SIZE, now=now)
+        assert layout.wallet_text is not None, "fixture lost the umans reading"
+        html_out = _render_dashboard_html(_fleet(now), now)
+        assert 'class="wallet"' in html_out
+        assert layout.wallet_text in html_out
+
+    def test_offline_wallet_shows_neither_surface(self) -> None:
+        now = _OFF_PEAK
+        fleet = [
+            r for r in _fleet(now) if r.provider is not Provider.UMANS
+        ] + [
+            _reading(
+                Provider.UMANS, now,
+                status=ReadingStatus.OFFLINE, stale=True,
+                session_percent=None, session_resets_at=None,
+                weekly_percent=None, weekly_resets_at=None, detail=None,
+            ),
+        ]
+        layout = build_main_layout(fleet, _SIZE, now=now)
+        html_out = _render_dashboard_html(fleet, now)
+        assert layout.wallet_text is None
+        assert 'class="wallet"' not in html_out
+        assert "$15.94" not in html_out
+
+    def test_absent_wallet_shows_neither_surface(self) -> None:
+        now = _OFF_PEAK
+        fleet = [r for r in _fleet(now) if r.provider is not Provider.UMANS]
+        layout = build_main_layout(fleet, _SIZE, now=now)
+        html_out = _render_dashboard_html(fleet, now)
+        assert layout.wallet_text is None
+        assert 'class="wallet"' not in html_out

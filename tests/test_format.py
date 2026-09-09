@@ -16,6 +16,7 @@ from usage_dashboard.client.format import (
     percent_text,
     status_suffix,
     to_local,
+    umans_wallet_line,
 )
 from usage_dashboard.shared.models import Provider, Reading, ReadingStatus
 
@@ -164,3 +165,72 @@ class TestFormatInterval:
 
     def test_five_minutes(self) -> None:
         assert format_interval(300) == "5m"
+
+
+class TestUmansWalletLine:
+    """Plan 004: one show/hide + wording rule shared by the panel corner and
+    the web capsule, so the two surfaces cannot drift (WI-020/WI-030)."""
+
+    @staticmethod
+    def _umans(**over: object) -> Reading:
+        base = {
+            "provider": Provider.UMANS,
+            "status": ReadingStatus.CURRENT,
+            "session_percent": None,
+            "session_resets_at": None,
+            "weekly_percent": None,
+            "weekly_resets_at": None,
+            "fetched_at": datetime(2026, 9, 9, 4, 0, 0),
+            "stale": False,
+            "detail": "$15.94, promo: $7.14",
+        }
+        base.update(over)
+        return Reading(**base)  # type: ignore[arg-type]
+
+    def test_prefers_the_label_prefix(self) -> None:
+        assert umans_wallet_line([self._umans()]) == "Umans: $15.94, promo: $7.14"
+
+    def test_legacy_usage_detail_is_rejected(self) -> None:
+        # Pre-PR#22 production rows carry the retired trailing-usage line as
+        # their detail; showing one as a wallet balance would be worse than
+        # showing nothing (and the stale path preserves detail through an
+        # outage, so this must be refused, not outlived).
+        reading = self._umans(detail="24h req 1234 tok 5.6M")
+        assert umans_wallet_line([reading]) is None
+
+    def test_arbitrary_detail_is_rejected(self) -> None:
+        assert umans_wallet_line([self._umans(detail="hello")]) is None
+
+    def test_zero_balance_still_shows(self) -> None:
+        assert umans_wallet_line([self._umans(detail="$0.00")]) == "Umans: $0.00"
+
+    def test_thousands_separated_balance_shows(self) -> None:
+        assert umans_wallet_line([self._umans(detail="$1,234.56")]) == (
+            "Umans: $1,234.56"
+        )
+
+    def test_no_wallet_detail_shows(self) -> None:
+        assert umans_wallet_line([self._umans(detail="no wallet")]) == (
+            "Umans: no wallet"
+        )
+
+    def test_absent_reading_yields_none(self) -> None:
+        assert umans_wallet_line([]) is None
+
+    def test_offline_yields_none_even_with_a_detail(self) -> None:
+        reading = self._umans(status=ReadingStatus.OFFLINE, stale=True)
+        assert umans_wallet_line([reading]) is None
+
+    def test_empty_detail_yields_none(self) -> None:
+        assert umans_wallet_line([self._umans(detail=None)]) is None
+
+    def test_stale_still_shows_its_last_balance(self) -> None:
+        reading = self._umans(status=ReadingStatus.STALE, stale=True)
+        assert umans_wallet_line([reading]) == "Umans: $15.94, promo: $7.14"
+
+    def test_ignores_other_providers(self) -> None:
+        reading = self._umans()
+        reading_claude = _reading()
+        assert umans_wallet_line([reading_claude, reading]) == (
+            "Umans: $15.94, promo: $7.14"
+        )

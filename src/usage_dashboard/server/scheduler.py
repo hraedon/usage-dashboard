@@ -17,6 +17,7 @@ from usage_dashboard.server.fetch_types import (
     FetchError,
     FetchRateLimitError,
 )
+from usage_dashboard.server.fetch_umans import fetch_umans_wallet
 from usage_dashboard.server.fetch_zai import fetch_zai_usage
 from usage_dashboard.server.token_store import TokenStore
 from usage_dashboard.shared.models import (
@@ -85,6 +86,7 @@ class FetchScheduler:
         codex_refresh_token: str | None = None,
         codex_client_id: str | None = None,
         codex_account_id: str | None = None,
+        umans_key: str | None = None,
         interval_seconds: int = 300,
         offline_threshold: int = 24,
         rate_limit_default_seconds: int = 300,
@@ -123,6 +125,8 @@ class FetchScheduler:
         self._codex_refresh_token = codex_refresh_token
         self._codex_client_id = codex_client_id
         self._codex_account_id = codex_account_id
+        # Umans wallet (Plan 004): a key alone configures the provider.
+        self._umans_key = umans_key
         self._offline_threshold = offline_threshold
         self._rate_limit_default_seconds = rate_limit_default_seconds
         # The idle ladder widens the poll gap when a provider's reading is not
@@ -368,8 +372,9 @@ class FetchScheduler:
                     ),
                 )
             )
-        # Keep this block last: ``configured_providers`` promises ``Provider``
-        # enum order, and it is derived from this list.
+        # Keep these blocks in ``Provider`` enum order:
+        # ``configured_providers`` promises that order, and it is derived from
+        # this list. UMANS is the last enum member, so its block is last.
         if self._opencode_workspace_id and self._opencode_cookie:
             tasks.append(
                 (
@@ -380,6 +385,10 @@ class FetchScheduler:
                         self._opencode_cookie,
                     ),
                 )
+            )
+        if self._umans_key is not None:
+            tasks.append(
+                (Provider.UMANS, partial(fetch_umans_wallet, self._umans_key))
             )
         return tasks
 

@@ -121,6 +121,10 @@ class MainLayout:
     status_rect: Rect
     refresh_rect: Rect | None = None  # on-demand refresh tap target (WI-012)
     refresh_pending: bool = False  # True while a refresh POST is in flight
+    # Umans wallet corner line (Plan 004), e.g. "Umans: $16.32, promo: $7.14".
+    # Rendered right-aligned in the status band; None when the wallet provider
+    # is unconfigured, offline, or has no detail yet.
+    wallet_text: str | None = None
 
 
 @dataclass(frozen=True)
@@ -311,6 +315,13 @@ def _estimate_tile_overhead(size: tuple[int, int]) -> int:
     title_h = max(24, title_nominal * 3 // 4)
     # top: pad + title + pad//2;  bottom: pad
     return pad + title_h + pad // 2 + pad
+
+
+def _wallet_text(by_provider: dict[Provider, Reading]) -> str | None:
+    """The Umans wallet corner line (Plan 004), or None when there is nothing
+    honest to show. The rule lives in ``shared.format.umans_wallet_line`` so
+    the web header capsule renders the identical string (WI-020/WI-030)."""
+    return fmt.umans_wallet_line(by_provider.values())
 
 
 def build_main_layout(
@@ -520,6 +531,7 @@ def build_main_layout(
         status_rect=status_rect,
         refresh_rect=refresh_button_rect(status_rect),
         refresh_pending=refresh_pending,
+        wallet_text=_wallet_text(by_provider),
     )
 
 

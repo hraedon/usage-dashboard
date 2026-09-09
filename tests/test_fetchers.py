@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from email.utils import format_datetime
 from unittest.mock import MagicMock, patch
 
 import httpx
@@ -18,6 +19,7 @@ from usage_dashboard.server.fetch_types import (
     FetchError,
     FetchRateLimitError,
 )
+from usage_dashboard.server.fetch_umans import fetch_umans_wallet
 from usage_dashboard.server.fetch_zai import _format_tokens, fetch_zai_usage
 from usage_dashboard.shared.models import (
     ALERT_CRIT,
@@ -1507,3 +1509,210 @@ class TestFetchOpenCode:
         url, kwargs = client.get.call_args[0][0], client.get.call_args[1]
         assert url == "https://opencode.ai/workspace/wrk_TEST/go"
         assert kwargs["headers"]["Cookie"] == "auth=cookie-value"
+
+
+def _umans_wallet_response_data():
+    # Live response shape 2026-09-09 (amounts from the real endpoint; the key
+    # identity is a placeholder, as with wrk_TEST/acct-123 elsewhere in this
+    # file — this repo is public). The documented balance object carries only
+    # balanceCents/funded/asOf — no promo split has ever been observed; promo
+    # parsing is forward-looking.
+    return {
+        "wallet": {"owner": "user"},
+        "key": {
+            "id": "00000000-0000-0000-0000-000000000000",
+            "prefix": "umans_TEST",
+            "kind": "service_account",
+            "name": "OpenCode",
+        },
+        "scope": "mine",
+        "balance": {
+            "balanceCents": 1631.5388090000001,
+            "funded": True,
+            "asOf": "2026-09-09T04:10:53.460Z",
+        },
+        "spend": {
+            "last24hCents": 40.44652,
+            "last7dCents": 1663.099491,
+            "last30dCents": 3354.461191,
+        },
+        "usage30d": {
+            "requests": 9917,
+            "tokensIn": 27483369,
+            "tokensOut": 7740536,
+            "tokensCachedRead": 1213484271,
+        },
+        "breakdown": [
+            {
+                "model": "umans-deepseek-v4-flash-0731",
+                "keyName": "OpenCode",
+                "keyPrefix": "umans_FZMw",
+                "requests": 8327,
+                "spendCents": 3322.199708,
+            },
+        ],
+        "asOf": "2026-09-09T04:10:53.460Z",
+    }
+
+
+class TestFetchUmansWallet:
+    def _mock_get(self, mock_client_cls, data=None, status=200, headers=None,
+                  content=None):
+        mock_response = MagicMock()
+        if status >= 400:
+            request = httpx.Request("GET", "https://app.umans.ai/api/v1/wallet/summary")
+            if content is not None:
+                resp = httpx.Response(
+                    status, request=request, content=content, headers=headers
+                )
+                mock_response.json.side_effect = ValueError("not JSON")
+            else:
+                resp = httpx.Response(status, request=request, json=data,
+                                      headers=headers)
+                mock_response.json.return_value = data
+            mock_response.status_code = status
+            mock_response.content = resp.content
+            mock_response.headers = resp.headers
+            mock_response.raise_for_status.side_effect = httpx.HTTPStatusError(
+                "err", request=request, response=resp
+            )
+        else:
+            mock_response.status_code = 200
+            mock_response.content = b"{}"
+            mock_response.json.return_value = data
+            mock_response.raise_for_status = MagicMock()
+        mock_client = MagicMock()
+        mock_client.get.return_value = mock_response
+        mock_client.__enter__ = MagicMock(return_value=mock_client)
+        mock_client.__exit__ = MagicMock(return_value=False)
+        mock_client_cls.return_value = mock_client
+        return mock_client
+
+    @patch("usage_dashboard.server.fetch_umans.httpx.Client")
+    def test_parses_live_shape_to_a_quotaless_reading(self, mock_client_cls):
+        self._mock_get(mock_client_cls, _umans_wallet_response_data())
+        reading = fetch_umans_wallet("test-key")
+        assert reading.provider is Provider.UMANS
+        assert reading.status is ReadingStatus.CURRENT
+        assert reading.session_percent is None
+        assert reading.weekly_percent is None
+        assert reading.stale is False
+        assert reading.detail == "$16.32"
+
+    @patch("usage_dashboard.server.fetch_umans.httpx.Client")
+    def test_sends_bearer_key_to_the_dashboard_host(self, mock_client_cls):
+        client = self._mock_get(mock_client_cls, _umans_wallet_response_data())
+        fetch_umans_wallet("test-key")
+        url, kwargs = client.get.call_args[0][0], client.get.call_args[1]
+        assert url == "https://app.umans.ai/api/v1/wallet/summary"
+        assert kwargs["headers"]["Authorization"] == "Bearer test-key"
+
+    @patch("usage_dashboard.server.fetch_umans.httpx.Client")
+    def test_promo_cents_appends_the_promo_tail(self, mock_client_cls):
+        data = _umans_wallet_response_data()
+        data["balance"]["promoCents"] = 714.0
+        data["balance"]["balanceCents"] = 875.0
+        self._mock_get(mock_client_cls, data)
+        reading = fetch_umans_wallet("test-key")
+        assert reading.detail == "$8.75, promo: $7.14"
+
+    @patch("usage_dashboard.server.fetch_umans.httpx.Client")
+    def test_zero_or_missing_promo_shows_no_tail(self, mock_client_cls):
+        data = _umans_wallet_response_data()
+        data["balance"]["promoCents"] = 0
+        self._mock_get(mock_client_cls, data)
+        reading = fetch_umans_wallet("test-key")
+        assert reading.detail == "$16.32"
+
+    @patch("usage_dashboard.server.fetch_umans.httpx.Client")
+    def test_404_wallet_not_found_is_a_current_no_wallet_reading(self, mock_client_cls):
+        # An archived-plan key has no wallet behind it: a documented steady
+        # state (umans usage renders its plan view on it), not a failure to
+        # back off and retry forever.
+        self._mock_get(
+            mock_client_cls, {"error": "no wallet", "code": "wallet_not_found"},
+            status=404,
+        )
+        reading = fetch_umans_wallet("test-key")
+        assert reading.status is ReadingStatus.CURRENT
+        assert reading.detail == "no wallet"
+
+    @patch("usage_dashboard.server.fetch_umans.httpx.Client")
+    def test_401_raises_auth_error(self, mock_client_cls):
+        self._mock_get(
+            mock_client_cls, {"error": "Invalid or revoked API key",
+                              "code": "invalid_key"},
+            status=401,
+        )
+        with pytest.raises(FetchAuthError):
+            fetch_umans_wallet("bad-key")
+
+    @patch("usage_dashboard.server.fetch_umans.httpx.Client")
+    def test_403_raises_auth_error(self, mock_client_cls):
+        # e.g. a personal wallet key asking for scope=organization is rejected
+        # with 403; we never send scope, but any 403 is a credential problem.
+        self._mock_get(
+            mock_client_cls, {"error": "forbidden", "code": "scope_not_allowed"},
+            status=403,
+        )
+        with pytest.raises(FetchAuthError):
+            fetch_umans_wallet("test-key")
+
+    @patch("usage_dashboard.server.fetch_umans.httpx.Client")
+    def test_404_without_the_coded_body_is_a_fetch_error(self, mock_client_cls):
+        # A proxy/HTML 404 page is NOT the documented archived-plan state.
+        self._mock_get(mock_client_cls, content=b"<html>not found</html>",
+                       status=404)
+        with pytest.raises(FetchError) as excinfo:
+            fetch_umans_wallet("test-key")
+        assert not isinstance(excinfo.value, FetchAuthError)
+
+    @patch("usage_dashboard.server.fetch_umans.httpx.Client")
+    def test_404_with_uncoded_json_body_is_a_fetch_error(self, mock_client_cls):
+        self._mock_get(mock_client_cls, {"error": "nope"}, status=404)
+        with pytest.raises(FetchError):
+            fetch_umans_wallet("test-key")
+
+    @patch("usage_dashboard.server.fetch_umans.httpx.Client")
+    def test_429_raises_rate_limit_error_with_retry_after(self, mock_client_cls):
+        self._mock_get(mock_client_cls, {}, status=429, headers={"Retry-After": "120"})
+        with pytest.raises(FetchRateLimitError) as excinfo:
+            fetch_umans_wallet("test-key")
+        assert excinfo.value.retry_after_seconds == 120.0
+
+    @patch("usage_dashboard.server.fetch_umans.httpx.Client")
+    def test_429_httpdate_retry_after_parses(self, mock_client_cls):
+        # RFC 7231 allows an HTTP-date; a future date must become seconds.
+        retry_at = datetime.now(timezone.utc) + timedelta(hours=1)
+        self._mock_get(
+            mock_client_cls, {}, status=429,
+            headers={"Retry-After": format_datetime(retry_at)},
+        )
+        with pytest.raises(FetchRateLimitError) as excinfo:
+            fetch_umans_wallet("test-key")
+        assert excinfo.value.retry_after_seconds is not None
+        assert 3500 < excinfo.value.retry_after_seconds <= 3600
+
+    @patch("usage_dashboard.server.fetch_umans.httpx.Client")
+    def test_429_past_httpdate_yields_no_hint(self, mock_client_cls):
+        self._mock_get(
+            mock_client_cls, {}, status=429,
+            headers={"Retry-After": "Wed, 21 Oct 2015 07:28:00 GMT"},
+        )
+        with pytest.raises(FetchRateLimitError) as excinfo:
+            fetch_umans_wallet("test-key")
+        assert excinfo.value.retry_after_seconds is None
+
+    @patch("usage_dashboard.server.fetch_umans.httpx.Client")
+    def test_429_without_retry_after_yields_no_hint(self, mock_client_cls):
+        self._mock_get(mock_client_cls, {}, status=429)
+        with pytest.raises(FetchRateLimitError) as excinfo:
+            fetch_umans_wallet("test-key")
+        assert excinfo.value.retry_after_seconds is None
+
+    @patch("usage_dashboard.server.fetch_umans.httpx.Client")
+    def test_missing_balance_raises_fetch_error(self, mock_client_cls):
+        self._mock_get(mock_client_cls, {"wallet": {"owner": "user"}})
+        with pytest.raises(FetchError) as excinfo:
+            fetch_umans_wallet("test-key")
+        assert not isinstance(excinfo.value, FetchAuthError)

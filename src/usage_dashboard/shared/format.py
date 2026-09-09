@@ -10,6 +10,21 @@ and WI-020 before it).
 """
 from __future__ import annotations
 
+import re
+from collections.abc import Iterable
+
+from usage_dashboard.shared.models import Provider, Reading, ReadingStatus
+
+# The detail shapes fetch_umans_wallet can produce. Anything else is not
+# wallet data: the production DB still holds pre-PR#22 ``umans`` rows whose
+# detail is the retired trailing-usage line ("24h req 1234 tok 5.6M"), and
+# re-adding the enum member made those parse again. Presenting one of those
+# as a wallet balance would be worse than showing nothing — especially during
+# a wallet-fetch outage, where the stale path preserves the old detail.
+_WALLET_DETAIL_RE = re.compile(
+    r"^(?:\$\d[\d,]*\.\d{2}(?:, promo: \$\d[\d,]*\.\d{2})?|no wallet)$"
+)
+
 
 def format_duration(total_seconds: float) -> str:
     """Compact duration label: 45 -> '1m', 12240 -> '3h 24m', 176400 -> '2d 1h'.
@@ -26,3 +41,23 @@ def format_duration(total_seconds: float) -> str:
     if hours > 0:
         return f"{hours}h {minutes}m"
     return f"{max(1, minutes)}m"
+
+
+def umans_wallet_line(readings: Iterable[Reading]) -> str | None:
+    """The Umans wallet line (Plan 004): ``Umans: $15.94, promo: $7.14``.
+
+    One rule for both surfaces (the touch panel's corner line and the web
+    dashboard's header capsule), so they cannot drift the way WI-020/WI-030
+    did. The money text is formatted server-side in the reading's ``detail``;
+    this only prefixes the label, and only when the detail is actually
+    wallet-shaped (see ``_WALLET_DETAIL_RE``). Nothing honest to show —
+    provider absent, offline, no detail yet, or a non-wallet detail from a
+    pre-wallet legacy row — means None, and each surface then renders nothing
+    rather than a wrong figure presented as live.
+    """
+    reading = next((r for r in readings if r.provider is Provider.UMANS), None)
+    if reading is None or reading.status is ReadingStatus.OFFLINE:
+        return None
+    if reading.detail is None or not _WALLET_DETAIL_RE.match(reading.detail):
+        return None
+    return f"Umans: {reading.detail}"

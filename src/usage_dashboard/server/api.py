@@ -17,6 +17,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from usage_dashboard.server.db import Database
 from usage_dashboard.server.schedule_config import ScheduleConfig
 from usage_dashboard.server.scheduler import FetchScheduler
+from usage_dashboard.shared.format import umans_wallet_line
 from usage_dashboard.shared.models import (
     ALERT_CRIT,
     ALERT_WARN,
@@ -326,8 +327,20 @@ def _render_dashboard_html(readings: list[Reading], now: datetime) -> str:
     fetched = max((r.fetched_at for r in readings), default=now)
     provider_count = len(cards)
     provider_word = "provider" if provider_count == 1 else "providers"
+    # The Umans wallet capsule (Plan 004): the web counterpart of the touch
+    # panel's corner line. Same shared rule, same string — floated right so it
+    # sits in the header's corner the way the panel puts it in the status
+    # band's corner. A capsule, not a card: the wallet is a balance, not a
+    # quota provider with bars.
+    wallet_line = umans_wallet_line(readings)
+    wallet_pill = (
+        f'<span class="wallet">{html.escape(wallet_line)}</span>'
+        if wallet_line
+        else ""
+    )
     header = (
-        '<header><h1>AI Usage <span class="provider-count">'
+        f'<header><h1>AI Usage {wallet_pill}'
+        '<span class="provider-count">'
         f"{provider_count} {provider_word}</span></h1></header>"
     )
     footer = (
@@ -353,6 +366,15 @@ header h1 {{ margin:4px 4px 12px; font-size:1.1rem; font-weight:600;
    folded into the single Claude card below. */
 .provider-count {{ float:right; color:#969696; font-size:0.78rem; font-weight:400;
   letter-spacing:0; }}
+/* Umans wallet capsule (Plan 004) — the /dashboard twin of the panel's
+   corner line. Declared before .provider-count so, both being float:right,
+   the capsule takes the very corner and the count sits to its left. Bounded
+   so a long balance can't wrap the header on a phone. */
+.wallet {{ float:right; margin-left:10px; max-width:40vw; overflow:hidden;
+  text-overflow:ellipsis; white-space:nowrap; color:#ccc; background:#1c1c1c;
+  border:1px solid #333; border-radius:999px; padding:1px 10px;
+  font-size:0.72rem; font-weight:400; letter-spacing:0; line-height:1.6;
+  font-variant-numeric:tabular-nums; }}
 /* Fluid grid: 1 column on a phone, 2 on a tablet, up to 4 on a desktop,
    driven by the card min width — no per-device breakpoints needed. */
 .grid {{ display:grid; grid-template-columns:repeat(auto-fit,
