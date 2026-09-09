@@ -1,10 +1,12 @@
 # Plan 004 — Umans wallet tracking (Pi corner line)
 
-**Status:** implemented 2026-09-09 (branch `feat/umans-wallet`); verified live
-— server `/readings` carries the wallet reading from the real API
-(`detail: "$15.94"`), GUI frame captures at 1280×720 and 720×1280 show the
-corner line `Umans: $15.94, promo: $7.14` right-aligned in the status band,
-web `/dashboard` shows the same string as a header capsule. Work-item
+**Status:** implemented 2026-09-09 (branch `feat/umans-wallet`); verified
+live against the real API — server `/readings` carries the wallet reading
+(`detail: "$15.94"`, no promo tail: the live API exposes no promo field).
+The promo tail was exercised against the stub server, whose frame captures at
+1280×720 and 720×1280 show `Umans: $15.94, promo: $7.14` right-aligned in the
+status band; the web `/dashboard` capsule was checked the same way. Read the
+promo half as stub-verified, not live-verified. Work-item
 backfill pending: the agent-notes store is down (regista migrations 45–50
 pending across several project schemas; CLI refuses all operations as of
 2026-09-09) — this plan is the tracked entry per AGENTS.md until the store
