@@ -701,9 +701,25 @@ class DashboardGui:
             refresh.x - min(8, max(4, refresh.w // 3))
             if refresh is not None else sr.x + sr.w - status_x
         )
+        # Umans wallet corner line (Plan 004): right-aligned in the band,
+        # ending at the refresh target.  It claims at most 60% of the line;
+        # the status text and refresh feedback fit into whatever remains, so
+        # the two can never overlap no matter how long either string grows.
+        line_right = status_right
+        if layout.wallet_text:
+            wallet_max = max(0, int((status_right - status_x) * 0.6))
+            wallet_text = self._fit_text(
+                self._font_small, layout.wallet_text, wallet_max
+            )
+            if wallet_text:
+                wallet = self._font_small.render(wallet_text, True, fmt.GRAY)
+                wallet_x = status_right - wallet.get_width()
+                line_right = wallet_x - min(8, max(4, sr.w // 40))
+                wallet_y = sr.y + (sr.h - wallet.get_height()) // 2
+                self._screen.blit(wallet, (wallet_x, wallet_y))
         status = self._font_small.render(
             self._fit_text(self._font_small, layout.status_text,
-                           max(0, status_right - status_x)),
+                           max(0, line_right - status_x)),
             True, fmt.GRAY,
         )
         status_y = sr.y + (sr.h - status.get_height()) // 2
@@ -716,7 +732,7 @@ class DashboardGui:
             feedback_x = status_x + status.get_width() + min(8, max(4, sr.w // 40))
             feedback_text = self._fit_text(
                 self._font_small, f"· {feedback}",
-                max(0, status_right - feedback_x),
+                max(0, line_right - feedback_x),
             )
             if feedback_text:
                 fb = self._font_small.render(feedback_text, True, colour)

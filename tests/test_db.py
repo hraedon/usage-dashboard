@@ -539,7 +539,7 @@ class TestGetLatestReadingsResilience:
             db._conn.execute(
                 "INSERT INTO readings"
                 " (provider, status, fetched_at, stale, throttle, alert)"
-                " VALUES ('umans', 'current', ?, 0, 'none', 'none')",
+                " VALUES ('fable', 'current', ?, 0, 'none', 'none')",
                 (now.isoformat(),),
             )
             db._conn.commit()

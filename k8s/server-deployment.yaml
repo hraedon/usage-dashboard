@@ -124,6 +124,14 @@ spec:
                   name: server-secrets
                   key: codex-account-id
                   optional: true
+            # Umans wallet (Plan 004): the corner balance line on the Pi.
+            # Absent/empty secret key leaves the provider unconfigured.
+            - name: UMANS_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: server-secrets
+                  key: umans-api-key
+                  optional: true
             - name: FETCH_INTERVAL
               value: "300"
             - name: PORT

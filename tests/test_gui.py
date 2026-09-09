@@ -1063,3 +1063,64 @@ def test_refresh_feedback_expires() -> None:
         assert gui._refresh_feedback == ""  # cleared, not just hidden
     finally:
         pygame.display.quit()
+
+
+def test_wallet_line_renders_in_status_band_without_collision() -> None:
+    """The Umans wallet corner line (Plan 004) blits right-aligned in the
+    status band at every audited size, inside the band, and never overlapping
+    the status text (or the refresh feedback slot)."""
+
+    class _RecordingSurface(pygame.Surface):
+        """A real Surface (so pygame.draw accepts it) that records text blits."""
+
+        def __init__(self, size):
+            super().__init__(size)
+            self.blit_rects: list[pygame.Rect] = []
+
+        def blit(self, source, dest, **kwargs):  # type: ignore[override]
+            self.blit_rects.append(source.get_rect(topleft=dest))
+            return super().blit(source, dest, **kwargs)
+
+    umans = Reading(
+        provider=Provider.UMANS,
+        status=ReadingStatus.CURRENT,
+        session_percent=None,
+        weekly_percent=None,
+        session_resets_at=None,
+        weekly_resets_at=None,
+        fetched_at=_NOW,
+        stale=False,
+        detail="$8.75, promo: $7.14",
+    )
+    readings = [*_readings(), umans]
+    for size in _AUDIT_SIZES:
+        pygame.display.init()
+        pygame.font.init()
+        pygame.display.set_mode(size)
+        try:
+            gui = DashboardGui(_FakeFetcher(readings), size)  # type: ignore[arg-type]
+            layout = build_main_layout(
+                readings, size, tile_overhead=gui._tile_overhead,
+            )
+            assert layout.wallet_text == "Umans: $8.75, promo: $7.14"
+            recorder = _RecordingSurface(size)
+            gui._screen = recorder  # type: ignore[assignment]
+            gui._draw_main(layout)
+            gui._screen = pygame.display.get_surface()
+            sr = layout.status_rect
+            band = [
+                r for r in recorder.blit_rects
+                if r.y < sr.y + sr.h and r.y + r.h > sr.y
+            ]
+            assert len(band) == 2  # status text + wallet line, nothing else
+            for rect in band:
+                assert rect.x >= 0
+                assert rect.right <= size[0]
+            first, second = band
+            assert not first.colliderect(second)
+            # The wallet line is the right-most of the pair (corner).
+            rightmost = max(band, key=lambda r: r.right)
+            if layout.refresh_rect is not None:
+                assert rightmost.right <= layout.refresh_rect.x
+        finally:
+            pygame.display.quit()

@@ -17,6 +17,11 @@ class Provider(Enum):
     OLLAMA = "ollama"
     CODEX = "codex"
     OPENCODE = "opencode"
+    # The Umans Code prepaid wallet (Plan 004). Not a quota provider: the
+    # reading is quota-less and its ``detail`` carries the formatted balance
+    # ("$16.32" or "$16.32, promo: $7.14"). The touch layout gives it no tile
+    # — it renders as the status-bar corner line instead.
+    UMANS = "umans"
 
 
 # Claude-family providers that share the OAuth fetch/refresh machinery, mapped

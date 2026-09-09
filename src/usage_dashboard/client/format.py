@@ -8,11 +8,18 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-# format_duration is re-exported so client call sites keep reading
-# `fmt.format_duration(...)`. It lives in shared/ because the web dashboard
-# renders the same durations — it was a byte-identical copy of
-# server/api._countdown_short until WI-030.
-from usage_dashboard.shared.format import format_duration  # noqa: F401
+# format_duration and umans_wallet_line are re-exported so client call sites
+# keep reading `fmt.format_duration(...)` / `fmt.umans_wallet_line(...)`. They
+# live in shared/ because the web dashboard renders the same strings —
+# format_duration was a byte-identical copy of server/api._countdown_short
+# until WI-030, and the wallet line was written there first for the same
+# reason (Plan 004).
+from usage_dashboard.shared.format import (
+    format_duration as format_duration,
+)
+from usage_dashboard.shared.format import (
+    umans_wallet_line as umans_wallet_line,
+)
 from usage_dashboard.shared.models import Reading, ReadingStatus
 
 # Colour palette (RGB), matching the web dashboard's thresholds.

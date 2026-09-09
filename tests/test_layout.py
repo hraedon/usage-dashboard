@@ -772,3 +772,59 @@ def test_non_zai_subtitle_stays_neutral():
     for tile in layout.tiles:
         if tile.provider is not Provider.ZAI:
             assert tile.subtitle_color == fmt.GRAY
+
+
+class TestWalletLine:
+    """The Umans wallet corner line (Plan 004): a status-band text, not a tile."""
+
+    def test_wallet_reading_gets_a_prefixed_line_and_no_tile(self) -> None:
+        readings = _all_configured() + [
+            _reading(Provider.UMANS, session_percent=None, weekly_percent=None,
+                     detail="$8.75, promo: $7.14"),
+        ]
+        layout = build_main_layout(readings, _SIZE, now=_NOW)
+        assert layout.wallet_text == "Umans: $8.75, promo: $7.14"
+        # The wallet is a balance, not a quota: the tile grid must not grow.
+        assert all(t.provider is not Provider.UMANS for t in layout.tiles)
+        assert hit_test(layout, (10, 10)) is not Provider.UMANS
+
+    def test_balance_only_detail_gets_no_promo_tail(self) -> None:
+        readings = _all_configured() + [
+            _reading(Provider.UMANS, session_percent=None, weekly_percent=None,
+                     detail="$16.32"),
+        ]
+        layout = build_main_layout(readings, _SIZE, now=_NOW)
+        assert layout.wallet_text == "Umans: $16.32"
+
+    def test_legacy_usage_detail_yields_no_line(self) -> None:
+        # Pre-PR#22 rows for the provider carry the retired usage-line text in
+        # detail; the wallet line must refuse to present that as a balance.
+        readings = _all_configured() + [
+            _reading(Provider.UMANS, session_percent=None, weekly_percent=None,
+                     detail="24h req 1234 tok 5.6M"),
+        ]
+        layout = build_main_layout(readings, _SIZE, now=_NOW)
+        assert layout.wallet_text is None
+
+    def test_absent_wallet_reading_yields_no_line(self) -> None:
+        layout = build_main_layout(_all_configured(), _SIZE, now=_NOW)
+        assert layout.wallet_text is None
+
+    def test_offline_wallet_yields_no_line(self) -> None:
+        # An offline wallet carries no trustworthy figure: the line disappears
+        # rather than presenting a dead balance as live.
+        readings = _all_configured() + [
+            _reading(Provider.UMANS, status=ReadingStatus.OFFLINE, stale=True,
+                     session_percent=None, weekly_percent=None, detail=None),
+        ]
+        layout = build_main_layout(readings, _SIZE, now=_NOW)
+        assert layout.wallet_text is None
+
+    def test_stale_wallet_still_shows_its_last_balance(self) -> None:
+        readings = _all_configured() + [
+            _reading(Provider.UMANS, status=ReadingStatus.STALE, stale=True,
+                     session_percent=None, weekly_percent=None,
+                     detail="$16.32"),
+        ]
+        layout = build_main_layout(readings, _SIZE, now=_NOW)
+        assert layout.wallet_text == "Umans: $16.32"
