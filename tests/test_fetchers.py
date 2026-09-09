@@ -1512,14 +1512,16 @@ class TestFetchOpenCode:
 
 
 def _umans_wallet_response_data():
-    # Live response shape 2026-09-09 (values from the real endpoint). The
-    # documented balance object carries only balanceCents/funded/asOf — no
-    # promo split has ever been observed; promo parsing is forward-looking.
+    # Live response shape 2026-09-09 (amounts from the real endpoint; the key
+    # identity is a placeholder, as with wrk_TEST/acct-123 elsewhere in this
+    # file — this repo is public). The documented balance object carries only
+    # balanceCents/funded/asOf — no promo split has ever been observed; promo
+    # parsing is forward-looking.
     return {
         "wallet": {"owner": "user"},
         "key": {
-            "id": "14cd333d-b5bd-46cf-b3ca-b38076b6e643",
-            "prefix": "umans_FZMw",
+            "id": "00000000-0000-0000-0000-000000000000",
+            "prefix": "umans_TEST",
             "kind": "service_account",
             "name": "OpenCode",
         },
