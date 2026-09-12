@@ -996,7 +996,7 @@ class TestVersionedApiSurface:
         app, _db = _create_app_with_db(tmp_path)
         paths = set(app.openapi().get("paths") or {})
         versioned = {p for p in paths if p.startswith(API_V1_PREFIX)}
-        # Plan 004 introduces a new API with no pre-versioning clients. Keep
+        # Plan 005 introduces a new API with no pre-versioning clients. Keep
         # this exception exact: every other route still requires its alias.
         versioned_only = {"/api/v1/agent/capacity"}
         assert versioned_only <= paths

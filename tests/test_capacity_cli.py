@@ -5,6 +5,7 @@ import sys
 from unittest.mock import MagicMock, patch
 
 import httpx
+import pytest
 
 from usage_dashboard.cli import _capacity_url, capacity, main
 
@@ -117,6 +118,22 @@ def test_capacity_hides_transport_diagnostics(monkeypatch, capsys) -> None:
     with patch("usage_dashboard.cli.httpx.Client", return_value=client):
         assert capacity() == 1
 
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.strip() == "capacity: capacity request failed"
+
+
+@pytest.mark.parametrize("error", [
+    httpx.InvalidURL("private endpoint diagnostic"),
+    UnicodeEncodeError("ascii", "private-token-\u00e9", 14, 15, "ordinal out of range"),
+])
+def test_capacity_hides_request_construction_errors(monkeypatch, capsys, error):
+    monkeypatch.setenv("USAGE_DASHBOARD_URL", "https://dashboard.example")
+    monkeypatch.setenv("USAGE_DASHBOARD_AGENT_TOKEN", "secret")
+    client = client_for(response(200, snapshot()))
+    client.get.side_effect = error
+    with patch("usage_dashboard.cli.httpx.Client", return_value=client):
+        assert capacity() == 1
     captured = capsys.readouterr()
     assert captured.out == ""
     assert captured.err.strip() == "capacity: capacity request failed"

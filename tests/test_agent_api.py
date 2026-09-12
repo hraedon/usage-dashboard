@@ -128,6 +128,37 @@ def test_naive_utc_and_offset_timestamps_compare_consistently():
     assert assess(value, NOW.astimezone(timezone(timedelta(hours=5)))).age_seconds == 60
 
 
+@pytest.mark.parametrize("offset_hours", [-7, 5.5])
+def test_database_round_trip_preserves_capacity_instants(tmp_path, offset_hours):
+    db = Database(str(tmp_path / "offsets.db"))
+    db.initialize()
+    offset = timezone(timedelta(hours=offset_hours))
+    value = reading(
+        fetched_at=(NOW - timedelta(seconds=60)).astimezone(offset),
+        session_resets_at=(NOW + timedelta(hours=1)).astimezone(offset),
+        weekly_resets_at=(NOW + timedelta(days=1)).astimezone(offset),
+    )
+    db.store_reading(value)
+    restored = db.get_latest_readings()[Provider.CLAUDE]
+    assert assess(restored) == assess(value)
+
+
+def test_api_does_not_turn_elapsed_offset_reset_into_headroom(api):
+    app, db, _scheduler = api
+    now = datetime.now(timezone.utc)
+    db.store_reading(reading(
+        fetched_at=now - timedelta(seconds=60),
+        session_resets_at=(now - timedelta(minutes=5)).astimezone(
+            timezone(timedelta(hours=5))
+        ),
+        weekly_resets_at=now + timedelta(days=1),
+    ))
+    account = request(app).json()["accounts"][0]
+    assert account["freshness"] == "fresh"
+    assert account["assessment"] == "unknown"
+    assert account["windows"][0]["reasons"] == ["reset_elapsed"]
+
+
 @pytest.fixture
 def api(tmp_path):
     db = Database(str(tmp_path / "agents.db"))
@@ -205,7 +236,8 @@ def test_filter_errors_and_no_legacy_alias(api):
     filtered = request(app, "/api/v1/agent/capacity?account=claude_work")
     assert [a["account_id"] for a in filtered.json()["accounts"]] == ["claude_work"]
     assert request(app, "/api/v1/agent/capacity?account=ollama").status_code == 404
-    assert request(app, "/api/v1/agent/capacity?account=umans").status_code == 422
+    assert request(app, "/api/v1/agent/capacity?account=umans").status_code == 404
+    assert request(app, "/api/v1/agent/capacity?account=nonexistent").status_code == 422
     for age in ("0", "86401", "nan"):
         assert request(app, f"/api/v1/agent/capacity?max_age_seconds={age}").status_code == 422
     assert request(app, "/agent/capacity").status_code == 404
@@ -231,3 +263,48 @@ def test_openapi_defines_authenticated_typed_contract(api):
     assert operation["x-exposure"] == "external"
     assert operation["responses"]["200"]["content"]["application/json"]["schema"]["$ref"]
     assert "AccountCapacity" in schema["components"]["schemas"]
+
+
+@pytest.mark.parametrize("detail", ["$16.32", "$0.00", "no wallet"])
+def test_umans_wallet_is_not_inferred_as_quota_or_spending_permission(api, detail):
+    _app, db, scheduler = api
+    app = create_app(
+        "operator-test", db, configured_providers=[Provider.UMANS],
+        scheduler=scheduler, agent_api_key="agent-test",
+    )
+    db.store_reading(reading(
+        provider=Provider.UMANS, fetched_at=datetime.now(timezone.utc),
+        session_percent=None, session_resets_at=None,
+        weekly_percent=None, weekly_resets_at=None, detail=detail,
+    ))
+    response = request(app, "/api/v1/agent/capacity?account=umans")
+    assert response.status_code == 200
+    account = response.json()["accounts"][0]
+    assert account["account_id"] == "umans"
+    assert account["freshness"] == "fresh"
+    assert account["assessment"] == "unknown"
+    assert account["reasons"] == ["no_reported_limits"]
+    assert account["windows"] == []
+    assert detail not in response.text
+    scheduler.fetch_now.assert_not_called()
+
+
+@pytest.mark.parametrize("prefix", ["", "/api/v1"])
+@pytest.mark.parametrize("endpoint,method", [
+    ("/readings", "GET"), ("/history?provider=claude", "GET"),
+    ("/schedule", "GET"), ("/refresh", "POST"),
+])
+def test_read_only_credential_refuses_every_operator_alias(api, prefix, endpoint, method):
+    app, _db, scheduler = api
+    assert request(app, prefix + endpoint, method=method).status_code == 401
+    scheduler.fetch_now.assert_not_called()
+
+
+def test_capacity_queries_leave_database_and_scheduler_unchanged(api):
+    app, db, scheduler = api
+    db.store_reading(reading())
+    before = list(db._conn.iterdump())
+    for query in ("", "?account=claude", "?max_age_seconds=30"):
+        assert request(app, "/api/v1/agent/capacity" + query).status_code == 200
+    assert list(db._conn.iterdump()) == before
+    assert scheduler.mock_calls == []

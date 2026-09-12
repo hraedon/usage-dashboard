@@ -713,7 +713,9 @@ def _fetch_capacity(
                 headers={"Authorization": f"Bearer {token}"},
                 params=params,
             )
-    except httpx.HTTPError as exc:
+    except (httpx.HTTPError, httpx.InvalidURL, UnicodeError) as exc:
+        # URL/header construction can fail before HTTPX creates a request.
+        # Keep those diagnostics out of stderr too: they may include the key.
         raise _CapacityCommandError("capacity request failed") from exc
 
     if response.status_code != 200:

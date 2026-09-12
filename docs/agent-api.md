@@ -20,9 +20,11 @@ shared read-only credential, not per-agent identity or account-level grants.
 ## Request
 
 - `account`: optional exact configured account ID (`claude`, `claude_work`,
-  `codex`, `zai`, `ollama`, `opencode`). Omit for all configured accounts.
-  `claude` and `claude_work` remain separate. Umans is not currently a supported
-  dashboard account; no balance is fabricated.
+  `codex`, `zai`, `ollama`, `opencode`, `umans`). Omit for all configured accounts.
+  `claude` and `claude_work` remain separate. Umans is a metered wallet, with no
+  quota windows: its assessment is `unknown` with `no_reported_limits` when
+  fresh. The display's formatted balance is not parsed or exposed by this API,
+  and neither a positive nor a zero balance authorizes or forbids spending here.
 - `max_age_seconds`: acceptable observation age, default 2100, range 30–86400.
   This controls trust in observations, not collection frequency. A larger value
   accepts older evidence; it cannot increase actual capacity.

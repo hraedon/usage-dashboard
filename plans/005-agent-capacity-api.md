@@ -1,16 +1,36 @@
-# Plan 004 — Agent capacity API
+# Plan 005 — Agent capacity API
 
-Status: implemented on `feat/agent-capacity-api`; not deployed. The API and CLI
+Status: integrated with current wallet support on
+`work/agent-capacity-integration-20260912`; not deployed. Originally implemented
+as commit `a64d814` on `feat/agent-capacity-api`. Renumbered from Plan 004 to
+preserve the wallet plan that subsequently landed on main. The API and CLI
 received a separate Sol-agent review (not an independent-lineage assurance
 claim). Review corrections cover OpenCode's account-wide monthly window,
 freshness aligned with the standard idle polling cadence, shared credential
 comparison, and keeping age-policy validation on the server.
 
-Local validation: 681 tests passed with the worktree source on `PYTHONPATH` and
+Original branch validation: 681 tests passed with the worktree source on `PYTHONPATH` and
 SDL dummy drivers; ruff, strict mypy (31 source files), and `git diff --check`
 passed. Existing asyncio refresh tests stalled in the sandbox, so the complete
 suite was run outside it. No live provider fetch, deployment, or remote CI
 qualification is claimed.
+
+Integration review (2026-09-12): preserved wallet rendering and the operator
+API aliases; updated Umans query semantics to distinguish unconfigured (404)
+from invalid account (422). A configured wallet has unknown quota capacity;
+formatted balances are never interpreted as quota or permission to spend.
+
+Regression tests reproduced a shared timestamp parser defect: dropping a
+non-UTC offset could turn an elapsed reset into future headroom after a SQLite
+round trip. The parser now converts to UTC before removing timezone information.
+Tests cover both offset directions, half-hour offsets, scoped resets and a real
+database/API round trip. The CLI handles URL/header construction failures with
+the same short, credential-free diagnostic as transport failures.
+
+Qualification also exercises the real HTTP server and CLI subprocess, both
+credential scopes, account filters, unknown/blocked outcomes and query errors.
+All fixtures are synthetic and the server has no provider scheduler. Validation
+results for the integrated revision are recorded in `docs/agent-api-validation.md`.
 
 Owner request: 2026-09-05, provide a dedicated API so agents do not scrape the
 dashboard or obtain data/credentials from Kubernetes.
@@ -43,5 +63,6 @@ Follow-on under the owner's estate-improvement authorization: ship
 operator-provided URL and token from environment variables. Do not duplicate the
 server's policy or introduce a scheduler in the client.
 
-Deferred: plan metadata, Umans fetcher, empirical duration/consumption estimates,
+Deferred: plan metadata, structured wallet amounts in the agent API,
+empirical duration/consumption estimates,
 MCP wrappers, account-specific access grants and coordinator admission.
