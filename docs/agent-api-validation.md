@@ -34,8 +34,18 @@ the test server has no provider scheduler or provider credentials.
   HTTP/CLI integration; the two additional CLI construction-error cases also
   pass in the subsequent 11-test CLI run. Ruff and strict mypy pass.
 - `git diff --check` passes.
+- Installed wheel from committed source
+  `b7ac032931fa579888a8d53f0c2e97c9e9499b9c`: **131 focused tests passed**,
+  including the six real HTTP/CLI tests. The wheel was installed into a fresh
+  Python 3.12 environment with locked dependencies, outside the checkout and
+  without `PYTHONPATH`. An explicit assertion confirmed the capacity module
+  loaded from that environment's `site-packages`.
+- Wheel SHA-256:
+  `685c068a262c660f8255e0e92563770fa42fd3e54a30063808e66ecfdb7169e0`.
+- Configured identifier checks pass for the tracked tree and commit messages;
+  the publication owner/author check passes.
 
-Installed-wheel and remote CI evidence will be recorded after their runs.
+Remote CI is reported on the pull request against its current head.
 These checks do not establish live provider accuracy, a deployed endpoint,
 credential provisioning, Pi fleet behavior, or sufficient capacity to finish
 a job. The endpoint assesses reported limits only and never reserves quota.
