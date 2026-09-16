@@ -984,7 +984,7 @@ class TestVersionedApiSurface:
 
         asyncio.run(_test())
 
-    def test_every_authed_route_has_a_versioned_twin(self, tmp_path):
+    def test_legacy_api_keeps_twins_and_new_agent_api_is_versioned_only(self, tmp_path):
         # Derived from the app, so a route added to only one mount is caught
         # rather than depending on this test's hardcoded list staying current.
         #
@@ -996,7 +996,12 @@ class TestVersionedApiSurface:
         app, _db = _create_app_with_db(tmp_path)
         paths = set(app.openapi().get("paths") or {})
         versioned = {p for p in paths if p.startswith(API_V1_PREFIX)}
-        legacy_of = {p[len(API_V1_PREFIX):] for p in versioned}
+        # Plan 005 introduces a new API with no pre-versioning clients. Keep
+        # this exception exact: every other route still requires its alias.
+        versioned_only = {"/api/v1/agent/capacity"}
+        assert versioned_only <= paths
+        assert not {p[len(API_V1_PREFIX):] for p in versioned_only} & paths
+        legacy_of = {p[len(API_V1_PREFIX):] for p in versioned - versioned_only}
         assert legacy_of <= paths, (
             f"versioned routes with no legacy alias: {sorted(legacy_of - paths)}"
         )

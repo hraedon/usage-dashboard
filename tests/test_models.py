@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from datetime import datetime
 
+import pytest
+
 from usage_dashboard.shared.models import (
     ALERT_NONE,
     ALERT_WARN,
@@ -9,6 +11,7 @@ from usage_dashboard.shared.models import (
     Provider,
     Reading,
     ReadingStatus,
+    ScopedLimit,
     make_offline_reading,
     make_stale_reading,
 )
@@ -59,6 +62,23 @@ def test_reading_from_dict_parses_datetime():
     assert restored.session_resets_at == datetime(2026, 1, 15, 10, 0, 0)
     assert restored.weekly_resets_at == datetime(2026, 1, 19, 0, 0, 0)
     assert restored.fetched_at == datetime(2026, 1, 14, 12, 0, 0)
+
+
+@pytest.mark.parametrize("stamp", [
+    "2026-01-14T12:00:00Z", "2026-01-14T12:00:00",
+    "2026-01-14T05:00:00-07:00", "2026-01-14T17:30:00+05:30",
+])
+def test_reading_deserialization_normalizes_all_instants_to_naive_utc(stamp):
+    data = _make_reading().to_dict()
+    for field in ("fetched_at", "session_resets_at", "weekly_resets_at"):
+        data[field] = stamp
+    data["scoped_limits"] = [{"name": "Model", "percent": 20, "resets_at": stamp}]
+    result = Reading.from_dict(data)
+    expected = datetime(2026, 1, 14, 12)
+    assert result.fetched_at == expected
+    assert result.session_resets_at == expected
+    assert result.weekly_resets_at == expected
+    assert result.scoped_limits == [ScopedLimit("Model", 20, expected)]
 
 
 def test_reading_to_dict_none_fields():

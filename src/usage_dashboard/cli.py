@@ -1,7 +1,7 @@
 """CLI entry point for usage-dashboard.
 
-Provides the `usage-dashboard login claude` command for minting a dedicated
-OAuth token pair via the Authorization Code + PKCE flow.
+Provides provider login commands and the `usage-dashboard capacity` command
+for reading the server's authenticated agent capacity snapshot.
 """
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ import hashlib
 import http.server
 import json
 import logging
+import os
 import re
 import secrets
 import string
@@ -42,6 +43,9 @@ _CLAUDE_SCOPES = "user:inference user:profile user:sessions:claude_code user:mcp
 _MANUAL_REDIRECT_URI = "https://platform.claude.com/oauth/code/callback"
 _CLAUDE_TIMEOUT = 120.0
 _TIMEOUT = 30.0  # codex login exchange
+_CAPACITY_TIMEOUT = 15.0
+_CAPACITY_PATH = "/api/v1/agent/capacity"
+_CAPACITY_SCHEMA = "agent-capacity-v1"
 
 # PKCE verifier: unreserved chars per RFC 7636 (A-Z a-z 0-9 - . _ ~)
 _VERIFIER_CHARS = string.ascii_letters + string.digits + "-._~"
@@ -659,6 +663,95 @@ def login_codex(port: int | None = None, no_browser: bool = False) -> None:
     print("  kubectl -n usage-dashboard rollout restart deploy/usage-dashboard-server")
 
 
+class _CapacityCommandError(Exception):
+    """A safe, user-facing capacity command failure."""
+
+
+def _capacity_url(raw_url: str) -> str:
+    """Build the capacity endpoint from a dashboard origin.
+
+    The documented value is an origin, but accepting a trailing ``/api/v1``
+    makes the command less surprising when copied from an API URL. Other
+    paths, credentials, schemes, query strings and fragments are rejected.
+    """
+    value = raw_url.strip()
+    if not value:
+        raise _CapacityCommandError("USAGE_DASHBOARD_URL is required")
+    try:
+        parsed = urlparse(value)
+        hostname = parsed.hostname
+        parsed.port  # Validate malformed ports while the URL is available.
+    except ValueError as exc:
+        raise _CapacityCommandError("USAGE_DASHBOARD_URL is invalid") from exc
+    if parsed.scheme.lower() not in {"http", "https"} or not hostname:
+        raise _CapacityCommandError("USAGE_DASHBOARD_URL must be an HTTP(S) URL")
+    if parsed.username is not None or parsed.password is not None:
+        raise _CapacityCommandError("USAGE_DASHBOARD_URL must not contain credentials")
+    if parsed.query or parsed.fragment:
+        raise _CapacityCommandError("USAGE_DASHBOARD_URL must not contain a query or fragment")
+    path = parsed.path.rstrip("/")
+    if path not in {"", "/api/v1"}:
+        raise _CapacityCommandError("USAGE_DASHBOARD_URL must be an origin or end in /api/v1")
+    return f"{parsed.scheme.lower()}://{parsed.netloc}{_CAPACITY_PATH}"
+
+
+def _fetch_capacity(
+    endpoint: str,
+    token: str,
+    account: str | None,
+    max_age_seconds: int | None,
+) -> dict[str, Any]:
+    params: dict[str, str | int] = {}
+    if account is not None:
+        params["account"] = account
+    if max_age_seconds is not None:
+        params["max_age_seconds"] = max_age_seconds
+    try:
+        with httpx.Client(timeout=_CAPACITY_TIMEOUT) as client:
+            response = client.get(
+                endpoint,
+                headers={"Authorization": f"Bearer {token}"},
+                params=params,
+            )
+    except (httpx.HTTPError, httpx.InvalidURL, UnicodeError) as exc:
+        # URL/header construction can fail before HTTPX creates a request.
+        # Keep those diagnostics out of stderr too: they may include the key.
+        raise _CapacityCommandError("capacity request failed") from exc
+
+    if response.status_code != 200:
+        raise _CapacityCommandError(f"capacity server returned HTTP {response.status_code}")
+    try:
+        body = response.json()
+    except (TypeError, ValueError) as exc:
+        raise _CapacityCommandError("capacity server returned invalid JSON") from exc
+    if not isinstance(body, dict):
+        raise _CapacityCommandError("capacity server returned an unsupported response")
+    if body.get("schema_version") != _CAPACITY_SCHEMA:
+        raise _CapacityCommandError("capacity server returned an unsupported schema")
+    return body
+
+
+def capacity(
+    account: str | None = None,
+    max_age_seconds: int | None = None,
+) -> int:
+    """Print one authenticated capacity snapshot and return a process status."""
+    dashboard_url = os.environ.get("USAGE_DASHBOARD_URL", "")
+    token = os.environ.get("USAGE_DASHBOARD_AGENT_TOKEN", "")
+    if not token:
+        print("capacity: USAGE_DASHBOARD_AGENT_TOKEN is required", file=sys.stderr)
+        return 1
+    try:
+        endpoint = _capacity_url(dashboard_url)
+        snapshot = _fetch_capacity(endpoint, token, account, max_age_seconds)
+    except _CapacityCommandError as exc:
+        print(f"capacity: {exc}", file=sys.stderr)
+        return 1
+    json.dump(snapshot, sys.stdout, sort_keys=True)
+    sys.stdout.write("\n")
+    return 0
+
+
 def main() -> None:
     logging.basicConfig(
         level=logging.INFO,
@@ -701,6 +794,21 @@ def main() -> None:
         help="[ollama|opencode] Skip fetching the usage page to validate the cookie",
     )
 
+    capacity_parser = sub.add_parser(
+        "capacity", help="Read the authenticated agent capacity snapshot"
+    )
+    capacity_parser.add_argument(
+        "--account",
+        default=None,
+        help="Return capacity for one configured account ID",
+    )
+    capacity_parser.add_argument(
+        "--max-age-seconds",
+        default=None,
+        type=int,
+        help="Maximum accepted observation age; server validates supported bounds",
+    )
+
     args = parser.parse_args()
 
     if args.command == "login":
@@ -712,6 +820,8 @@ def main() -> None:
             login_opencode(headless=args.headless, verify=not args.no_verify)
         elif args.provider == "codex":
             login_codex(port=args.port, no_browser=args.no_browser)
+    elif args.command == "capacity":
+        raise SystemExit(capacity(account=args.account, max_age_seconds=args.max_age_seconds))
     else:
         parser.print_help()
         sys.exit(1)

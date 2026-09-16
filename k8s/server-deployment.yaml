@@ -27,6 +27,12 @@ spec:
                 secretKeyRef:
                   name: server-secrets
                   key: api-key
+            - name: AGENT_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: server-secrets
+                  key: agent-api-key
+                  optional: true
             - name: DB_PATH
               value: "/data/readings.db"
             - name: CLAUDE_TOKEN

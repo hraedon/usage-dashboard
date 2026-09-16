@@ -152,11 +152,16 @@ def _format_dt(dt: datetime | None) -> str | None:
 def _parse_dt(value: str | None) -> datetime | None:
     if value is None:
         return None
-    return datetime.fromisoformat(value.replace("Z", "+00:00")).replace(tzinfo=None)
+    return _parse_required_dt(value)
 
 
 def _parse_required_dt(value: str) -> datetime:
-    return datetime.fromisoformat(value.replace("Z", "+00:00")).replace(tzinfo=None)
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    # Readings use naive UTC internally. Convert an explicit offset before
+    # dropping it; otherwise a DB round trip changes observation/reset times.
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(timezone.utc)
+    return parsed.replace(tzinfo=None)
 
 
 @dataclass(frozen=True, slots=True)

@@ -10,10 +10,16 @@ from collections.abc import Callable, Iterable
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from fastapi import APIRouter, Depends, FastAPI, HTTPException
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Response
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
+from usage_dashboard.server.capacity import (
+    DEFAULT_MAX_AGE_SECONDS,
+    CapacitySnapshot,
+    account_capacity,
+    timestamp,
+)
 from usage_dashboard.server.db import Database
 from usage_dashboard.server.schedule_config import ScheduleConfig
 from usage_dashboard.server.scheduler import FetchScheduler
@@ -426,6 +432,12 @@ footer {{ text-align:center; color:#555; font-size:0.7rem; margin-top:12px; }}
 </html>"""
 
 
+def _same_api_key(supplied: str, expected: str) -> bool:
+    # Compare bytes so non-ASCII input cannot turn an auth refusal into a
+    # TypeError. This also keeps both credential surfaces on one comparison.
+    return hmac.compare_digest(supplied.encode("utf-8"), expected.encode("utf-8"))
+
+
 def _make_auth_dependency(
     api_key: str,
 ) -> Callable[..., Any]:
@@ -434,7 +446,7 @@ def _make_auth_dependency(
     ) -> str:
         if credentials is None:
             raise HTTPException(status_code=401)
-        if not hmac.compare_digest(credentials.credentials, api_key):
+        if not _same_api_key(credentials.credentials, api_key):
             raise HTTPException(status_code=401)
         return credentials.credentials
 
@@ -447,12 +459,25 @@ def create_app(
     configured_providers: Iterable[Provider] | None = None,
     schedule_config: ScheduleConfig | None = None,
     scheduler: FetchScheduler | None = None,
+    agent_api_key: str | None = None,
 ) -> FastAPI:
+    if agent_api_key and _same_api_key(agent_api_key, api_key):
+        raise ValueError("AGENT_API_KEY must differ from API_KEY to remain read-only")
     app = FastAPI()
     auth = _make_auth_dependency(api_key)
     # Authenticated routes live on this router so they can be mounted at both
     # /api/v1 and the legacy root paths from a single definition.
     api = APIRouter()
+    agent_api = APIRouter()
+
+    async def agent_auth(
+        credentials: HTTPAuthorizationCredentials | None = Depends(_bearer_scheme),
+    ) -> None:
+        supplied = credentials.credentials if credentials is not None else ""
+        full_access = bool(supplied) and _same_api_key(supplied, api_key)
+        read_only = bool(agent_api_key) and _same_api_key(supplied, agent_api_key or "")
+        if not (full_access or read_only):
+            raise HTTPException(status_code=401)
 
     # Only report providers that are actually configured. A provider that was
     # never configured is omitted entirely rather than fabricated as "offline",
@@ -471,6 +496,30 @@ def create_app(
             readings.get(provider) or make_offline_reading(provider, now)
             for provider in providers
         ]
+
+    @agent_api.get("/agent/capacity", tags=["agents"], **EXTERNAL)
+    async def get_agent_capacity(
+        response: Response,
+        account: Provider | None = None,
+        max_age_seconds: int = Query(default=DEFAULT_MAX_AGE_SECONDS, ge=30, le=86400),
+        _user: None = Depends(agent_auth),
+    ) -> CapacitySnapshot:
+        """Assess cached reported limits; does not reserve quota or predict job completion."""
+        if account is not None and account not in providers:
+            raise HTTPException(status_code=404, detail="account_not_configured")
+        selected = [account] if account is not None else providers
+        now = datetime.now(timezone.utc)
+        readings = db.get_latest_readings()
+        response.headers["Cache-Control"] = "no-store"
+        return CapacitySnapshot(
+            schema_version="agent-capacity-v1",
+            generated_at=timestamp(now),
+            max_age_seconds=max_age_seconds,
+            accounts=[
+                account_capacity(p, readings.get(p), now=now, max_age_seconds=max_age_seconds)
+                for p in selected
+            ],
+        )
 
     @api.get("/readings", **EXTERNAL)
     async def get_readings(
@@ -572,5 +621,7 @@ def create_app(
     # object, so a route can never exist on one set and not the other.
     app.include_router(api, prefix=API_V1_PREFIX)
     app.include_router(api, prefix=LEGACY_ALIAS_PREFIX)
+    # New agent routes have no pre-versioning clients and need no root alias.
+    app.include_router(agent_api, prefix=API_V1_PREFIX)
 
     return app

@@ -10,6 +10,10 @@ A two-component system for monitoring AI usage across Claude, z.ai, Ollama, Code
 - **Clients**: The touch GUI polls the server API and uses colour/threshold + countdown logic from `client/format.py`. **Touch GUI** (`usage-dashboard-gui`, `client/gui.py`) — the primary target: a fullscreen pygame app for a **Pi 4B + Touch Display 2** (720×1280), run under a minimal X server (`xinit`+`xrandr`), *not* bare KMS/DRM (which presents black on this panel). Optional scheduled backlight-sleep + tap-to-wake (`BACKLIGHT_SLEEP`/`UNIT_ID`, server `/schedule`) and a tap-the-status-line overlay: unit diagnostics on the left (`client/diagnostics.py` — hostname/IPs, server, running commit, updater health read from the two status files `deploy/pi/update.sh` writes under the state dir) + brightness `+`/`-` on the right (`BRIGHTNESS_STEPS`, persisted to `BRIGHTNESS_STATE_FILE`; `client/brightness.py`). See `deploy/pi/` for the install + auto-update tooling. Off-peak windows (`shared/offpeak.py`) drive display hints: the z.ai tile title tints green off-peak / orange during peak hours, with a countdown to the next boundary
 
 Key modules:
+- `src/usage_dashboard/server/capacity.py` — Read-only account-capacity projection
+  for `/api/v1/agent/capacity`; see `docs/agent-api.md`. It evaluates cached
+  observations only. The optional `AGENT_API_KEY` cannot refresh providers or
+  access operator endpoints. `usage-dashboard capacity` is the thin JSON client.
 - `src/usage_dashboard/shared/models.py` — Normalized reading schema (Provider enum, Reading dataclass)
 - `src/usage_dashboard/server/` — Fetchers (Claude, z.ai, Ollama, Codex, OpenCode Go), SQLite DB, API, scheduler
 - `src/usage_dashboard/client/` — HTTP fetcher with adaptive refresh, pygame touch GUI
