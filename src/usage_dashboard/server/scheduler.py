@@ -7,9 +7,10 @@ from datetime import datetime, timedelta, timezone
 from functools import partial
 from typing import Any, Callable
 
+from usage_dashboard.server.codex_app_server import CodexAppServerClient
 from usage_dashboard.server.db import Database
 from usage_dashboard.server.fetch_claude import fetch_claude_usage, refresh_claude_token
-from usage_dashboard.server.fetch_codex import fetch_codex_usage, refresh_codex_token
+from usage_dashboard.server.fetch_codex import fetch_codex_usage
 from usage_dashboard.server.fetch_ollama import fetch_ollama_usage
 from usage_dashboard.server.fetch_opencode import fetch_opencode_usage
 from usage_dashboard.server.fetch_types import (
@@ -38,16 +39,18 @@ logger = logging.getLogger(__name__)
 _MIN_SLEEP_SECONDS = 1.0
 _MAX_SLEEP_SECONDS = 1800.0
 
-# Providers authenticated by a scraped browser cookie rather than an OAuth pair.
-# There is nothing to refresh when one is rejected — only a human re-login helps
-# — so an auth failure parks the provider at the failure cap with an actionable
-# detail line instead of retrying on the normal backoff curve. The message
-# differs per provider because the causes differ: Ollama can only be an expired
-# cookie, while OpenCode Go serves the same sign-in redirect for an expired
-# cookie *and* a wrong workspace id.
-_COOKIE_AUTH_DETAIL: dict[Provider, str] = {
+# Providers the dashboard cannot re-authenticate on its own. There is nothing
+# to refresh when one is rejected — only a human re-login helps — so an auth
+# failure parks the provider at the failure cap with an actionable detail line
+# instead of retrying on the normal backoff curve. The message differs per
+# provider because the causes differ: Ollama can only be an expired cookie,
+# while OpenCode Go serves the same sign-in redirect for an expired cookie
+# *and* a wrong workspace id. Codex joined this set in Plan 005 — the App
+# Server owns its tokens, so the dashboard has no refresh path at all.
+_REAUTH_DETAIL: dict[Provider, str] = {
     Provider.OLLAMA: "cookie expired — re-login",
     Provider.OPENCODE: "cookie expired or bad workspace — re-login",
+    Provider.CODEX: "login required — run `usage-dashboard login codex`",
 }
 
 
@@ -82,10 +85,7 @@ class FetchScheduler:
         ollama_cookie: str | None = None,
         opencode_workspace_id: str | None = None,
         opencode_cookie: str | None = None,
-        codex_token: str | None = None,
-        codex_refresh_token: str | None = None,
-        codex_client_id: str | None = None,
-        codex_account_id: str | None = None,
+        codex_client: CodexAppServerClient | None = None,
         umans_key: str | None = None,
         interval_seconds: int = 300,
         offline_threshold: int = 24,
@@ -121,10 +121,9 @@ class FetchScheduler:
         # set — the same "never fabricate an offline tile" rule as WI-003.
         self._opencode_workspace_id = opencode_workspace_id
         self._opencode_cookie = opencode_cookie
-        self._codex_token = codex_token
-        self._codex_refresh_token = codex_refresh_token
-        self._codex_client_id = codex_client_id
-        self._codex_account_id = codex_account_id
+        # Codex owns its own OAuth now (Plan 005): the dashboard holds a
+        # client, not tokens, and has nothing to refresh.
+        self._codex_client = codex_client
         # Umans wallet (Plan 004): a key alone configures the provider.
         self._umans_key = umans_key
         self._offline_threshold = offline_threshold
@@ -361,16 +360,12 @@ class FetchScheduler:
             tasks.append(
                 (Provider.OLLAMA, partial(fetch_ollama_usage, self._ollama_cookie))
             )
-        if self._codex_token is not None:
+        if self._codex_client is not None:
+            # Configured because the operator enabled app-server mode. A
+            # missing or expired login yields an actionable auth failure, not
+            # a silently vanishing tile.
             tasks.append(
-                (
-                    Provider.CODEX,
-                    partial(
-                        fetch_codex_usage,
-                        self._codex_token,
-                        self._codex_account_id,
-                    ),
-                )
+                (Provider.CODEX, partial(fetch_codex_usage, self._codex_client))
             )
         # Keep these blocks in ``Provider`` enum order:
         # ``configured_providers`` promises that order, and it is derived from
@@ -447,35 +442,6 @@ class FetchScheduler:
         self._claude_work_token, self._claude_work_refresh_token = pair
         return True
 
-    def _try_refresh_codex(self) -> bool:
-        if self._codex_refresh_token is None:
-            return False
-        try:
-            new_access, new_refresh = refresh_codex_token(
-                self._codex_refresh_token, client_id=self._codex_client_id
-            )
-        except FetchError as exc:
-            logger.warning("Codex token refresh failed: %s", exc)
-            return False
-        if self._token_store is not None:
-            self._token_store.save("codex", new_access, new_refresh)
-            logger.info("Codex tokens refreshed and persisted")
-        else:
-            logger.info("Codex token refreshed, not persisted")
-        self._codex_token, self._codex_refresh_token = new_access, new_refresh
-        return True
-
-    def _retry_codex(self, provider: Provider, previous: Reading | None) -> bool:
-        """Re-fetch Codex after a token refresh. Returns True on success."""
-        try:
-            reading = fetch_codex_usage(self._codex_token or "", self._codex_account_id)
-        except FetchError:
-            return False
-        self._db.store_reading(reading)
-        self._db.reset_failures(provider)
-        self._schedule_after_success(provider, previous, reading)
-        return True
-
     def _fetch_one(
         self,
         provider: Provider,
@@ -499,10 +465,7 @@ class FetchScheduler:
                 elif provider == Provider.CLAUDE_WORK and self._try_refresh_claude_work():
                     if self._retry_claude(provider, previous, self._claude_work_token):
                         return
-                elif provider == Provider.CODEX and self._try_refresh_codex():
-                    if self._retry_codex(provider, previous):
-                        return
-            if provider in _COOKIE_AUTH_DETAIL and isinstance(exc, FetchAuthError):
+            if provider in _REAUTH_DETAIL and isinstance(exc, FetchAuthError):
                 self._record_auth_failure(provider, exc)
                 return
             self._record_failure(provider, exc)
@@ -587,7 +550,7 @@ class FetchScheduler:
         self._db.store_reading(
             replace(
                 make_offline_reading(provider, now),
-                detail=_COOKIE_AUTH_DETAIL.get(provider, "credential rejected — re-login"),
+                detail=_REAUTH_DETAIL.get(provider, "credential rejected — re-login"),
             ),
         )
         logger.warning(
@@ -649,3 +612,8 @@ class FetchScheduler:
         if self._thread is not None:
             self._thread.join()
             self._thread = None
+        # Release any App Server child the client is holding. Harmless under
+        # the default one-shot policy (nothing is retained); required if the
+        # client is ever switched to a long-lived process.
+        if self._codex_client is not None:
+            self._codex_client.close()

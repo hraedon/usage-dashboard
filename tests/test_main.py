@@ -7,12 +7,13 @@ from usage_dashboard.server.token_store import TokenStore
 
 
 class TestResolveClaudeTokens:
+    """Plan 005: the token store is authoritative, the Secret is only a seed."""
+
     def test_first_boot_seeds_from_env(self, tmp_path: Path) -> None:
         store = TokenStore(tmp_path / "tokens.json")
         access, refresh = _resolve_claude_tokens(store, "a0", "r0")
         assert (access, refresh) == ("a0", "r0")
         assert store.load_claude_tokens() == ("a0", "r0")
-        assert store.get_claude_seed_marker() is not None
 
     def test_restart_keeps_refreshed_tokens(self, tmp_path: Path) -> None:
         # WI-001 regression: after a refresh, a restart with the same (stale)
@@ -26,17 +27,45 @@ class TestResolveClaudeTokens:
         access, refresh = _resolve_claude_tokens(restarted, "a0", "r0")
         assert (access, refresh) == ("a1", "r1")
 
-    def test_changed_secret_is_adopted(self, tmp_path: Path) -> None:
-        # A deliberate re-login updates the Secret; the new pair must win.
+    def test_an_enrolled_credential_outranks_a_changed_secret(
+        self, tmp_path: Path
+    ) -> None:
+        # Behaviour change from the seed-marker scheme. Credentials are now
+        # created by `usage-dashboard login claude`, which writes to the store.
+        # A Secret edited afterwards holds a pair that has already been rotated
+        # away, so letting it win would log the dashboard out.
         path = tmp_path / "tokens.json"
         store = TokenStore(path)
         _resolve_claude_tokens(store, "a0", "r0")
-        store.save_claude_tokens("a1", "r1")
+        store.save_claude_tokens("enrolled-access", "enrolled-refresh")
 
         restarted = TokenStore(path)
         access, refresh = _resolve_claude_tokens(restarted, "a2", "r2")
-        assert (access, refresh) == ("a2", "r2")
-        assert restarted.load_claude_tokens() == ("a2", "r2")
+        assert (access, refresh) == ("enrolled-access", "enrolled-refresh")
+        assert restarted.load_claude_tokens() == ("enrolled-access", "enrolled-refresh")
+
+    def test_seeding_happens_only_into_an_empty_entry(self, tmp_path: Path) -> None:
+        path = tmp_path / "tokens.json"
+        store = TokenStore(path)
+        # A pre-Plan-005 deployment: credentials live only in the Secret.
+        assert store.get("claude_work") == (None, None)
+        assert _resolve_claude_tokens(store, "w0", "wr0", store_key="claude_work") == (
+            "w0",
+            "wr0",
+        )
+        assert store.get("claude_work") == ("w0", "wr0")
+        # ...and never again.
+        assert _resolve_claude_tokens(store, "w9", "wr9", store_key="claude_work") == (
+            "w0",
+            "wr0",
+        )
+
+    def test_accounts_resolve_independently(self, tmp_path: Path) -> None:
+        store = TokenStore(tmp_path / "tokens.json")
+        _resolve_claude_tokens(store, "p0", "pr0", store_key="claude")
+        _resolve_claude_tokens(store, "w0", "wr0", store_key="claude_work")
+        assert store.get("claude") == ("p0", "pr0")
+        assert store.get("claude_work") == ("w0", "wr0")
 
     def test_empty_env_uses_persisted(self, tmp_path: Path) -> None:
         path = tmp_path / "tokens.json"

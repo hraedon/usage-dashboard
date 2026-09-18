@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from usage_dashboard.server.token_store import TokenStore
+import pytest
+
+from usage_dashboard.server.token_store import TokenStore, TokenStoreError
 
 
 class TestTokenStore:
@@ -45,11 +47,22 @@ class TestTokenStore:
         store = TokenStore(tmp_path / "nonexistent.json")
         assert store.get("claude") == (None, None)
 
-    def test_load_from_corrupt_json(self, tmp_path: Path) -> None:
+    def test_corrupt_json_fails_closed(self, tmp_path: Path) -> None:
+        # Plan 005: a corrupt store used to be swallowed, leaving an empty
+        # in-memory store whose next write REPLACED the file — turning an
+        # unreadable file into permanent credential loss.
         path = tmp_path / "tokens.json"
         path.write_text("not valid json{{{")
-        store = TokenStore(path)
-        assert store.get("claude") == (None, None)
+        with pytest.raises(TokenStoreError):
+            TokenStore(path)
+        # The unreadable content is still there to be recovered by hand.
+        assert path.read_text() == "not valid json{{{"
+
+    def test_non_object_json_fails_closed(self, tmp_path: Path) -> None:
+        path = tmp_path / "tokens.json"
+        path.write_text('["not", "an", "object"]')
+        with pytest.raises(TokenStoreError):
+            TokenStore(path)
 
     def test_file_contents_are_valid_json(self, tmp_path: Path) -> None:
         path = tmp_path / "tokens.json"

@@ -769,7 +769,7 @@ class TestConfiguredProviders:
             claude_work_token="cw",
             zai_key="z",
             ollama_cookie="o",
-            codex_token="cx",
+            codex_client=MagicMock(),
             opencode_workspace_id="wrk_X",
             opencode_cookie="oc",
             umans_key="u",

@@ -140,12 +140,12 @@ Images are built and pushed to `ghcr.io/hraedon/usage-dashboard-server` and `ghc
 | Key | Required | Description |
 |-----|----------|-------------|
 | `api-key` | Yes | Shared Bearer token for server-client auth |
-| `claude-token` | No | Claude OAuth access token |
-| `claude-refresh-token` | No | Claude OAuth refresh token |
-| `claude-client-id` | No | Claude OAuth client ID |
-| `claude-work-token` | No | Second Claude account's OAuth access token (see *Two Claude accounts*) |
-| `claude-work-refresh-token` | No | Second Claude account's OAuth refresh token |
-| `claude-work-client-id` | No | Second Claude account's OAuth client ID |
+| `claude-token` | No | *Deprecated (Plan 005)* — seeds an empty token-store entry only; enrol with `usage-dashboard login claude` |
+| `claude-refresh-token` | No | *Deprecated* — as above |
+| `claude-client-id` | No | *Deprecated* — as above |
+| `claude-work-token` | No | *Deprecated* — work account seed |
+| `claude-work-refresh-token` | No | *Deprecated* — work account seed |
+| `claude-work-client-id` | No | *Deprecated* — work account seed |
 | `zai-api-key` | No | z.ai API key |
 | `ollama-cookie` | No | ollama.com browser session cookie (`name=value`; see below) |
 | `ollama-email` | No | Unused — see *Ollama login* (kept only as a placeholder) |
@@ -185,75 +185,126 @@ The Claude usage endpoint requires the `user:profile` OAuth scope. A
 `claude setup-token` is scoped for inference only and returns `403` here, and
 credentials copied from an interactive Claude session can't be used because the
 dashboard would rotate the refresh token out from under that session. So the
-dashboard mints its **own** dedicated token pair — see *Claude login* below.
+dashboard enrols a **dedicated** credential through the official Claude Code
+login and becomes its sole refresher — see *Provider enrolment* below.
 
-### Claude login
+> **Support boundary, stated plainly.** Codex usage comes from a supported
+> interface: the official App Server's `account/rateLimits/read`. Claude usage
+> does not. Anthropic publishes no subscription-quota API, so the dashboard
+> reads the undocumented `GET /api/oauth/usage` and parses the credential file
+> Claude Code writes. Both of those dependencies are deliberately quarantined
+> (`fetch_claude.py`, `claude_credentials.py`) and fail closed, but they can
+> break on any Claude Code release.
 
-The `login claude` command runs a one-time PKCE OAuth flow to mint a
-dedicated token pair that belongs to the dashboard alone.  This avoids
-sharing credentials with an interactive Claude session (which would break
-that session when the dashboard rotates the refresh token).
+### Provider enrolment (Plan 005)
 
-Run it **on your own computer** (the one with a web browser) — not on the Pi or
-the cluster. It only prints tokens for you to copy into the k8s Secret; it
-doesn't talk to the server. First install the CLI into a throwaway venv:
+Codex and Claude are enrolled **inside the server pod**, through each vendor's
+own official CLI. Nothing is minted by this project, no token is printed, and
+nothing is pasted into a Kubernetes Secret. The server image ships pinned
+`codex` and `claude` binaries for exactly this purpose.
+
+Enrolment has to happen in the pod because the Longhorn PVC holding the token
+store is **RWO** — only the running server can mount it. Do not mount it from a
+second live pod.
 
 ```bash
-git clone https://github.com/hraedon/usage-dashboard.git
-cd usage-dashboard
-python3 -m venv .venv
-.venv/bin/pip install -e .
+POD=$(kubectl -n usage-dashboard get pod -l app=usage-dashboard-server \
+        -o jsonpath='{.items[0].metadata.name}')
+kubectl -n usage-dashboard exec -it "$POD" -- <command>
 ```
 
-Then run the login (use `.venv/bin/usage-dashboard` if it's not on your PATH):
+#### Codex
+
+Codex authenticates itself. The official App Server owns the OAuth flow, stores
+its credentials under `CODEX_HOME` (`/data/codex`, on the PVC) and refreshes
+them on its own; the dashboard only asks it for rate-limit windows.
 
 ```bash
-# Option A — opens a browser and catches the redirect automatically:
-usage-dashboard login claude --port 8282
-
-# Option B — no local port (works over SSH): prints a URL; after you authorize,
-# Claude's page shows a CODE#STATE value — paste it back at the prompt:
-usage-dashboard login claude
+kubectl -n usage-dashboard exec -it "$POD" -- usage-dashboard login codex
 ```
 
-A browser opens to Claude's sign-in. Sign in as the account you want to track,
-approve, and the command prints three values — `claude-token`,
-`claude-refresh-token`, and `claude-client-id`. Put them in the Secret and roll
-the server:
+It prints a verification URL and a one-time code. Open the URL, enter the code,
+and it confirms enrolment by re-reading the account through a *fresh* App Server
+process — which is what proves the credential actually landed on the PVC.
+
+Set `CODEX_MODE=app_server` in the deployment (the default in the manifest) and
+roll the server.
+
+> **Re-enrolling:** never run two App Server processes against one `CODEX_HOME`.
+> Set `CODEX_MODE=disabled`, roll the pod, run the login, then restore
+> `app_server` and roll again.
+
+#### Claude
+
+`login claude` runs the *official* Claude Code login in a throwaway config
+directory, imports the credential it writes into the dashboard's token store,
+and then **deletes that directory**. The deletion is the point: a refresh token
+has exactly one rightful refresher, and leaving a second copy behind would have
+both rotate the same family into a lockout.
 
 ```bash
-kubectl apply -f k8s/server-secret.yaml
+# personal account
+kubectl -n usage-dashboard exec -it "$POD" -- usage-dashboard login claude --account personal
+
+# work account (independent tokens, independent rotation)
+kubectl -n usage-dashboard exec -it "$POD" -- usage-dashboard login claude --account work
+```
+
+Over SSH or in a container the login shows a code to paste back into the
+terminal. Before the store is touched, the command checks the credential
+actually carries `user:profile` **and** can read the usage endpoint — so a
+credential that cannot do the dashboard's job never displaces a working one.
+
+> `claude setup-token` cannot be used here. It mints an inference token without
+> the `user:profile` scope that the subscription-usage endpoint requires.
+
+Roll the server afterwards so the scheduler picks up the new credential:
+
+```bash
 kubectl -n usage-dashboard rollout restart deploy/usage-dashboard-server
 ```
 
-After the first login, the server persists refreshed tokens to the PVC
-(`/data/tokens.json`), so pod restarts survive token rotation without
-re-login.  The k8s Secret values are used only for the initial seed.
+The work account shows as a **second, muted set of bars in the Claude tile** —
+`me` and `work` — not a separate tile. With no work credential enrolled it stays
+completely hidden.
 
-### Two Claude accounts
+#### Where credentials live
 
-To watch a second Claude account (e.g. a work login) alongside your personal
-one, run the **same `login claude` command again** but sign in as the *other*
-account. (If your browser is already logged into the first account, use a
-private/incognito window or log out first, so you authorize the right one.)
+`/data/tokens.json` on the PVC is **authoritative** for Claude. The
+`claude-*` Secret keys now only seed an *empty* store entry, so a pre-Plan-005
+deployment keeps working across the upgrade and can roll back. Once an entry
+exists, only enrolment replaces it — a stale Secret can no longer overwrite a
+freshly enrolled credential.
+
+Codex keeps its own credentials under `/data/codex`; the dashboard never reads
+or writes them.
+
+#### Telling expired auth from a transport failure
 
 ```bash
-usage-dashboard login claude --port 8282   # sign in as the SECOND account
-kubectl apply -f k8s/server-secret.yaml
-kubectl -n usage-dashboard rollout restart deploy/usage-dashboard-server
+kubectl -n usage-dashboard logs deploy/usage-dashboard-server | grep -i codex
 ```
 
-> The command always labels its output `claude-token` / `claude-refresh-token` /
-> `claude-client-id` (it can't tell which account you signed in as). For the
-> second account, copy those three values into the **`claude-work-`** keys
-> instead — `claude-work-token`, `claude-work-refresh-token`,
-> `claude-work-client-id` — leaving your first account's `claude-*` keys alone.
+- **`Codex login required: …`** — the App Server has no usable ChatGPT login.
+  Re-enrol. There is nothing to refresh; Codex owns the tokens.
+- **`Codex App Server timed out …` / `… exited (code N)`** — transport or child
+  process failure, not an auth problem. The scheduler backs off and retries; the
+  next poll spawns a fresh process.
+- **Claude going offline after a 401** — the dashboard refreshes and retries
+  once by itself. Persistent failure means the refresh token is dead: re-enrol.
 
-The work account is fetched and refreshed independently (its own
-`/data/tokens.json` namespace, its own rotation). The dashboard then shows it as
-a **second, muted set of bars in the Claude tile** — `me` and `work` — rather
-than a separate tile. With no `claude-work-*` keys set it stays completely
-hidden, and the Claude tile looks exactly as before.
+#### Rollback
+
+Both halves are reversible for one soak period:
+
+- Roll back to the prior image and restore `CODEX_TOKEN`/`CODEX_REFRESH_TOKEN`/
+  `CODEX_CLIENT_ID`/`CODEX_ACCOUNT_ID` injection in the deployment. **Keep the
+  old Secret values** until the new image has survived a token refresh and a
+  pod restart.
+- Claude needs no rollback step: the `claude-*` Secret keys are still present
+  and the old image reads them directly.
+
+Delete the deprecated Secret keys only after the soak.
 
 ### Ollama login
 

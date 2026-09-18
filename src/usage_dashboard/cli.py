@@ -1,293 +1,202 @@
 """CLI entry point for usage-dashboard.
 
-Provides the `usage-dashboard login claude` command for minting a dedicated
-OAuth token pair via the Authorization Code + PKCE flow.
+Provider enrolment. Since Plan 005 the dashboard implements no OAuth flow of
+its own: Codex enrols through the official App Server's device-code login (and
+Codex keeps the tokens), and Claude enrols through the official Claude Code
+login, whose credential is imported into the dashboard's token store and then
+deleted from the temporary profile. Ollama and OpenCode Go still capture a
+browser session cookie, which is all their usage pages expose.
 """
 from __future__ import annotations
 
 import argparse
-import base64
-import hashlib
-import http.server
 import json
 import logging
+import os
 import re
-import secrets
-import string
+import shutil
+import subprocess
 import sys
-import time
-import webbrowser
+import tempfile
 from collections.abc import Iterable, Mapping
+from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlencode, urlparse
 
-import httpx
+from usage_dashboard.claude_credentials import (
+    REQUIRED_SCOPE,
+    ClaudeCredential,
+    ClaudeCredentialError,
+    parse_credentials,
+)
+from usage_dashboard.server.codex_app_server import (
+    DEFAULT_CODEX_BIN,
+    DEFAULT_CODEX_HOME,
+    CodexAppServerClient,
+    CodexAppServerConfig,
+)
+from usage_dashboard.server.fetch_claude import fetch_claude_usage
+from usage_dashboard.server.fetch_types import FetchError
+from usage_dashboard.server.token_store import TokenStore, TokenStoreError
+from usage_dashboard.shared.models import Provider
 
 logger = logging.getLogger(__name__)
 
-# Claude Code's public OAuth client. These were confirmed against the current
-# Claude Code CLI (binary analysis of v2.1.220), per Plan 001's warning not to
-# trust them from memory. The usage endpoint requires the user:profile scope;
-# the rest of the scope string mirrors what Claude Code requests so the server
-# issues a code it will accept at exchange time.
-_CLAUDE_AUTHORIZE_URL = "https://claude.ai/oauth/authorize"
-_CLAUDE_TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
-_CLAUDE_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
-_CLAUDE_SCOPES = "user:inference user:profile user:sessions:claude_code user:mcp_servers"
-# Claude's authorize endpoint requires the non-standard ``code=true`` flag (the
-# real CLI always sends it first). Without it the sign-in appears to complete
-# but the returned value is not a usable PKCE code, so the exchange fails with
-# an "invalid response". The token endpoint has been observed to take 40-60s
-# during platform incidents, so the exchange uses a generous timeout.
-_MANUAL_REDIRECT_URI = "https://platform.claude.com/oauth/code/callback"
-_CLAUDE_TIMEOUT = 120.0
-_TIMEOUT = 30.0  # codex login exchange
-
-# PKCE verifier: unreserved chars per RFC 7636 (A-Z a-z 0-9 - . _ ~)
-_VERIFIER_CHARS = string.ascii_letters + string.digits + "-._~"
-_VERIFIER_LENGTH = 64
 
 
-def _generate_verifier() -> str:
-    return "".join(secrets.choice(_VERIFIER_CHARS) for _ in range(_VERIFIER_LENGTH))
+# ---------------------------------------------------------------------------
+# Claude enrolment (Plan 005)
+#
+# The dashboard no longer implements Claude's authorization-code/PKCE flow.
+# Enrolment now drives the *official* Claude Code login in a throwaway config
+# directory, imports the credential it writes into the dashboard's own token
+# store, and then deletes that directory.
+#
+# Deleting it is the point, not tidiness: a refresh token has exactly one
+# rightful refresher. If a copy were left behind under a Claude Code profile,
+# both it and the dashboard would rotate the same family and race each other
+# into a lockout (the WI-001 failure, re-created).
+#
+# Two dependencies here remain unsupported and are deliberately quarantined:
+# reading `.credentials.json` (see claude_credentials.py) and calling
+# GET /api/oauth/usage. Anthropic exposes no documented subscription-quota API,
+# and `claude setup-token` cannot help — it mints an inference token without
+# the `user:profile` scope that endpoint requires.
+# ---------------------------------------------------------------------------
+
+DEFAULT_CLAUDE_BIN = "claude"
+# CLI account selector -> token-store key. The work account resolves and
+# refreshes independently of the personal one.
+CLAUDE_ACCOUNT_KEYS = {"personal": "claude", "work": "claude_work"}
+_CREDENTIALS_FILENAME = ".credentials.json"
+_DEFAULT_TOKEN_STORE = "/data/tokens.json"
 
 
-def _generate_challenge(verifier: str) -> str:
-    digest = hashlib.sha256(verifier.encode("ascii")).digest()
-    return base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
-
-
-class _TokenExchangeError(httpx.HTTPError):
-    """The token exchange failed (transport, rejection, or malformed body).
-
-    Subclasses httpx.HTTPError so the login command's existing error handling
-    keeps surfacing it as a clean "Token exchange failed: ..." message.
-    """
-
-
-def _exchange_code(
-    code: str,
-    verifier: str,
-    redirect_uri: str,
-    state: str | None = None,
-) -> tuple[str, str]:
-    """Exchange an authorization code for access + refresh tokens.
-
-    The redirect_uri must match the one sent to the authorize endpoint, and
-    the public client_id must be included for a PKCE public-client exchange.
-    Server-side rejections (OAuth ``error`` bodies, non-JSON responses,
-    missing access_token) raise _TokenExchangeError with the server's reason
-    rather than crashing on a bare KeyError.
-    """
-    data = {
-        "grant_type": "authorization_code",
-        "code": code,
-        "code_verifier": verifier,
-        "redirect_uri": redirect_uri,
-        "client_id": _CLAUDE_CLIENT_ID,
-    }
-    if state is not None:
-        data["state"] = state
+def _claude_cli_version(claude_bin: str) -> str | None:
+    """Best-effort `claude --version`, for naming in a schema error."""
     try:
-        response = httpx.post(
-            _CLAUDE_TOKEN_URL,
-            data=data,
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-            timeout=_CLAUDE_TIMEOUT,
+        result = subprocess.run(
+            [claude_bin, "--version"], capture_output=True, text=True, timeout=30.0
         )
-    except httpx.HTTPError as exc:
-        raise _TokenExchangeError(
-            f"token endpoint request failed: {type(exc).__name__}: {exc}"
-        ) from exc
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return result.stdout.strip() or None
+
+
+def _run_official_claude_login(claude_bin: str, config_dir: str) -> None:
+    """Run the official login ceremony against an isolated config directory.
+
+    `claude auth login --claudeai` is the documented entry point and works over
+    SSH and in containers by displaying a code the operator pastes back. The
+    caller's TTY is inherited deliberately so that interaction reaches them.
+    """
+    env = dict(os.environ)
+    env["CLAUDE_CONFIG_DIR"] = config_dir
     try:
-        body = response.json()
-    except ValueError as exc:
-        raise _TokenExchangeError(
-            f"token endpoint returned a non-JSON body (HTTP {response.status_code})"
+        result = subprocess.run([claude_bin, "auth", "login", "--claudeai"], env=env)
+    except OSError as exc:
+        raise ClaudeCredentialError(
+            f"Could not run {claude_bin!r}: {exc}. Is the Claude Code CLI installed?"
         ) from exc
-    if not isinstance(body, dict):
-        raise _TokenExchangeError(
-            f"token endpoint returned an unexpected body (HTTP {response.status_code})"
+    if result.returncode != 0:
+        raise ClaudeCredentialError(
+            f"Claude Code login exited with status {result.returncode}; "
+            "existing credentials were left untouched."
         )
-    error = body.get("error")
-    if error is not None:
-        if isinstance(error, dict):
-            error_str = str(error.get("type") or "error")
-            detail = str(error.get("message") or "")
-        else:
-            error_str = str(error)
-            detail = str(body.get("error_description") or body.get("message") or "")
-        message = f"token endpoint rejected the exchange: {error_str}"
-        if detail:
-            message += f" ({detail})"
-        raise _TokenExchangeError(message)
+
+
+def _read_imported_credential(config_dir: str, claude_bin: str) -> ClaudeCredential:
+    """Parse the credential the official login just wrote."""
+    path = Path(config_dir) / _CREDENTIALS_FILENAME
+    if not path.exists():
+        raise ClaudeCredentialError(
+            f"Claude Code wrote no {_CREDENTIALS_FILENAME} in {config_dir}. "
+            "The login did not complete, or this version stores credentials "
+            "elsewhere (a system keychain rather than a file)."
+        )
     try:
-        access_token = body["access_token"]
-    except KeyError as exc:
-        raise _TokenExchangeError(
-            f"token endpoint response missing access_token (HTTP {response.status_code})"
+        raw = json.loads(path.read_text())
+    except (OSError, ValueError) as exc:
+        raise ClaudeCredentialError(f"Could not read {path}: {exc}") from exc
+    return parse_credentials(raw, cli_version=_claude_cli_version(claude_bin))
+
+
+def _validate_usage_access(credential: ClaudeCredential, provider: Provider) -> None:
+    """Prove the credential can actually read the usage endpoint.
+
+    Checked *before* the store is touched, so a credential that cannot do the
+    dashboard's one job never displaces a working one. The scope check is the
+    cheap gate; the live call is the one that cannot be fooled by absent or
+    optimistic metadata.
+    """
+    if credential.scopes_known and not credential.has_profile_scope:
+        raise ClaudeCredentialError(
+            f"Imported credential lacks the {REQUIRED_SCOPE!r} scope "
+            f"(got: {', '.join(credential.scopes) or 'none'}). "
+            "A `claude setup-token` token cannot be used here — the usage "
+            "endpoint needs a full login."
+        )
+    try:
+        fetch_claude_usage(credential.access_token, provider)
+    except FetchError as exc:
+        raise ClaudeCredentialError(
+            f"Imported credential could not read Claude usage: {exc}. "
+            "Existing credentials were left untouched."
         ) from exc
-    refresh_token = body.get("refresh_token", "")
-    return access_token, refresh_token
 
 
-class _CallbackHandler(http.server.BaseHTTPRequestHandler):
-    """Minimal HTTP handler that captures the OAuth callback code."""
+def login_claude(
+    account: str = "personal",
+    token_store_path: str | None = None,
+    claude_bin: str = DEFAULT_CLAUDE_BIN,
+) -> None:
+    """Enrol a dedicated Claude credential via the official Claude Code login.
 
-    code: str | None = None
-    state: str | None = None
-    error: str | None = None
-
-    def do_GET(self) -> None:
-        parsed = urlparse(self.path)
-        params = parse_qs(parsed.query)
-        if "code" in params:
-            _CallbackHandler.code = params["code"][0]
-            _CallbackHandler.state = params.get("state", [None])[0]
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html")
-            self.end_headers()
-            self.wfile.write(
-                b"<html><body><h1>Login successful!</h1>"
-                b"<p>You can close this tab and return to the terminal.</p>"
-                b"</body></html>"
-            )
-        elif "error" in params:
-            _CallbackHandler.error = params["error"][0]
-            self.send_response(400)
-            self.send_header("Content-Type", "text/html")
-            self.end_headers()
-            self.wfile.write(
-                f"<html><body><h1>Error: {params['error'][0]}</h1></body></html>".encode()
-            )
-        else:
-            self.send_response(400)
-            self.end_headers()
-
-    def log_message(self, format: str, *args: object) -> None:
-        pass  # silence request logs
-
-
-def _parse_pasted_input(raw: str) -> tuple[str | None, str | None]:
-    """Parse what the operator pastes back into ``(code, state)``.
-
-    Accepts the full redirect URL (``?code=...&state=...``), Claude's hosted
-    ``CODE#STATE`` form, or a bare code.
+    Writes straight into the dashboard's token store on the PVC; no token is
+    ever printed, and nothing needs pasting into a Kubernetes Secret.
     """
-    raw = raw.strip()
-    if raw.startswith("http"):
-        params = parse_qs(urlparse(raw).query)
-        return params.get("code", [None])[0], params.get("state", [None])[0]
-    if "#" in raw:
-        code, _, state = raw.partition("#")
-        return code or None, state or None
-    return (raw or None), None
-
-
-def _wait_for_code(port: int, timeout: float = 300.0) -> tuple[str | None, str | None, str | None]:
-    """Start a local HTTP server and wait for the OAuth callback.
-
-    Returns ``(code, state, error)``. Gives up after *timeout* seconds: the
-    server's own timeout only bounds a single ``handle_request`` call, so the
-    loop must enforce the overall deadline itself — otherwise an operator who
-    never completes the browser flow hangs the login forever (the callers'
-    "Timed out" branches used to be unreachable).
-    """
-    server = http.server.HTTPServer(("127.0.0.1", port), _CallbackHandler)
-    server.timeout = 1.0
-    deadline = time.monotonic() + timeout
-    while _CallbackHandler.code is None and _CallbackHandler.error is None:
-        if time.monotonic() >= deadline:
-            break
-        server.handle_request()
-    server.server_close()
-    return _CallbackHandler.code, _CallbackHandler.state, _CallbackHandler.error
-
-
-def login_claude(port: int | None = None, no_browser: bool = False) -> None:
-    """Run the PKCE OAuth login flow for Claude and print the token pair."""
-    redirect_uri = (
-        f"http://localhost:{port}/callback" if port is not None else _MANUAL_REDIRECT_URI
-    )
-
-    verifier = _generate_verifier()
-    challenge = _generate_challenge(verifier)
-    state = secrets.token_urlsafe(16)
-
-    params = urlencode({
-        # Required (non-standard) flag: Claude's authorize endpoint only issues
-        # a usable PKCE authorization code when ``code=true`` is present. The
-        # real Claude Code CLI always sends it first.
-        "code": "true",
-        "response_type": "code",
-        "client_id": _CLAUDE_CLIENT_ID,
-        "code_challenge": challenge,
-        "code_challenge_method": "S256",
-        "redirect_uri": redirect_uri,
-        "scope": _CLAUDE_SCOPES,
-        "state": state,
-    })
-    authorize_url = f"{_CLAUDE_AUTHORIZE_URL}?{params}"
-
-    # Reset class state for repeated invocations (testing).
-    _CallbackHandler.code = None
-    _CallbackHandler.state = None
-    _CallbackHandler.error = None
-
-    returned_state: str | None
-    if port is not None:
-        print(f"Starting local callback server on port {port}...")
-        print(f"Opening browser to:\n  {authorize_url}\n")
-        if not no_browser:
-            webbrowser.open(authorize_url)
-
-        code, returned_state, error = _wait_for_code(port)
-        if error:
-            print(f"Authorization failed: {error}", file=sys.stderr)
-            sys.exit(1)
-        if code is None:
-            print("Timed out waiting for authorization.", file=sys.stderr)
-            sys.exit(1)
-    else:
-        print("Open this URL in a browser to authorize:\n")
-        print(f"  {authorize_url}\n")
+    try:
+        store_key = CLAUDE_ACCOUNT_KEYS[account]
+    except KeyError:
         print(
-            "After authorizing, the page shows a code like CODE#STATE.\n"
-            "Paste it here (the full CODE#STATE, or the redirect URL):"
+            f"Unknown account {account!r}; expected one of "
+            f"{', '.join(sorted(CLAUDE_ACCOUNT_KEYS))}.",
+            file=sys.stderr,
         )
-        raw = input("> ")
-        code, returned_state = _parse_pasted_input(raw)
-        if not code:
-            print("No authorization code provided.", file=sys.stderr)
-            sys.exit(1)
-
-    # CSRF: the returned state must match what we sent (when the flow echoes
-    # one back). A mismatch means the response isn't ours — refuse it.
-    if returned_state is not None and returned_state != state:
-        print("State mismatch — aborting (possible CSRF).", file=sys.stderr)
         sys.exit(1)
+    provider = Provider.CLAUDE if store_key == "claude" else Provider.CLAUDE_WORK
+    store_path = token_store_path or os.environ.get("TOKEN_STORE_PATH") or _DEFAULT_TOKEN_STORE
 
+    print(f"Enrolling the '{account}' Claude account (token-store key: {store_key}).")
+    print("A one-time official Claude Code login follows. Over SSH or in a")
+    print("container it shows a code to paste back into this terminal.\n")
+
+    # mkdtemp is 0700 by default; the credential must not be world-readable
+    # even for the seconds it exists.
+    config_dir = tempfile.mkdtemp(prefix="usage-dashboard-claude-login-")
     try:
-        access_token, refresh_token = _exchange_code(
-            code, verifier, redirect_uri, state=state
+        _run_official_claude_login(claude_bin, config_dir)
+        credential = _read_imported_credential(config_dir, claude_bin)
+        _validate_usage_access(credential, provider)
+        store = TokenStore(store_path)
+        store.save(
+            store_key,
+            credential.access_token,
+            credential.refresh_token,
+            metadata=credential.metadata(),
         )
-    except httpx.HTTPError as exc:
-        print(f"Token exchange failed: {exc}", file=sys.stderr)
+    except (ClaudeCredentialError, TokenStoreError) as exc:
+        print(f"\nEnrolment failed: {exc}", file=sys.stderr)
         sys.exit(1)
+    finally:
+        # Non-negotiable: leaving this behind would give the credential family
+        # a second refresher.
+        shutil.rmtree(config_dir, ignore_errors=True)
 
-    print("\nDedicated Claude OAuth tokens minted successfully.\n")
-    print("Load these into the k8s Secret (server-secret.yaml):\n")
-    print(f"  claude-token: \"{access_token}\"")
-    print(f"  claude-refresh-token: \"{refresh_token}\"")
-    print(f"  claude-client-id: \"{_CLAUDE_CLIENT_ID}\"")
-    print()
-    print("Then update the Secret keys and roll the server, e.g.:")
-    print(
-        "  kubectl -n usage-dashboard patch secret server-secrets --type merge -p \\\n"
-        "    \"{\\\"stringData\\\":{\\\"claude-token\\\":\\\"$ACCESS\\\","
-        "\\\"claude-refresh-token\\\":\\\"$REFRESH\\\","
-        f"\\\"claude-client-id\\\":\\\"{_CLAUDE_CLIENT_ID}\\\"}}}}\""
-    )
+    plan = credential.subscription_type or "unknown"
+    print(f"\nClaude '{account}' enrolled successfully (plan: {plan}).")
+    print(f"  token store: {store_path}  key: {store_key}")
+    print("  temporary Claude Code credential store removed.")
+    print("\nRoll the server so the scheduler picks it up:")
     print("  kubectl -n usage-dashboard rollout restart deploy/usage-dashboard-server")
 
 
@@ -515,147 +424,73 @@ def login_opencode(headless: bool = False, verify: bool = True) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Codex (OpenAI / ChatGPT-plan) login
+# Codex enrolment (Plan 005)
 #
-# Mirrors the Claude PKCE flow against OpenAI's OAuth (auth.openai.com), using
-# the public Codex CLI client. Endpoints/client_id/scopes were taken from the
-# openai/codex source (not memory), same discipline as the Claude constants.
-# Loopback-only: OpenAI's redirect allow-list expects http://localhost:1455/
-# auth/callback, so there's no hosted "paste the code" page like Claude's.
+# The dashboard no longer mints, stores, refreshes or transmits an OpenAI
+# token. `codex` owns all of that; enrolment just drives the App Server's
+# device-code login against the same CODEX_HOME the server runs with, so the
+# credential lands on the PVC where the scheduler will find it.
+#
+# Re-enrolment caution: never run two App Server processes against one
+# CODEX_HOME. Set CODEX_MODE=disabled, roll the pod, enrol, then restore
+# app_server and roll again (see the README runbook).
 # ---------------------------------------------------------------------------
 
-_CODEX_AUTHORIZE_URL = "https://auth.openai.com/oauth/authorize"
-_CODEX_TOKEN_URL_LOGIN = "https://auth.openai.com/oauth/token"
-_CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
-_CODEX_SCOPES = "openid profile email offline_access"
-_CODEX_DEFAULT_PORT = 1455
 
+def login_codex(
+    codex_home: str | None = None,
+    codex_bin: str | None = None,
+    timeout: float = 900.0,
+) -> None:
+    """Enrol a ChatGPT account through the Codex App Server's device-code flow.
 
-def _decode_jwt_payload(token: str) -> dict[str, Any]:
-    """Best-effort decode of a JWT's payload segment (no signature check)."""
-    try:
-        payload = token.split(".")[1]
-        payload += "=" * (-len(payload) % 4)  # restore base64 padding
-        decoded = json.loads(base64.urlsafe_b64decode(payload))
-    except (IndexError, ValueError, TypeError):
-        return {}
-    return decoded if isinstance(decoded, dict) else {}
-
-
-def _extract_codex_account_id(id_token: str) -> str | None:
-    """Pull the chatgpt-account-id from the id_token's OpenAI auth claim."""
-    payload = _decode_jwt_payload(id_token)
-    auth = payload.get("https://api.openai.com/auth")
-    if isinstance(auth, dict):
-        acc = auth.get("chatgpt_account_id") or auth.get("account_id")
-        if acc:
-            return str(acc)
-    acc = payload.get("chatgpt_account_id")
-    return str(acc) if acc else None
-
-
-def _exchange_code_codex(
-    code: str, verifier: str, redirect_uri: str
-) -> tuple[str, str, str]:
-    """Exchange an auth code for (access, refresh, id_token) — form-encoded."""
-    data = {
-        "grant_type": "authorization_code",
-        "code": code,
-        "redirect_uri": redirect_uri,
-        "client_id": _CODEX_CLIENT_ID,
-        "code_verifier": verifier,
-    }
-    response = httpx.post(
-        _CODEX_TOKEN_URL_LOGIN,
-        data=data,
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
-        timeout=_TIMEOUT,
+    Prints only the verification URL and one-time user code; no token material
+    is returned, printed or copied anywhere.
+    """
+    config = CodexAppServerConfig(
+        binary=codex_bin or os.environ.get("CODEX_BIN") or DEFAULT_CODEX_BIN,
+        home=codex_home or os.environ.get("CODEX_HOME") or DEFAULT_CODEX_HOME,
     )
-    response.raise_for_status()
-    body = response.json()
-    return (
-        body["access_token"],
-        body.get("refresh_token", ""),
-        body.get("id_token", ""),
-    )
+    print(f"Enrolling Codex against CODEX_HOME={config.home}")
+    print("Codex owns the resulting tokens; the dashboard never sees them.\n")
 
+    def present(url: str, code: str) -> None:
+        print("Open this URL and enter the code:\n")
+        print(f"  {url}")
+        print(f"  code: {code}\n")
+        print("Waiting for the login to complete...")
 
-def login_codex(port: int | None = None, no_browser: bool = False) -> None:
-    """Run the PKCE OAuth login flow for Codex and print the token pair."""
-    port = port or _CODEX_DEFAULT_PORT
-    redirect_uri = f"http://localhost:{port}/auth/callback"
-
-    verifier = _generate_verifier()
-    challenge = _generate_challenge(verifier)
-    state = secrets.token_urlsafe(16)
-
-    params = urlencode({
-        "response_type": "code",
-        "client_id": _CODEX_CLIENT_ID,
-        "redirect_uri": redirect_uri,
-        "scope": _CODEX_SCOPES,
-        "code_challenge": challenge,
-        "code_challenge_method": "S256",
-        # These make the id_token carry the ChatGPT account/org, so we can
-        # surface the chatgpt-account-id the usage endpoint needs.
-        "id_token_add_organizations": "true",
-        "codex_cli_simplified_flow": "true",
-        "state": state,
-    })
-    authorize_url = f"{_CODEX_AUTHORIZE_URL}?{params}"
-
-    _CallbackHandler.code = None
-    _CallbackHandler.state = None
-    _CallbackHandler.error = None
-
-    print(f"Starting local callback server on port {port}...")
-    print(f"Opening browser to:\n  {authorize_url}\n")
-    if not no_browser:
-        webbrowser.open(authorize_url)
-
-    code, returned_state, error = _wait_for_code(port)
-    if error:
-        print(f"Authorization failed: {error}", file=sys.stderr)
-        sys.exit(1)
-    if code is None:
-        print("Timed out waiting for authorization.", file=sys.stderr)
-        sys.exit(1)
-    if returned_state is not None and returned_state != state:
-        print("State mismatch — aborting (possible CSRF).", file=sys.stderr)
-        sys.exit(1)
-
+    client = CodexAppServerClient(config)
     try:
-        access_token, refresh_token, id_token = _exchange_code_codex(
-            code, verifier, redirect_uri
-        )
-    except httpx.HTTPError as exc:
-        print(f"Token exchange failed: {exc}", file=sys.stderr)
+        client.device_code_login(present, timeout=timeout)
+    except FetchError as exc:
+        print(f"\nCodex enrolment failed: {exc}", file=sys.stderr)
         sys.exit(1)
+    finally:
+        client.close()
 
-    account_id = _extract_codex_account_id(id_token)
-
-    print("\nDedicated Codex OAuth tokens minted successfully.\n")
-    print("Load these into the k8s Secret (server-secret.yaml):\n")
-    print(f'  codex-token: "{access_token}"')
-    print(f'  codex-refresh-token: "{refresh_token}"')
-    print(f'  codex-client-id: "{_CODEX_CLIENT_ID}"')
-    if account_id:
-        print(f'  codex-account-id: "{account_id}"')
-    else:
+    # Verify with a *fresh* App Server process. Re-reading through the same
+    # child would only prove it remembered its own login; spawning a new one
+    # proves the credential actually reached CODEX_HOME on disk, which is what
+    # the server will read after the next rollout.
+    verifier = CodexAppServerClient(config)
+    try:
+        account, rate_limits = verifier.read_account_and_rate_limits()
+    except FetchError as exc:
         print(
-            "  codex-account-id: <not found in id_token — the usage endpoint "
-            "may still work without it; set it if fetches 401/403>"
+            f"\nLogin reported success but verification failed: {exc}",
+            file=sys.stderr,
         )
-    print()
-    print("Then update the Secret keys and roll the server, e.g.:")
-    acct = account_id or "$ACCOUNT"
-    print(
-        "  kubectl -n usage-dashboard patch secret server-secrets --type merge -p \\\n"
-        "    \"{\\\"stringData\\\":{\\\"codex-token\\\":\\\"$ACCESS\\\","
-        "\\\"codex-refresh-token\\\":\\\"$REFRESH\\\","
-        f"\\\"codex-client-id\\\":\\\"{_CODEX_CLIENT_ID}\\\","
-        f"\\\"codex-account-id\\\":\\\"{acct}\\\"}}}}\""
-    )
+        sys.exit(1)
+    finally:
+        verifier.close()
+
+    detail = account.get("account") or {}
+    print("\nCodex enrolled successfully.")
+    print(f"  auth mode: {detail.get('type')}  plan: {detail.get('planType')}")
+    buckets = rate_limits.get("rateLimitsByLimitId") or {}
+    print(f"  rate-limit buckets visible: {', '.join(sorted(buckets)) or 'rateLimits only'}")
+    print("\nSet CODEX_MODE=app_server (if it is not already) and roll the server:")
     print("  kubectl -n usage-dashboard rollout restart deploy/usage-dashboard-server")
 
 
@@ -678,16 +513,32 @@ def main() -> None:
         help="Provider to log in to",
     )
     login_parser.add_argument(
-        "--port",
-        type=int,
-        default=None,
-        help="[claude] Local port for OAuth callback server (omit for manual paste); "
-        "[codex] callback port (default 1455)",
+        "--account",
+        choices=sorted(CLAUDE_ACCOUNT_KEYS),
+        default="personal",
+        help="[claude] Which Claude account to enrol (default: personal)",
     )
     login_parser.add_argument(
-        "--no-browser",
-        action="store_true",
-        help="[claude] Don't auto-open the browser (print URL instead)",
+        "--token-store",
+        default=None,
+        help="[claude] Path to the token store (default: $TOKEN_STORE_PATH or "
+        "/data/tokens.json)",
+    )
+    login_parser.add_argument(
+        "--claude-bin",
+        default=DEFAULT_CLAUDE_BIN,
+        help="[claude] Claude Code executable to run the official login with",
+    )
+    login_parser.add_argument(
+        "--codex-home",
+        default=None,
+        help="[codex] CODEX_HOME to enrol into (default: $CODEX_HOME or /data/codex). "
+        "Must match the server's, or the login will not be visible to it",
+    )
+    login_parser.add_argument(
+        "--codex-bin",
+        default=None,
+        help="[codex] Codex executable (default: $CODEX_BIN or `codex`)",
     )
     login_parser.add_argument(
         "--headless",
@@ -705,13 +556,17 @@ def main() -> None:
 
     if args.command == "login":
         if args.provider == "claude":
-            login_claude(port=args.port, no_browser=args.no_browser)
+            login_claude(
+                account=args.account,
+                token_store_path=args.token_store,
+                claude_bin=args.claude_bin,
+            )
         elif args.provider == "ollama":
             login_ollama(headless=args.headless, verify=not args.no_verify)
         elif args.provider == "opencode":
             login_opencode(headless=args.headless, verify=not args.no_verify)
         elif args.provider == "codex":
-            login_codex(port=args.port, no_browser=args.no_browser)
+            login_codex(codex_home=args.codex_home, codex_bin=args.codex_bin)
     else:
         parser.print_help()
         sys.exit(1)

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import ast
+import pathlib
 from datetime import datetime, timedelta, timezone
 from email.utils import format_datetime
 from unittest.mock import MagicMock, patch
@@ -7,8 +9,9 @@ from unittest.mock import MagicMock, patch
 import httpx
 import pytest
 
+from usage_dashboard.server.codex_app_server import CodexLoginRequired
 from usage_dashboard.server.fetch_claude import fetch_claude_usage, refresh_claude_token
-from usage_dashboard.server.fetch_codex import fetch_codex_usage
+from usage_dashboard.server.fetch_codex import fetch_codex_usage, parse_rate_limits
 from usage_dashboard.server.fetch_ollama import _parse_relative_reset, fetch_ollama_usage
 from usage_dashboard.server.fetch_opencode import (
     _parse_duration_granularity,
@@ -81,30 +84,68 @@ def _claude_response_data():
     }
 
 
-def _codex_response_data():
-    # Mirrors the LIVE GET /wham/usage shape captured 2026-07-10 from a
-    # ChatGPT-plan account: a `rate_limit` (singular) object with
-    # primary_window (~5h session) and secondary_window (weekly). Each window
-    # carries used_percent + reset_at (absolute Unix epoch, seconds).
+def _runtime_string_constants(path):
+    """String literals a module evaluates at runtime, excluding docstrings."""
+    tree = ast.parse(path.read_text())
+    docstrings = set()
+    for node in ast.walk(tree):
+        if isinstance(
+            node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
+        ):
+            first = node.body[0] if node.body else None
+            if (
+                isinstance(first, ast.Expr)
+                and isinstance(first.value, ast.Constant)
+                and isinstance(first.value.value, str)
+            ):
+                docstrings.add(id(first.value))
+    return [
+        node.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant)
+        and isinstance(node.value, str)
+        and id(node) not in docstrings
+    ]
+
+
+def _codex_rate_limits(primary=None, secondary=None, by_limit_id=True):
+    """The LIVE `account/rateLimits/read` result (codex-cli 0.155.1).
+
+    Captured from a real ChatGPT Pro account, including the second
+    `base_model_inference` bucket that must never be folded into the tile.
+    NOTE the units: `windowDurationMins` is MINUTES (weekly = 10080).
+    """
+    bucket = {
+        "limitId": "codex",
+        "limitName": None,
+        "primary": primary,
+        "secondary": secondary,
+        "credits": {"hasCredits": False, "unlimited": False, "balance": "0"},
+        "planType": "pro",
+    }
+    payload = {"rateLimits": bucket, "accountId": "acct-1"}
+    if by_limit_id:
+        payload["rateLimitsByLimitId"] = {
+            "codex": bucket,
+            "base_model_inference": {
+                "limitId": "base_model_inference",
+                "limitName": "gpt-reserve",
+                "primary": {
+                    "usedPercent": 7,
+                    "windowDurationMins": 10080,
+                    "resetsAt": 1790377124,
+                },
+                "secondary": None,
+            },
+        }
+    return payload
+
+
+def _window(percent, minutes, resets_at=1778000000):
     return {
-        "plan_type": "plus",
-        "rate_limit": {
-            "allowed": True,
-            "limit_reached": False,
-            "primary_window": {
-                "used_percent": 42,
-                "limit_window_seconds": 18000,
-                "reset_after_seconds": 16594,
-                "reset_at": 1778000000,
-            },
-            "secondary_window": {
-                "used_percent": 71.5,
-                "limit_window_seconds": 604800,
-                "reset_after_seconds": 577014,
-                "reset_at": 1778400000,
-            },
-        },
-        "credits": {"has_credits": False, "balance": "0"},
+        "usedPercent": percent,
+        "windowDurationMins": minutes,
+        "resetsAt": resets_at,
     }
 
 
@@ -366,162 +407,153 @@ class TestFetchClaude:
         )
 
 
-class TestFetchCodex:
-    def _mock_get(self, mock_client_cls, data, status=200):
-        mock_response = MagicMock()
-        mock_response.json.return_value = data
-        if status >= 400:
-            request = httpx.Request("GET", "https://chatgpt.com/backend-api/wham/usage")
-            resp = httpx.Response(status, request=request)
-            mock_response.raise_for_status.side_effect = httpx.HTTPStatusError(
-                "err", request=request, response=resp
-            )
-        else:
-            mock_response.raise_for_status = MagicMock()
-        mock_client = MagicMock()
-        mock_client.get.return_value = mock_response
-        mock_client.__enter__ = MagicMock(return_value=mock_client)
-        mock_client.__exit__ = MagicMock(return_value=False)
-        mock_client_cls.return_value = mock_client
+class TestParseCodexRateLimits:
+    """Parsing only — the transport is codex_app_server's problem now."""
 
-    @patch("usage_dashboard.server.fetch_codex.httpx.Client")
-    def test_fetch_codex_returns_reading(self, mock_client_cls):
-        self._mock_get(mock_client_cls, _codex_response_data())
-        reading = fetch_codex_usage("test-token")
+    SESSION_MINS = 300  # 5 h
+    WEEKLY_MINS = 10080  # 7 d
+
+    def test_standard_primary_and_secondary(self):
+        reading = parse_rate_limits(
+            _codex_rate_limits(
+                primary=_window(42, self.SESSION_MINS, 1778000000),
+                secondary=_window(71.5, self.WEEKLY_MINS, 1778600000),
+            )
+        )
         assert reading.provider is Provider.CODEX
         assert reading.status is ReadingStatus.CURRENT
         assert reading.session_percent == 42.0
         assert reading.weekly_percent == 71.5
-        # resets_at parsed from the absolute epoch (naive UTC).
         assert reading.session_resets_at == datetime(2026, 5, 5, 16, 53, 20)
         assert reading.stale is False
 
-    @patch("usage_dashboard.server.fetch_codex.httpx.Client")
-    def test_fetch_codex_accepts_fallback_rate_limits_shape(self, mock_client_cls):
-        # The openai/codex struct variant: `rate_limits` with primary/secondary
-        # and `resets_at`. Parser tolerates it alongside the live shape.
-        data = {
-            "rate_limits": {
-                "primary": {"used_percent": 42, "resets_at": 1778000000},
-                "secondary": {"used_percent": 71.5, "resets_at": 1778400000},
-            }
+    def test_weekly_only_window_in_the_primary_slot(self):
+        # The LIVE shape for a Pro account: the weekly window arrives in
+        # `primary` with `secondary: null`. Classifying by slot would report a
+        # 93% weekly burn as a session burn.
+        reading = parse_rate_limits(
+            _codex_rate_limits(primary=_window(93, self.WEEKLY_MINS), secondary=None)
+        )
+        assert reading.session_percent is None
+        assert reading.weekly_percent == 93.0
+        assert reading.weekly_resets_at == datetime(2026, 5, 5, 16, 53, 20)
+
+    def test_weekly_minutes_are_not_mistaken_for_seconds(self):
+        # Regression guard for the unit trap: the pre-migration threshold was
+        # 100_000 SECONDS. A weekly window is 10_080 MINUTES, which is less
+        # than 100_000, so reusing that constant silently classifies every
+        # weekly window as a session window.
+        reading = parse_rate_limits(
+            _codex_rate_limits(primary=_window(93, self.WEEKLY_MINS), secondary=None)
+        )
+        assert reading.weekly_percent == 93.0, (
+            "a 10080-minute window must classify as weekly"
+        )
+
+    def test_session_only_window_in_the_secondary_slot(self):
+        reading = parse_rate_limits(
+            _codex_rate_limits(primary=None, secondary=_window(12, self.SESSION_MINS))
+        )
+        assert reading.session_percent == 12.0
+        assert reading.weekly_percent is None
+
+    def test_session_only_window_in_the_primary_slot(self):
+        reading = parse_rate_limits(
+            _codex_rate_limits(primary=_window(12, self.SESSION_MINS), secondary=None)
+        )
+        assert reading.session_percent == 12.0
+        assert reading.weekly_percent is None
+
+    def test_by_limit_id_is_preferred_over_the_compatibility_bucket(self):
+        payload = _codex_rate_limits(
+            primary=_window(42, self.SESSION_MINS), secondary=None
+        )
+        # Make the two disagree so the assertion can only pass one way.
+        payload["rateLimits"] = {
+            "limitId": "codex",
+            "primary": _window(99, self.SESSION_MINS),
+            "secondary": None,
         }
-        self._mock_get(mock_client_cls, data)
-        reading = fetch_codex_usage("test-token")
+        assert parse_rate_limits(payload).session_percent == 42.0
+
+    def test_compatibility_response_with_only_rate_limits(self):
+        payload = _codex_rate_limits(
+            primary=_window(55, self.SESSION_MINS), secondary=None, by_limit_id=False
+        )
+        assert "rateLimitsByLimitId" not in payload
+        assert parse_rate_limits(payload).session_percent == 55.0
+
+    def test_other_buckets_are_ignored(self):
+        # base_model_inference sits at 7% in the fixture; folding it in would
+        # mix two unrelated limits into one tile.
+        reading = parse_rate_limits(
+            _codex_rate_limits(primary=_window(42, self.SESSION_MINS), secondary=None)
+        )
         assert reading.session_percent == 42.0
-        assert reading.weekly_percent == 71.5
+        assert reading.weekly_percent is None
 
-    @patch("usage_dashboard.server.fetch_codex.httpx.Client")
-    def test_fetch_codex_sends_account_id_header(self, mock_client_cls):
-        self._mock_get(mock_client_cls, _codex_response_data())
-        fetch_codex_usage("test-token", account_id="acct-123")
-        _, kwargs = mock_client_cls.return_value.get.call_args
-        assert kwargs["headers"]["chatgpt-account-id"] == "acct-123"
-        assert kwargs["headers"]["Authorization"] == "Bearer test-token"
-
-    @patch("usage_dashboard.server.fetch_codex.httpx.Client")
-    def test_fetch_codex_401_raises_auth_error(self, mock_client_cls):
-        self._mock_get(mock_client_cls, {}, status=401)
-        with pytest.raises(FetchAuthError):
-            fetch_codex_usage("bad-token")
-
-    @patch("usage_dashboard.server.fetch_codex.httpx.Client")
-    def test_fetch_codex_429_raises_rate_limit_error(self, mock_client_cls):
-        self._mock_get(mock_client_cls, {}, status=429)
-        with pytest.raises(FetchRateLimitError):
-            fetch_codex_usage("test-token")
-
-    @patch("usage_dashboard.server.fetch_codex.httpx.Client")
-    def test_fetch_codex_missing_rate_limits_raises(self, mock_client_cls):
-        self._mock_get(mock_client_cls, {"something_else": 1})
-        with pytest.raises(FetchError):
-            fetch_codex_usage("test-token")
-
-    @patch("usage_dashboard.server.fetch_codex.httpx.Client")
-    def test_fetch_codex_weekly_only_no_primary(self, mock_client_cls):
-        # Weekly-only mode: primary_window is null, only secondary_window
-        # (weekly) is present. session_percent should be None.
-        data = {
-            "plan_type": "plus",
-            "rate_limit": {
-                "allowed": True,
-                "limit_reached": False,
-                "primary_window": None,
-                "secondary_window": {
-                    "used_percent": 55,
-                    "limit_window_seconds": 604800,
-                    "reset_after_seconds": 400000,
-                    "reset_at": 1778400000,
-                },
-            },
-        }
-        self._mock_get(mock_client_cls, data)
-        reading = fetch_codex_usage("test-token")
+    def test_null_and_missing_windows(self):
+        reading = parse_rate_limits(_codex_rate_limits(primary=None, secondary=None))
         assert reading.session_percent is None
+        assert reading.weekly_percent is None
         assert reading.session_resets_at is None
-        assert reading.weekly_percent == 55.0
-        assert reading.weekly_resets_at == datetime(2026, 5, 10, 8, 0, 0)
+        assert reading.weekly_resets_at is None
 
-    @patch("usage_dashboard.server.fetch_codex.httpx.Client")
-    def test_fetch_codex_weekly_in_primary_window(self, mock_client_cls):
-        # Weekly-only mode variant: the sole window is in primary_window but
-        # its limit_window_seconds (604800) identifies it as weekly.
-        data = {
-            "plan_type": "plus",
-            "rate_limit": {
-                "allowed": True,
-                "limit_reached": False,
-                "primary_window": {
-                    "used_percent": 33,
-                    "limit_window_seconds": 604800,
-                    "reset_after_seconds": 400000,
-                    "reset_at": 1778400000,
-                },
-            },
-        }
-        self._mock_get(mock_client_cls, data)
-        reading = fetch_codex_usage("test-token")
-        assert reading.session_percent is None
-        assert reading.weekly_percent == 33.0
-
-    @patch("usage_dashboard.server.fetch_codex.httpx.Client")
-    def test_fetch_codex_session_only_in_secondary_window(self, mock_client_cls):
-        # Edge case: the sole window is in secondary_window but its
-        # limit_window_seconds (18000) identifies it as a session window.
-        data = {
-            "plan_type": "plus",
-            "rate_limit": {
-                "allowed": True,
-                "limit_reached": False,
-                "secondary_window": {
-                    "used_percent": 80,
-                    "limit_window_seconds": 18000,
-                    "reset_after_seconds": 12000,
-                    "reset_at": 1778000000,
-                },
-            },
-        }
-        self._mock_get(mock_client_cls, data)
-        reading = fetch_codex_usage("test-token")
-        assert reading.session_percent == 80.0
-        assert reading.weekly_percent is None
-
-    @patch("usage_dashboard.server.fetch_codex.httpx.Client")
-    def test_fetch_codex_both_windows_absent(self, mock_client_cls):
-        # Both windows absent/null — the rate_limit object exists but has
-        # no window data. Should not raise; produces a reading with both
-        # percents None (rendered as offline-like by the client).
-        data = {
-            "plan_type": "plus",
-            "rate_limit": {
-                "allowed": True,
-                "limit_reached": False,
-            },
-        }
-        self._mock_get(mock_client_cls, data)
-        reading = fetch_codex_usage("test-token")
+    def test_missing_percentages_and_reset_times(self):
+        reading = parse_rate_limits(
+            _codex_rate_limits(
+                primary={"windowDurationMins": 300}, secondary={"usedPercent": None}
+            )
+        )
         assert reading.session_percent is None
         assert reading.weekly_percent is None
+
+    def test_malformed_response_raises_a_contained_error(self):
+        with pytest.raises(FetchError):
+            parse_rate_limits({"nothing": "useful"})
+
+
+class TestFetchCodexUsage:
+    """The thin layer between the App Server client and the parser."""
+
+    def test_fetches_through_the_client(self):
+        client = MagicMock()
+        client.read_account_and_rate_limits.return_value = (
+            {"account": {"type": "chatgpt"}},
+            _codex_rate_limits(primary=_window(42, 300), secondary=None),
+        )
+        reading = fetch_codex_usage(client)
+        assert reading.provider is Provider.CODEX
+        assert reading.session_percent == 42.0
+
+    def test_login_required_propagates(self):
+        client = MagicMock()
+        client.read_account_and_rate_limits.side_effect = CodexLoginRequired(
+            "Codex login required"
+        )
+        with pytest.raises(CodexLoginRequired):
+            fetch_codex_usage(client)
+
+    def test_no_openai_oauth_surface_remains(self):
+        """Acceptance criterion: the custom integration is gone, not just unused.
+
+        Checks *runtime* string constants across the package — docstrings and
+        comments are excluded, because this module's own prose necessarily
+        names what was removed.
+        """
+        forbidden = (
+            "app_EMoamEEZ73f0CkXaXp7hrann",  # Codex CLI OAuth client id
+            "auth.openai.com",  # OpenAI token endpoint
+            "codex_cli_rs",  # originator spoofing
+            "backend-api/wham/usage",  # the internal usage endpoint
+        )
+        offenders = []
+        for path in sorted(pathlib.Path("src/usage_dashboard").rglob("*.py")):
+            for literal in _runtime_string_constants(path):
+                for marker in forbidden:
+                    if marker in literal:
+                        offenders.append(f"{path}: {marker}")
+        assert not offenders, offenders
 
 
 class TestFetchZai:
