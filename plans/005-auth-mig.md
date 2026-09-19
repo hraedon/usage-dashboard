@@ -752,7 +752,35 @@ by a reader thread into a queue. Caught by the interleaved-notification test.
 - Both pinned artefacts' SHA256 checksums verified against real downloads.
 - 739 tests pass; `ruff check .` and `mypy src` (strict) clean.
 
+### Phase B — done 2026-09-19
+
+Merged as PR #40 (CI, identifier-gate and GitGuardian green), image built on
+`main` (`sha-8ef9e8f`), deployment manifest applied, Codex enrolled by
+device code in the pod.
+
+Result on the live deployment:
+
+- Both pinned CLIs present: `codex-cli 0.155.1`, `2.1.276 (Claude Code)`.
+- `claude` and `claude_work` rode through the rollout untouched — the token
+  store was already populated and is now authoritative, so no Claude enrolment
+  was needed (as the plan's Phase B step 3 anticipated).
+- Codex came up `offline` with the actionable detail, then `current` at 93.0%
+  weekly after enrolment. Scheduler logged `codex poll interval -> 300s
+  (recovered)`.
+- One resident App Server child, **92 MB RSS** — not the ~302 MB estimated
+  during the decision, because that figure was measured against a
+  plugin-laden `CODEX_HOME`. Pod total went 50 Mi → 69 Mi.
+- `CODEX_HOME` settled at 3.4 MB; `/data` at 1% of the 1 GiB PVC.
+
+**A first enrolment needs no rollout**, contrary to this plan's
+"operational procedure should still roll the deployment" step. A failed fetch
+discards the resident session (`CodexLoginRequired` is a `FetchError`), so the
+next poll starts a fresh child holding the new credential; `POST /refresh`
+makes it immediate. Verified with the pod at zero restarts. Re-enrolment still
+involves rolls, because it requires `CODEX_MODE=disabled` first to avoid two
+App Server processes on one `CODEX_HOME`.
+
 ### Not done here
 
-Phase B (production enrolment: device-code paste + rollout) is the operator's.
-Phase C (delete the deprecated Secret keys) waits on the soak.
+Phase C (delete the deprecated Secret keys, and the now-dead `codex` entry in
+the token store) waits on the soak.

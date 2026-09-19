@@ -227,8 +227,11 @@ It prints a verification URL and a one-time code. Open the URL, enter the code,
 and it confirms enrolment by re-reading the account through a *fresh* App Server
 process — which is what proves the credential actually landed on the PVC.
 
-Set `CODEX_MODE=app_server` in the deployment (the default in the manifest) and
-roll the server.
+**A first enrolment needs no rollout.** The resident App Server child is
+discarded whenever a fetch raises, and "login required" is one of those, so the
+next poll starts a fresh child that reads the new credential. `POST /refresh`
+makes it immediate instead of waiting out the failure backoff. Verified in
+production: `offline` → `current` with the pod at zero restarts.
 
 > **Re-enrolling:** never run two App Server processes against one `CODEX_HOME`.
 > Set `CODEX_MODE=disabled`, roll the pod, run the login, then restore
@@ -270,8 +273,8 @@ completely hidden.
 
 #### Footprint on the PVC
 
-The server keeps one resident `codex app-server` child (~300 MB RSS) rather than
-starting one per poll. Each *start* leaves ~29 kB behind in `CODEX_HOME` —
+The server keeps one resident `codex app-server` child (~92 MB RSS, measured in
+production with plugins disabled) rather than starting one per poll. Each *start* leaves ~29 kB behind in `CODEX_HOME` —
 uncheckpointed SQLite WALs and a leaked temp directory — which at one start per
 5-minute poll is ~8.3 MB/day and fills the 1 GiB PVC in about four months,
 taking `readings.db` with it. Growth is per-start, not per-request, so one child
