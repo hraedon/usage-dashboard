@@ -17,11 +17,71 @@ COPY src/ src/
 
 RUN pip install --no-cache-dir --prefix=/install --no-deps .
 
+
+# ---------------------------------------------------------------------------
+# Official provider CLIs (Plan 005)
+#
+# Both are standalone native binaries — no Node or Rust toolchain is needed —
+# fetched in a builder stage so curl and the tarballs stay out of the runtime
+# image. Both are pinned to an exact version and verified against a published
+# SHA256; `latest` must never appear here, because an unattended image rebuild
+# would otherwise change the protocol the server speaks without a code change.
+#
+# `codex` is the App Server the dashboard reads Codex usage through. `claude`
+# is only ever run by the operator during `usage-dashboard login claude`, but
+# it must live in THIS image: the Longhorn PVC holding the token store is RWO,
+# so enrolment has to happen via `kubectl exec` in the one pod that mounts it.
+#
+# Size: these add roughly 480 MB to the image. That is the price of enrolling a
+# clean deployment from a terminal with no token copy/paste and no sacrificial
+# VM. Check the published checksums before bumping either pin:
+#   https://github.com/openai/codex/releases
+#   https://downloads.claude.ai/claude-code-releases/<version>/manifest.json
+# ---------------------------------------------------------------------------
+FROM python:3.12-slim AS clis
+
+ARG TARGETARCH=amd64
+
+# Pinned versions, verified live against these exact builds.
+ARG CODEX_VERSION=0.155.1
+ARG CODEX_SHA256=a0ef8b2debc3bf747e07b1a039354de31300ac0dcc2276498ba281470b5d9115
+ARG CLAUDE_VERSION=2.1.276
+ARG CLAUDE_SHA256=8a56c8a14bd3cb246e2bdb7e60aefe0f609bff78c8bbcc5ea6b1817c111c6145
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# The checksums above are for the x86_64 artefacts, and the build workflow
+# targets a single amd64 node. Fail loudly rather than silently installing an
+# unverified binary if that ever changes.
+RUN test "$TARGETARCH" = "amd64" \
+    || (echo "Pinned checksums are x86_64-only; got TARGETARCH=$TARGETARCH" >&2; exit 1)
+
+RUN curl -fsSL -o /tmp/codex.tar.gz \
+      "https://github.com/openai/codex/releases/download/rust-v${CODEX_VERSION}/codex-x86_64-unknown-linux-musl.tar.gz" \
+    && echo "${CODEX_SHA256}  /tmp/codex.tar.gz" | sha256sum -c - \
+    && tar -xzf /tmp/codex.tar.gz -C /tmp \
+    && install -m 0755 /tmp/codex-x86_64-unknown-linux-musl /usr/local/bin/codex \
+    && rm -rf /tmp/codex.tar.gz /tmp/codex-x86_64-unknown-linux-musl
+
+RUN curl -fsSL -o /tmp/claude \
+      "https://downloads.claude.ai/claude-code-releases/${CLAUDE_VERSION}/linux-x64/claude" \
+    && echo "${CLAUDE_SHA256}  /tmp/claude" | sha256sum -c - \
+    && install -m 0755 /tmp/claude /usr/local/bin/claude \
+    && rm -f /tmp/claude
+
+# Prove both binaries actually run in this image before it ships.
+RUN /usr/local/bin/codex --version && /usr/local/bin/claude --version
+
+
 FROM python:3.12-slim
 
 WORKDIR /app
 
 COPY --from=builder /install /usr/local
+COPY --from=clis /usr/local/bin/codex /usr/local/bin/codex
+COPY --from=clis /usr/local/bin/claude /usr/local/bin/claude
 
 VOLUME ["/data"]
 
@@ -29,6 +89,8 @@ EXPOSE 8080
 
 ENV DB_PATH="/data/readings.db" \
     FETCH_INTERVAL="300" \
-    PORT="8080"
+    PORT="8080" \
+    CODEX_HOME="/data/codex" \
+    CODEX_BIN="/usr/local/bin/codex"
 
 CMD ["python", "-m", "usage_dashboard.server.main"]

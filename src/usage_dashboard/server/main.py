@@ -8,6 +8,12 @@ import sys
 import uvicorn
 
 from usage_dashboard.server.api import create_app
+from usage_dashboard.server.codex_app_server import (
+    DEFAULT_CODEX_BIN,
+    DEFAULT_CODEX_HOME,
+    CodexAppServerClient,
+    CodexAppServerConfig,
+)
 from usage_dashboard.server.db import Database
 from usage_dashboard.server.schedule_config import ScheduleConfig
 from usage_dashboard.server.scheduler import FetchScheduler
@@ -22,31 +28,39 @@ def _resolve_claude_tokens(
     env_refresh: str | None,
     store_key: str = "claude",
 ) -> tuple[str | None, str | None]:
-    """Decide which Claude tokens to run with (WI-001).
+    """Decide which Claude tokens to run with (WI-001, revised by Plan 005).
 
-    The k8s Secret keeps the originally-provisioned tokens forever, so seeding
-    the store from the env on every boot would clobber the refreshed tokens the
-    scheduler persisted — after a restart the stale pair 401s and its
-    already-rotated refresh token can't recover. Instead: only (re)seed from the
-    env when the Secret differs from what we last seeded (first boot or a
-    deliberate re-login); otherwise prefer the persisted, possibly-refreshed
-    tokens. A hash of the env access token is the change marker, so the Secret
-    value isn't duplicated on disk.
+    The token store is now **authoritative**. Claude credentials are created by
+    ``usage-dashboard login claude``, which writes straight into the store, so
+    the Secret is only ever a migration seed:
+
+    * an empty entry is seeded once from the environment (a pre-Plan-005
+      deployment carrying its credentials in ``server-secrets``);
+    * once an entry exists, the environment can no longer displace it.
+
+    The old behaviour re-seeded whenever the Secret's value differed from a
+    recorded marker. That is unsafe now: the Secret keeps the originally
+    provisioned tokens forever, so after enrolment writes a fresh credential, a
+    restart would find the marker unchanged... but any hand-edit of the Secret
+    would silently overwrite the newly enrolled credential with a stale pair
+    that has already been rotated away. Only enrolment replaces a credential.
 
     *store_key* namespaces the credentials so a second account ("claude_work")
     resolves and persists independently of the primary one.
     """
     persisted_access, persisted_refresh = token_store.get(store_key)
+    if persisted_access and persisted_refresh:
+        return persisted_access, persisted_refresh
 
     if env_access and env_refresh:
-        marker = hashlib.sha256(env_access.encode()).hexdigest()
-        if marker != token_store.get_seed_marker(store_key):
-            # New credential from the Secret — adopt it and record the marker.
-            token_store.save(store_key, env_access, env_refresh)
-            token_store.set_seed_marker(store_key, marker)
-            return env_access, env_refresh
+        # One-time import for a deployment that predates enrolment.
+        logger.info(
+            "Seeding %s credentials from the environment into the empty token store",
+            store_key,
+        )
+        token_store.save(store_key, env_access, env_refresh)
+        return env_access, env_refresh
 
-    # Prefer persisted (refreshed) tokens; fall back to whatever the env gave.
     return persisted_access or env_access, persisted_refresh or env_refresh
 
 
@@ -75,6 +89,37 @@ def _resolve_cookie(
             return env_cookie
 
     return persisted or env_cookie
+
+
+def _build_codex_client(
+    mode: str,
+    home: str,
+    binary: str,
+) -> CodexAppServerClient | None:
+    """Construct the Codex App Server client for *mode*, or None if disabled.
+
+    ``app_server`` is the only enabled mode: the dashboard drives the official
+    `codex` App Server. Anything else (including the default) leaves Codex
+    unconfigured, so its tile is absent rather than showing a failure the
+    operator never asked for.
+    """
+    if mode != "app_server":
+        if mode not in ("disabled", ""):
+            logger.warning(
+                "Unknown CODEX_MODE %r; Codex is disabled. Expected 'app_server' "
+                "or 'disabled'.",
+                mode,
+            )
+        return None
+    logger.info("Codex enabled in app_server mode (CODEX_HOME=%s, bin=%s)", home, binary)
+    # persistent: one resident child for the pod's life. Explicit here because
+    # it is a deployment-shaped decision — a child per poll leaks ~29 kB of
+    # uncheckpointed SQLite WAL and a temp dir into CODEX_HOME each start,
+    # which fills the PVC (and kills the readings DB with it) in about four
+    # months. FetchScheduler.stop() closes it.
+    return CodexAppServerClient(
+        CodexAppServerConfig(binary=binary, home=home), persistent=True
+    )
 
 
 def _optional_int_env(name: str) -> int | None:
@@ -115,11 +160,12 @@ def main() -> None:
     # the workspace id (stable, `wrk_…`) and the `auth` browser cookie.
     opencode_workspace_id = os.environ.get("OPENCODE_WORKSPACE_ID") or None
     opencode_cookie = os.environ.get("OPENCODE_COOKIE") or None
-    # Optional OpenAI Codex (ChatGPT-plan) account, via a dedicated OAuth login.
-    codex_token = os.environ.get("CODEX_TOKEN") or None
-    codex_refresh_token = os.environ.get("CODEX_REFRESH_TOKEN") or None
-    codex_client_id = os.environ.get("CODEX_CLIENT_ID") or None
-    codex_account_id = os.environ.get("CODEX_ACCOUNT_ID") or None
+    # Optional OpenAI Codex (ChatGPT-plan) account. Plan 005: the official
+    # `codex` App Server owns the login, tokens and refresh; the dashboard
+    # holds no OpenAI credential at all.
+    codex_mode = (os.environ.get("CODEX_MODE") or "disabled").strip().lower()
+    codex_home = os.environ.get("CODEX_HOME") or DEFAULT_CODEX_HOME
+    codex_bin = os.environ.get("CODEX_BIN") or DEFAULT_CODEX_BIN
     # Optional Umans wallet key (Plan 004): adds the corner balance line on
     # the Pi; absent leaves the provider unconfigured.
     umans_key = os.environ.get("UMANS_API_KEY") or None
@@ -149,11 +195,7 @@ def main() -> None:
     )
     ollama_cookie = _resolve_cookie(token_store, ollama_cookie, "ollama")
     opencode_cookie = _resolve_cookie(token_store, opencode_cookie, "opencode")
-    # Codex reuses the Claude token-resolution logic (seed-once, prefer
-    # persisted-refreshed) under its own store key.
-    codex_token, codex_refresh_token = _resolve_claude_tokens(
-        token_store, codex_token, codex_refresh_token, store_key="codex"
-    )
+    codex_client = _build_codex_client(codex_mode, codex_home, codex_bin)
 
     scheduler = FetchScheduler(
         db=database,
@@ -169,10 +211,7 @@ def main() -> None:
         ollama_cookie=ollama_cookie,
         opencode_workspace_id=opencode_workspace_id,
         opencode_cookie=opencode_cookie,
-        codex_token=codex_token,
-        codex_refresh_token=codex_refresh_token,
-        codex_client_id=codex_client_id,
-        codex_account_id=codex_account_id,
+        codex_client=codex_client,
         umans_key=umans_key,
         interval_seconds=fetch_interval,
         failure_cap_seconds=failure_backoff_cap,

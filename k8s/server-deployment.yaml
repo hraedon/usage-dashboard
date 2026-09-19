@@ -29,6 +29,11 @@ spec:
                   key: api-key
             - name: DB_PATH
               value: "/data/readings.db"
+            # DEPRECATED (Plan 005), remove in Phase C once the soak is over.
+            # Claude credentials now live in the token store on the PVC, written
+            # by `usage-dashboard login claude`. The store is AUTHORITATIVE:
+            # these values seed it only when its entry is empty, so they are a
+            # migration/rollback net, not the source of truth.
             - name: CLAUDE_TOKEN
               valueFrom:
                 secretKeyRef:
@@ -100,30 +105,19 @@ spec:
                   name: server-secrets
                   key: opencode-cookie
                   optional: true
-            - name: CODEX_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: server-secrets
-                  key: codex-token
-                  optional: true
-            - name: CODEX_REFRESH_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: server-secrets
-                  key: codex-refresh-token
-                  optional: true
-            - name: CODEX_CLIENT_ID
-              valueFrom:
-                secretKeyRef:
-                  name: server-secrets
-                  key: codex-client-id
-                  optional: true
-            - name: CODEX_ACCOUNT_ID
-              valueFrom:
-                secretKeyRef:
-                  name: server-secrets
-                  key: codex-account-id
-                  optional: true
+            # Codex (Plan 005): the official `codex` App Server owns the
+            # ChatGPT login, its tokens and their refresh. The dashboard holds
+            # no OpenAI credential, so there is nothing to inject here.
+            # `app_server` enables the tile; `disabled` hides it (and is what
+            # you set temporarily to re-enrol — never run two App Server
+            # processes against one CODEX_HOME).
+            - name: CODEX_MODE
+              value: "app_server"
+            # On the PVC, so the login survives pod restarts.
+            - name: CODEX_HOME
+              value: "/data/codex"
+            - name: CODEX_BIN
+              value: "/usr/local/bin/codex"
             # Umans wallet (Plan 004): the corner balance line on the Pi.
             # Absent/empty secret key leaves the provider unconfigured.
             - name: UMANS_API_KEY

@@ -12,6 +12,8 @@ A two-component system for monitoring AI usage across Claude, z.ai, Ollama, Code
 Key modules:
 - `src/usage_dashboard/shared/models.py` — Normalized reading schema (Provider enum, Reading dataclass)
 - `src/usage_dashboard/server/` — Fetchers (Claude, z.ai, Ollama, Codex, OpenCode Go), SQLite DB, API, scheduler
+- `src/usage_dashboard/server/codex_app_server.py` — client for the official `codex app-server` (JSONL over stdio). **Protocol facts in its docstring were verified against a real binary, not docs** — keep it that way. **One long-lived child** (`persistent=True`) — not one per fetch. Latency would allow per-fetch (~0.7s vs a 300s poll), but each *start* leaks ~29 kB of uncheckpointed SQLite WAL plus a `.tmp/git-*` dir into `CODEX_HOME`: ~8.3 MB/day, which fills the 1 GiB PVC — and the readings DB with it — in ~4 months. Growth is per-start, not per-request. Plugins are disabled in the default args because an authenticated App Server otherwise downloads ~50 MB of plugin catalog and Office templates this client can never reach (55.9 MB → 3.1 MB). Never bound a read with `select()` here: the child writes notifications and responses together, and `select()` cannot see lines already in Python's buffer
+- `src/usage_dashboard/claude_credentials.py` — quarantined parser for Claude Code's `.credentials.json`. Fails closed and names the installed CLI version; it is the only place that knows that (undocumented) schema
 - `src/usage_dashboard/client/` — HTTP fetcher with adaptive refresh, pygame touch GUI
 - `src/usage_dashboard/deploy/` — `redeploy.py`: opt-in self-redeploy of the Pi's installer-managed components (units/scripts) from the pulled checkout (`AUTO_REDEPLOY=1`); driven by `deploy/pi/update.sh` via the root `usage-dashboard-redeploy` helper. Content-addressed + atomic-write + unit-verify + GUI rollback
 - `k8s/` — Kubernetes manifests for deployment
@@ -26,9 +28,32 @@ uv venv && uv pip install -e ".[dev]"
 .venv/bin/mypy src
 ```
 
+## Provider authentication (Plan 005)
+
+The dashboard implements **no OAuth flow of its own**. Enrolment happens inside
+the server pod, via each vendor's official CLI (both pinned into the image):
+
+- `usage-dashboard login codex` — device-code login against the official App
+  Server. Codex owns the tokens under `CODEX_HOME` (`/data/codex`). Nothing here
+  mints, stores or refreshes an OpenAI token. Never run two App Server processes
+  against one `CODEX_HOME`.
+- `usage-dashboard login claude --account personal|work` — runs the official
+  Claude Code login in a throwaway `CLAUDE_CONFIG_DIR`, imports the credential
+  into the token store, then **deletes** that directory. The deletion is
+  load-bearing: a refresh-token family must have exactly one refresher.
+
+`/data/tokens.json` is authoritative for Claude; the `claude-*` Secret keys seed
+only an *empty* entry (deprecated, deleted in Phase C). The token store takes an
+advisory file lock because enrolment mutates it from a second process, and it
+fails closed on corrupt content rather than replacing it.
+
+Claude usage remains an **unsupported** dependency (undocumented
+`GET /api/oauth/usage` plus that credential file); Codex usage is supported.
+
 ## Hard rules
 
 - **Spec acceptance criteria are the boundary.** Don't add features beyond the spec without a tracked breadcrumb or plan entry.
+- **Don't reintroduce an OpenAI OAuth surface.** A test asserts no runtime string in `src/` contains the Codex client id, `auth.openai.com`, `codex_cli_rs` or `backend-api/wham/usage`.
 
 ## Work items / breadcrumbs
 
