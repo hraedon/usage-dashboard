@@ -28,13 +28,27 @@ binary rather than taken from documentation:
   ``{loginId, verificationUrl, userCode}``; ``account/login/cancel`` takes the
   ``loginId`` and answers ``{"status": "canceled"}``.
 
-**Process lifetime.** A full spawn → initialize → read cycle measures ~0.7 s
-against a 300 s poll interval, so the default policy is one short-lived child
-per call: the next poll is the retry, on the scheduler's existing backoff,
-which removes any need for a restart policy or a resident child. The
-session layer below is deliberately lifetime-agnostic, and a persistent
-policy is implemented and tested (``persistent=True``) so moving to a
-long-lived child later is a constructor flag, not a rewrite.
+**Process lifetime.** The default is one long-lived child (``persistent=True``),
+restarted at most once per call if its transport breaks.
+
+On latency alone a short-lived child per call is fine — a full spawn →
+initialize → read cycle measures ~0.7 s against a 300 s poll. What rules it out
+is disk. Each *start* leaves roughly 29 kB behind in ``CODEX_HOME``: SQLite
+``-wal`` files that are never checkpointed, because the child is terminated
+rather than closed cleanly, plus one leaked ``.tmp/git-XXXXXX/`` directory.
+Measured over 25 starts that is linear, and at 288 polls a day it works out to
+~8.3 MB/day — which fills the 1 GiB Longhorn PVC in about four months and takes
+the readings database down with it, four months after anyone touched this code.
+
+The growth is per-start, not per-request: 30 request cycles against one
+long-lived child left ``CODEX_HOME`` unchanged at 2.872 MB. So a resident child
+costs ~300 MB RSS and bounds the disk usage, while a per-call child costs no RSS
+and grows without limit. On a 32 GB node the RSS is the cheaper of the two.
+
+``persistent=False`` is still implemented and tested, and remains correct for a
+short-lived or one-shot invocation — the enrolment CLI uses it deliberately, so
+that verification runs against a *fresh* process. The session layer is
+lifetime-agnostic; the policy is a constructor flag either way.
 """
 from __future__ import annotations
 
@@ -58,7 +72,27 @@ logger = logging.getLogger(__name__)
 DEFAULT_CODEX_BIN = "codex"
 DEFAULT_CODEX_HOME = "/data/codex"
 # `app-server` last so the global flags bind to the CLI, not the subcommand.
-DEFAULT_CODEX_ARGS: tuple[str, ...] = ("-s", "read-only", "-a", "never", "app-server")
+#
+# The plugin features are disabled deliberately. Once authenticated, the App
+# Server bootstraps a remote plugin catalog (a ~22 MB JSON) and a template cache
+# (~25 MB of .pptx/.docx) into CODEX_HOME. This client only ever calls
+# `account/read` and `account/rateLimits/read` — it never starts a thread or
+# runs a tool — so none of that is reachable, and it is 50 MB of a 1 GiB PVC
+# shared with the readings database. Measured: 55.9 MB with plugins, 3.1 MB
+# without, identical readings.
+DEFAULT_CODEX_ARGS: tuple[str, ...] = (
+    "-s",
+    "read-only",
+    "-a",
+    "never",
+    "--disable",
+    "plugins",
+    "--disable",
+    "remote_plugin",
+    "--disable",
+    "plugin_sharing",
+    "app-server",
+)
 
 _CLIENT_NAME = "usage_dashboard"
 _CLIENT_TITLE = "Usage Dashboard"
@@ -411,21 +445,23 @@ class AppServerSession:
 class CodexAppServerClient:
     """Public App Server API, with a pluggable process-lifetime policy.
 
-    ``persistent=False`` (the default) starts a child per call and closes it
-    again — the measured cost is ~0.7 s against a 300 s poll, and it means a
-    broken child needs no restart policy because the next poll simply spawns a
-    fresh one on the scheduler's existing backoff.
+    ``persistent=True`` (the default) keeps one child and restarts it at most
+    once per call if the transport breaks. This is the runtime policy: every
+    *start* leaks ~29 kB into ``CODEX_HOME`` (uncheckpointed SQLite WALs and a
+    temp directory), which is unbounded at one start per poll but irrelevant at
+    one start per pod. See the module docstring for the measurements.
 
-    ``persistent=True`` keeps one child and restarts it at most once per call
-    if the transport breaks. Both policies are exercised by the tests so the
-    long-lived option stays a live migration target.
+    ``persistent=False`` starts a child per call and closes it again. Correct
+    for short-lived invocations — the enrolment CLI uses it so that its
+    verification step runs against a genuinely fresh process. Both policies are
+    exercised by the tests.
     """
 
     def __init__(
         self,
         config: CodexAppServerConfig | None = None,
         *,
-        persistent: bool = False,
+        persistent: bool = True,
         session_factory: Callable[[CodexAppServerConfig], AppServerSession] | None = None,
     ) -> None:
         self._config = config or CodexAppServerConfig()

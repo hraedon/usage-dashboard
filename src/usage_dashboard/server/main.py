@@ -112,7 +112,14 @@ def _build_codex_client(
             )
         return None
     logger.info("Codex enabled in app_server mode (CODEX_HOME=%s, bin=%s)", home, binary)
-    return CodexAppServerClient(CodexAppServerConfig(binary=binary, home=home))
+    # persistent: one resident child for the pod's life. Explicit here because
+    # it is a deployment-shaped decision — a child per poll leaks ~29 kB of
+    # uncheckpointed SQLite WAL and a temp dir into CODEX_HOME each start,
+    # which fills the PVC (and kills the readings DB with it) in about four
+    # months. FetchScheduler.stop() closes it.
+    return CodexAppServerClient(
+        CodexAppServerConfig(binary=binary, home=home), persistent=True
+    )
 
 
 def _optional_int_env(name: str) -> int | None:

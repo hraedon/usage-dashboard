@@ -460,7 +460,9 @@ def login_codex(
         print(f"  code: {code}\n")
         print("Waiting for the login to complete...")
 
-    client = CodexAppServerClient(config)
+    # persistent=False: enrolment is a one-shot ceremony, and the per-start
+    # CODEX_HOME residue the runtime avoids is irrelevant for a handful of runs.
+    client = CodexAppServerClient(config, persistent=False)
     try:
         client.device_code_login(present, timeout=timeout)
     except FetchError as exc:
@@ -473,7 +475,7 @@ def login_codex(
     # child would only prove it remembered its own login; spawning a new one
     # proves the credential actually reached CODEX_HOME on disk, which is what
     # the server will read after the next rollout.
-    verifier = CodexAppServerClient(config)
+    verifier = CodexAppServerClient(config, persistent=False)
     try:
         account, rate_limits = verifier.read_account_and_rate_limits()
     except FetchError as exc:

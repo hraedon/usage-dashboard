@@ -18,6 +18,7 @@ from typing import Any
 import pytest
 
 from usage_dashboard.server.codex_app_server import (
+    DEFAULT_CODEX_ARGS,
     AppServerSession,
     CodexAppServerClient,
     CodexAppServerConfig,
@@ -140,7 +141,7 @@ def _config(tmp_path: Path, behaviour: str = "ok", **kw: Any) -> CodexAppServerC
     return CodexAppServerConfig(
         binary=str(_fake_codex(tmp_path, behaviour)),
         home=str(home),
-        args=("-s", "read-only", "-a", "never", "app-server"),
+        args=DEFAULT_CODEX_ARGS,
         **kw,
     )
 
@@ -157,7 +158,13 @@ class TestLaunch:
             (Path(config.home) / "invocation.json").read_text()
         )
         # Flag order matters: these are CLI globals, so `app-server` is last.
-        assert invocation["argv"] == ["-s", "read-only", "-a", "never", "app-server"]
+        assert invocation["argv"] == list(DEFAULT_CODEX_ARGS)
+        assert invocation["argv"][-1] == "app-server"
+        # Plugins off: the App Server otherwise downloads ~50 MB of catalog and
+        # Office templates into CODEX_HOME that this client can never reach.
+        assert "--disable" in invocation["argv"]
+        for feature in ("plugins", "remote_plugin", "plugin_sharing"):
+            assert feature in invocation["argv"]
         assert invocation["codex_home"] == config.home
 
     def test_missing_binary_raises_fetch_error(self, tmp_path: Path) -> None:
@@ -257,7 +264,41 @@ class TestProtocol:
 
 
 class TestLifetimePolicy:
-    """One-shot is the default; persistent stays a live migration target."""
+    """Persistent is the runtime default; one-shot stays supported for enrolment."""
+
+    def test_the_default_is_persistent(self, tmp_path: Path) -> None:
+        """Guard rail, not a style preference.
+
+        A child per poll leaks ~29 kB into CODEX_HOME per *start* —
+        uncheckpointed SQLite WALs plus a `.tmp/git-*` directory — which is
+        ~8.3 MB/day at a 300s interval and fills the 1 GiB PVC in about four
+        months, taking the readings DB with it. The growth is per-start, not
+        per-request, so one resident child bounds it. Flipping this back
+        reintroduces a failure that shows up a third of a year later.
+        """
+        client = CodexAppServerClient(_config(tmp_path))
+        try:
+            client.read_account()
+            assert client._session is not None, (
+                "the runtime default must reuse one child; a child per call "
+                "grows CODEX_HOME without bound"
+            )
+        finally:
+            client.close()
+
+    def test_a_persistent_child_is_started_once_across_many_reads(
+        self, tmp_path: Path
+    ) -> None:
+        config = _config(tmp_path)
+        client = CodexAppServerClient(config, persistent=True)
+        try:
+            for _ in range(5):
+                client.read_account()
+        finally:
+            client.close()
+        # The fake rewrites invocation.json on every start, so a start count is
+        # observable: one file, and the child answered five reads.
+        assert (Path(config.home) / "invocation.json").exists()
 
     def test_one_shot_starts_a_child_per_call_and_retains_none(
         self, tmp_path: Path
@@ -303,12 +344,12 @@ class TestLifetimePolicy:
         assert client._session is None
 
     def test_close_is_idempotent(self, tmp_path: Path) -> None:
-        client = CodexAppServerClient(_config(tmp_path))
+        client = CodexAppServerClient(_config(tmp_path), persistent=False)
         client.close()
         client.close()
 
     def test_calls_after_close_fail_cleanly(self, tmp_path: Path) -> None:
-        client = CodexAppServerClient(_config(tmp_path))
+        client = CodexAppServerClient(_config(tmp_path), persistent=False)
         client.close()
         with pytest.raises(FetchError):
             client.read_account()

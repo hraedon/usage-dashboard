@@ -268,6 +268,17 @@ The work account shows as a **second, muted set of bars in the Claude tile** —
 `me` and `work` — not a separate tile. With no work credential enrolled it stays
 completely hidden.
 
+#### Footprint on the PVC
+
+The server keeps one resident `codex app-server` child (~300 MB RSS) rather than
+starting one per poll. Each *start* leaves ~29 kB behind in `CODEX_HOME` —
+uncheckpointed SQLite WALs and a leaked temp directory — which at one start per
+5-minute poll is ~8.3 MB/day and fills the 1 GiB PVC in about four months,
+taking `readings.db` with it. Growth is per-start, not per-request, so one child
+bounds it. Plugins are disabled for the same reason: an authenticated App Server
+otherwise downloads ~50 MB of plugin catalog and Office templates the dashboard
+can never reach. `CODEX_HOME` settles at ~3 MB.
+
 #### Where credentials live
 
 `/data/tokens.json` on the PVC is **authoritative** for Claude. The

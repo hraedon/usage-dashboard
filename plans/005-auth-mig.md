@@ -696,14 +696,26 @@ documentation summary, and four things in the plan above needed correcting.
 
 ### Deviations from the plan, and why
 
-- **One-shot process, not a long-lived supervised child.** A full spawn →
-  initialize → `account/read` → `account/rateLimits/read` cycle measures
-  **~0.7 s** against a 300 s poll interval. One child per call removes the
-  restart policy, the resident process and most of the supervision surface: the
-  next poll *is* the retry, on the scheduler's existing backoff. The session
-  layer (`AppServerSession`) is lifetime-agnostic and a `persistent=True`
-  policy is implemented **and tested**, so moving to a long-lived child later is
-  a constructor flag, not a rewrite. (Owner decision, 2026-09-18.)
+- **Long-lived child (`persistent=True`), after an initial one-shot decision was
+  reversed on measurement.** One-shot was chosen first because a full spawn →
+  initialize → read cycle measures ~0.7 s against a 300 s poll, which is true
+  but was only the latency axis. Measuring disk before Phase B showed each
+  *start* leaves ~29 kB in `CODEX_HOME` — SQLite `-wal` files never
+  checkpointed (the child is terminated, not closed) plus a leaked
+  `.tmp/git-XXXXXX/` directory. Linear over 25 starts; ~8.3 MB/day at 288
+  polls/day; the 1 GiB PVC fills in ~115 days and takes the readings database
+  with it. The growth is per-start, not per-request: 30 request cycles against
+  one long-lived child left `CODEX_HOME` unchanged. A resident child costs
+  ~302 MB RSS (~1% of a 32 GB node running at 20-40%); that is the cheaper
+  resource here. `persistent=False` stays implemented and tested, and the
+  enrolment CLI uses it deliberately so its verification runs against a fresh
+  process. (Owner decision 2026-09-18, revised on evidence 2026-09-19.)
+- **Plugins disabled in the default args.** An *authenticated* App Server
+  bootstraps a ~22 MB remote plugin catalog and ~25 MB of .pptx/.docx templates
+  into `CODEX_HOME`. This client only calls `account/read` and
+  `account/rateLimits/read`, so none of it is reachable. Measured 55.9 MB with
+  plugins vs 3.1 MB with `--disable plugins --disable remote_plugin --disable
+  plugin_sharing`, identical readings, device-code login unaffected.
 - **No `legacy` CODEX_MODE.** `CODEX_MODE` is `app_server|disabled`. Keeping a
   legacy bridge would mean retaining the exact OpenAI OAuth code that acceptance
   criterion #1 says must not exist, so Phase A could not have satisfied its own
