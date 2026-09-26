@@ -13,8 +13,11 @@ from typing import Any
 from fastapi import APIRouter, Depends, FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from pydantic import BaseModel
 
 from usage_dashboard.server.db import Database
+from usage_dashboard.server.enrolment import EnrolmentError, EnrolmentService
+from usage_dashboard.server.login_page import render_login_html
 from usage_dashboard.server.schedule_config import ScheduleConfig
 from usage_dashboard.server.scheduler import FetchScheduler
 from usage_dashboard.shared.format import umans_wallet_line
@@ -426,6 +429,25 @@ footer {{ text-align:center; color:#555; font-size:0.7rem; margin-top:12px; }}
 </html>"""
 
 
+# Request bodies for the enrolment routes. Module level, not local to
+# create_app: the module's  postpones
+# annotation evaluation, and FastAPI resolves parameter annotations in module
+# scope — a locally-defined model is invisible there and degrades to a query
+# parameter (the 422 this comment replaces).
+class _ClaudeLoginRequest(BaseModel):
+    account: str = "personal"
+
+
+class _CredentialRequest(BaseModel):
+    provider: str
+    credential: str
+    workspace_id: str | None = None
+
+
+class _JobInputRequest(BaseModel):
+    text: str
+
+
 def _make_auth_dependency(
     api_key: str,
 ) -> Callable[..., Any]:
@@ -447,12 +469,17 @@ def create_app(
     configured_providers: Iterable[Provider] | None = None,
     schedule_config: ScheduleConfig | None = None,
     scheduler: FetchScheduler | None = None,
+    enrolment: EnrolmentService | None = None,
 ) -> FastAPI:
     app = FastAPI()
     auth = _make_auth_dependency(api_key)
     # Authenticated routes live on this router so they can be mounted at both
     # /api/v1 and the legacy root paths from a single definition.
     api = APIRouter()
+    # Plan 006: enrolment mints credentials, so it is INTERNAL_ONLY — mounted
+    # once under /internal/v1 and never reachable through the external
+    # ingress's whole-/api rule.
+    internal = APIRouter()
 
     # Only report providers that are actually configured. A provider that was
     # never configured is omitted entirely rather than fabricated as "offline",
@@ -563,6 +590,87 @@ def create_app(
         spec = schedule_config.for_unit(unit) if schedule_config is not None else None
         return {"schedule": spec}
 
+    # -- enrolment (Plan 006) -------------------------------------------
+    #
+    # Blocking work (PTY spawn, the codex pause bracket, live verification)
+    # runs off the event loop via to_thread, mirroring POST /refresh. All of
+    # it requires the bearer key; without an EnrolmentService (tests, a
+    # config-only server) the routes report 501 like /refresh does.
+
+    def _require_enrolment() -> EnrolmentService:
+        if enrolment is None:
+            raise HTTPException(
+                status_code=501, detail="enrolment unavailable (not configured)"
+            )
+        return enrolment
+
+    @internal.get("/login/status", **INTERNAL_ONLY)
+    async def login_status(_user: str = Depends(auth)) -> dict[str, Any]:
+        return await asyncio.to_thread(_require_enrolment().status)
+
+    @internal.post("/login/claude", **INTERNAL_ONLY)
+    async def login_claude(
+        request: _ClaudeLoginRequest, _user: str = Depends(auth)
+    ) -> dict[str, Any]:
+        try:
+            return await asyncio.to_thread(_require_enrolment().start_claude, request.account)
+        except EnrolmentError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @internal.post("/login/codex", **INTERNAL_ONLY)
+    async def login_codex(_user: str = Depends(auth)) -> dict[str, Any]:
+        try:
+            return await asyncio.to_thread(_require_enrolment().start_codex)
+        except EnrolmentError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @internal.post("/login/credential", **INTERNAL_ONLY)
+    async def login_credential(
+        request: _CredentialRequest, _user: str = Depends(auth)
+    ) -> dict[str, Any]:
+        try:
+            return await asyncio.to_thread(
+                _require_enrolment().submit_credential,
+                request.provider,
+                request.credential,
+                request.workspace_id,
+            )
+        except EnrolmentError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @internal.get("/login/jobs/{job_id}", **INTERNAL_ONLY)
+    async def login_job(job_id: str, _user: str = Depends(auth)) -> dict[str, Any]:
+        try:
+            job = await asyncio.to_thread(_require_enrolment().get_job, job_id)
+        except EnrolmentError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return job.to_dict()
+
+    @internal.post("/login/jobs/{job_id}/input", **INTERNAL_ONLY)
+    async def login_job_input(
+        job_id: str, request: _JobInputRequest, _user: str = Depends(auth)
+    ) -> dict[str, Any]:
+        try:
+            return await asyncio.to_thread(
+                _require_enrolment().send_input, job_id, request.text
+            )
+        except EnrolmentError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @internal.post("/login/jobs/{job_id}/cancel", **INTERNAL_ONLY)
+    async def login_job_cancel(job_id: str, _user: str = Depends(auth)) -> dict[str, Any]:
+        try:
+            return await asyncio.to_thread(_require_enrolment().cancel, job_id)
+        except EnrolmentError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.get("/login", response_class=HTMLResponse)
+    async def login_pane() -> HTMLResponse:
+        # Unauthenticated shell exactly like /dashboard: the pane carries no
+        # data until the operator supplies the API key, and /login is not on
+        # the external ingress (which routes /api plus the legacy aliases).
+        return HTMLResponse(render_login_html())
+
     @app.get("/health")
     async def health() -> dict[str, str]:
         return {"status": "ok"}
@@ -572,5 +680,6 @@ def create_app(
     # object, so a route can never exist on one set and not the other.
     app.include_router(api, prefix=API_V1_PREFIX)
     app.include_router(api, prefix=LEGACY_ALIAS_PREFIX)
+    app.include_router(internal, prefix=INTERNAL_V1_PREFIX)
 
     return app

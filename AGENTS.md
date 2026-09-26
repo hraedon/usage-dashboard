@@ -47,6 +47,20 @@ only an *empty* entry (deprecated, deleted in Phase C). The token store takes an
 advisory file lock because enrolment mutates it from a second process, and it
 fails closed on corrupt content rather than replacing it.
 
+## Browser enrolment pane (Plan 006)
+
+`/login` (internal ingress only) drives the same ceremonies over HTTP:
+`/internal/v1/login/*` is INTERNAL_ONLY and bearer-gated — it mints
+credentials, so it is deliberately not under the externally-routed `/api`.
+Claude runs the CLI on a PTY and streams the transcript (token-shaped output
+redacted); Codex surfaces the device-code URL/code and pauses the runtime App
+Server for the ceremony (`scheduler.pause_codex`/`resume_codex` — one
+CODEX_HOME owner, always); ollama/opencode verify-then-store a pasted session
+cookie (plus the OpenCode `wrk_…` workspace id, now store-side metadata).
+After any successful enrolment the scheduler adopts the new credential
+in-memory (`update_credentials`) and fetches — no rollout restart needed.
+`kubectl exec` remains the fallback path.
+
 Claude usage remains an **unsupported** dependency (undocumented
 `GET /api/oauth/usage` plus that credential file); Codex usage is supported.
 
