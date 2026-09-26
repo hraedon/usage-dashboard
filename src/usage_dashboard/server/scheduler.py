@@ -86,6 +86,7 @@ class FetchScheduler:
         opencode_workspace_id: str | None = None,
         opencode_cookie: str | None = None,
         codex_client: CodexAppServerClient | None = None,
+        codex_factory: Callable[[], CodexAppServerClient] | None = None,
         umans_key: str | None = None,
         interval_seconds: int = 300,
         offline_threshold: int = 24,
@@ -124,6 +125,14 @@ class FetchScheduler:
         # Codex owns its own OAuth now (Plan 005): the dashboard holds a
         # client, not tokens, and has nothing to refresh.
         self._codex_client = codex_client
+        # Rebuild hook for pause/resume around enrolment (Plan 006): a closed
+        # client can never be reopened, so resuming means constructing a new
+        # one exactly the way main built the original.
+        self._codex_factory = codex_factory
+        self._codex_paused = False
+        # Serialises credential swaps and the codex pause/resume bracket; the
+        # loop and fetch_now threads only ever read the swapped attributes.
+        self._update_lock = threading.RLock()
         # Umans wallet (Plan 004): a key alone configures the provider.
         self._umans_key = umans_key
         self._offline_threshold = offline_threshold
@@ -386,6 +395,65 @@ class FetchScheduler:
                 (Provider.UMANS, partial(fetch_umans_wallet, self._umans_key))
             )
         return tasks
+
+    def update_credentials(self, **credentials: str | None) -> None:
+        """Swap credential attributes mid-run (Plan 006).
+
+        Enrolment writes a fresh credential into the token store; the login
+        pane calls this so the running scheduler adopts it without a rollout.
+        Fetch tasks are rebuilt from these attributes on every cycle, so the
+        swap takes effect on the next poll; a fetch already in flight keeps
+        the credential it captured and simply reports what it saw. Only
+        credential attributes may pass through — anything else is a wiring
+        bug and fails loudly.
+        """
+        allowed = {
+            "claude_token",
+            "claude_refresh_token",
+            "claude_client_id",
+            "claude_work_token",
+            "claude_work_refresh_token",
+            "claude_work_client_id",
+            "ollama_cookie",
+            "opencode_workspace_id",
+            "opencode_cookie",
+        }
+        unknown = set(credentials) - allowed
+        if unknown:
+            raise ValueError(f"not a credential attribute: {sorted(unknown)}")
+        with self._update_lock:
+            for name, value in credentials.items():
+                setattr(self, f"_{name}", value)
+
+    def pause_codex(self) -> bool:
+        """Stop using the App Server child so enrolment can own CODEX_HOME.
+
+        Plan 006 replaces the runbook's CODEX_MODE=disabled + two rollouts:
+        closing the client releases the child (blocking until any in-flight
+        fetch completes — the client's own lock guarantees that), and
+        ``_get_fetch_tasks`` drops the tile until :meth:`resume_codex`.
+        Returns whether a client was actually closed.
+        """
+        with self._update_lock:
+            client, self._codex_client = self._codex_client, None
+            self._codex_paused = True
+        if client is not None:
+            client.close()
+        return client is not None
+
+    def resume_codex(self) -> bool:
+        """Rebuild the App Server client after enrolment finished with
+        CODEX_HOME. Returns False when there is nothing to resume (no factory
+        wired, or not paused) — the caller reports that the tile stays down
+        until the next rollout instead of silently believing it recovered.
+        """
+        factory = self._codex_factory
+        with self._update_lock:
+            if factory is None or not self._codex_paused:
+                return False
+            self._codex_client = factory()
+            self._codex_paused = False
+        return True
 
     def fetch_now(self) -> None:
         """Force an immediate fetch for every configured provider (WI-012).

@@ -15,6 +15,7 @@ from usage_dashboard.server.codex_app_server import (
     CodexAppServerConfig,
 )
 from usage_dashboard.server.db import Database
+from usage_dashboard.server.enrolment import EnrolmentService
 from usage_dashboard.server.schedule_config import ScheduleConfig
 from usage_dashboard.server.scheduler import FetchScheduler
 from usage_dashboard.server.token_store import TokenStore
@@ -62,6 +63,16 @@ def _resolve_claude_tokens(
         return env_access, env_refresh
 
     return persisted_access or env_access, persisted_refresh or env_refresh
+
+
+def _resolve_opencode_workspace(
+    token_store: TokenStore,
+    env_value: str | None,
+) -> str | None:
+    """Workspace id store-first (Plan 006): a pane-submitted ``wrk_…`` id
+    persists beside the cookie, with the env var as the original seed."""
+    stored = token_store.get_metadata("opencode", "workspace_id")
+    return stored if isinstance(stored, str) and stored else env_value
 
 
 def _resolve_cookie(
@@ -186,6 +197,19 @@ def main() -> None:
     # so pod restarts survive a rotation without touching the Secret.
     token_store = TokenStore(os.path.join(db_dir or "/data", "tokens.json"))
 
+    # Raw env values, kept BEFORE resolution overwrites the locals: the
+    # enrolment reload re-runs the same seed-from-env resolution, and it must
+    # see the Secret's values, not the store's (Plan 006).
+    env_credentials = {
+        "claude_token": claude_token,
+        "claude_refresh_token": claude_refresh_token,
+        "claude_work_token": claude_work_token,
+        "claude_work_refresh_token": claude_work_refresh_token,
+        "ollama_cookie": ollama_cookie,
+        "opencode_cookie": opencode_cookie,
+        "opencode_workspace_id": opencode_workspace_id,
+    }
+
     claude_token, claude_refresh_token = _resolve_claude_tokens(
         token_store, claude_token, claude_refresh_token
     )
@@ -195,7 +219,19 @@ def main() -> None:
     )
     ollama_cookie = _resolve_cookie(token_store, ollama_cookie, "ollama")
     opencode_cookie = _resolve_cookie(token_store, opencode_cookie, "opencode")
+    opencode_workspace_id = _resolve_opencode_workspace(token_store, opencode_workspace_id)
     codex_client = _build_codex_client(codex_mode, codex_home, codex_bin)
+    # Rebuild hook for the enrolment pause/resume bracket (Plan 006): the
+    # factory mirrors _build_codex_client's app_server construction exactly.
+    codex_factory = (
+        (
+            lambda: CodexAppServerClient(
+                CodexAppServerConfig(binary=codex_bin, home=codex_home), persistent=True
+            )
+        )
+        if codex_client is not None
+        else None
+    )
 
     scheduler = FetchScheduler(
         db=database,
@@ -212,11 +248,64 @@ def main() -> None:
         opencode_workspace_id=opencode_workspace_id,
         opencode_cookie=opencode_cookie,
         codex_client=codex_client,
+        codex_factory=codex_factory,
         umans_key=umans_key,
         interval_seconds=fetch_interval,
         failure_cap_seconds=failure_backoff_cap,
         token_store=token_store,
         retention_days=retention_days,
+    )
+
+    def _reload_credentials() -> None:
+        """Adopt whatever enrolment just wrote, without a rollout (Plan 006).
+
+        Re-runs the same store-authoritative resolution as startup — the
+        Secret can still only seed an empty entry — and swaps the result
+        into the running scheduler, then fetches so the tiles show it.
+        """
+        claude_t, claude_r = _resolve_claude_tokens(
+            token_store,
+            env_credentials["claude_token"],
+            env_credentials["claude_refresh_token"],
+        )
+        work_t, work_r = _resolve_claude_tokens(
+            token_store,
+            env_credentials["claude_work_token"],
+            env_credentials["claude_work_refresh_token"],
+            store_key="claude_work",
+        )
+        scheduler.update_credentials(
+            claude_token=claude_t,
+            claude_refresh_token=claude_r,
+            claude_work_token=work_t,
+            claude_work_refresh_token=work_r,
+            ollama_cookie=_resolve_cookie(
+                token_store, env_credentials["ollama_cookie"], "ollama"
+            ),
+            opencode_cookie=_resolve_cookie(
+                token_store, env_credentials["opencode_cookie"], "opencode"
+            ),
+            opencode_workspace_id=_resolve_opencode_workspace(
+                token_store, env_credentials["opencode_workspace_id"]
+            ),
+        )
+
+    def _after_enrolment(provider: str) -> None:
+        if provider == "codex":
+            # The resume bracket already rebuilt the client against the new
+            # login; the next scheduled poll reads it.
+            return
+        _reload_credentials()
+        scheduler.fetch_now()
+
+    enrolment = EnrolmentService(
+        token_store,
+        claude_bin=os.environ.get("CLAUDE_BIN") or "claude",
+        codex_home=codex_home,
+        codex_bin=codex_bin,
+        on_success=_after_enrolment,
+        codex_pause=scheduler.pause_codex,
+        codex_resume=scheduler.resume_codex,
     )
 
     app = create_app(
@@ -225,6 +314,7 @@ def main() -> None:
         configured_providers=scheduler.configured_providers(),
         schedule_config=ScheduleConfig.load(os.environ.get("SCHEDULES_DIR") or None),
         scheduler=scheduler,
+        enrolment=enrolment,
     )
 
     scheduler.start()

@@ -18,7 +18,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -441,24 +441,32 @@ def login_codex(
     codex_home: str | None = None,
     codex_bin: str | None = None,
     timeout: float = 900.0,
+    emit: Callable[[str], None] | None = None,
+    present: Callable[[str, str], None] | None = None,
 ) -> None:
     """Enrol a ChatGPT account through the Codex App Server's device-code flow.
 
     Prints only the verification URL and one-time user code; no token material
-    is returned, printed or copied anywhere.
+    is returned, printed or copied anywhere. *emit* redirects every status
+    line (the login pane's transcript); *present* replaces the URL/code
+    announcement entirely, for callers that surface the pair as structured
+    fields.
     """
+    _emit = emit or print
     config = CodexAppServerConfig(
         binary=codex_bin or os.environ.get("CODEX_BIN") or DEFAULT_CODEX_BIN,
         home=codex_home or os.environ.get("CODEX_HOME") or DEFAULT_CODEX_HOME,
     )
-    print(f"Enrolling Codex against CODEX_HOME={config.home}")
-    print("Codex owns the resulting tokens; the dashboard never sees them.\n")
+    _emit(f"Enrolling Codex against CODEX_HOME={config.home}")
+    _emit("Codex owns the resulting tokens; the dashboard never sees them.")
 
-    def present(url: str, code: str) -> None:
-        print("Open this URL and enter the code:\n")
-        print(f"  {url}")
-        print(f"  code: {code}\n")
-        print("Waiting for the login to complete...")
+    def _print_present(url: str, code: str) -> None:
+        _emit("Open this URL and enter the code:")
+        _emit(f"  {url}")
+        _emit(f"  code: {code}")
+        _emit("Waiting for the login to complete...")
+
+    present = present or _print_present
 
     # persistent=False: enrolment is a one-shot ceremony, and the per-start
     # CODEX_HOME residue the runtime avoids is irrelevant for a handful of runs.
@@ -466,7 +474,7 @@ def login_codex(
     try:
         client.device_code_login(present, timeout=timeout)
     except FetchError as exc:
-        print(f"\nCodex enrolment failed: {exc}", file=sys.stderr)
+        _emit(f"Codex enrolment failed: {exc}")
         sys.exit(1)
     finally:
         client.close()
@@ -479,21 +487,19 @@ def login_codex(
     try:
         account, rate_limits = verifier.read_account_and_rate_limits()
     except FetchError as exc:
-        print(
-            f"\nLogin reported success but verification failed: {exc}",
-            file=sys.stderr,
-        )
+        _emit(f"Login reported success but verification failed: {exc}")
         sys.exit(1)
     finally:
         verifier.close()
 
     detail = account.get("account") or {}
-    print("\nCodex enrolled successfully.")
-    print(f"  auth mode: {detail.get('type')}  plan: {detail.get('planType')}")
+    _emit("Codex enrolled successfully.")
+    _emit(f"  auth mode: {detail.get('type')}  plan: {detail.get('planType')}")
     buckets = rate_limits.get("rateLimitsByLimitId") or {}
-    print(f"  rate-limit buckets visible: {', '.join(sorted(buckets)) or 'rateLimits only'}")
-    print("\nSet CODEX_MODE=app_server (if it is not already) and roll the server:")
-    print("  kubectl -n usage-dashboard rollout restart deploy/usage-dashboard-server")
+    _emit(
+        f"  rate-limit buckets visible: {', '.join(sorted(buckets)) or 'rateLimits only'}"
+    )
+    _emit("The dashboard's App Server resumes and reads the new login on its next poll.")
 
 
 def main() -> None:

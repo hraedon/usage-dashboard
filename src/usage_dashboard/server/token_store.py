@@ -57,6 +57,11 @@ class TokenStore:
         with self._thread_lock, self._flock(exclusive=False):
             self._data = self._read()
 
+    @property
+    def path(self) -> Path:
+        """The store file path (the enrolment service passes it to the CLI)."""
+        return self._path
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -101,11 +106,28 @@ class TokenStore:
         """Return one optional metadata field for *provider*, or None."""
         return self._entry(provider).get(key)
 
-    def save_credential(self, provider: str, credential: str) -> None:
-        """Persist a single opaque credential for *provider* (preserving any seed marker)."""
+    def save_credential(
+        self,
+        provider: str,
+        credential: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        """Persist a single opaque credential for *provider* (preserving any
+        seed marker).
+
+        *metadata* carries optional fields alongside the credential (e.g. the
+        OpenCode workspace id), applying the same None-means-remove rule as
+        :meth:`save`.
+        """
 
         def mutate(data: dict[str, dict[str, Any]]) -> None:
-            data.setdefault(provider, {})["credential"] = credential
+            entry = data.setdefault(provider, {})
+            entry["credential"] = credential
+            for key, value in (metadata or {}).items():
+                if value is None:
+                    entry.pop(key, None)
+                else:
+                    entry[key] = value
 
         self._mutate(mutate)
 
