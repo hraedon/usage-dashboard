@@ -23,7 +23,7 @@ import sys
 import tempfile
 from collections.abc import Callable, Iterable, Mapping
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from urllib.parse import urlparse
 
 import httpx
@@ -548,6 +548,8 @@ def _fetch_capacity(
     token: str,
     account: str | None,
     max_age_seconds: int | None,
+    *,
+    timeout: float = _CAPACITY_TIMEOUT,
 ) -> dict[str, Any]:
     params: dict[str, str | int] = {}
     if account is not None:
@@ -555,7 +557,7 @@ def _fetch_capacity(
     if max_age_seconds is not None:
         params["max_age_seconds"] = max_age_seconds
     try:
-        with httpx.Client(timeout=_CAPACITY_TIMEOUT) as client:
+        with httpx.Client(timeout=timeout) as client:
             response = client.get(
                 endpoint,
                 headers={"Authorization": f"Bearer {token}"},
@@ -598,6 +600,57 @@ def capacity(
     json.dump(snapshot, sys.stdout, sort_keys=True)
     sys.stdout.write("\n")
     return 0
+
+
+def watch_capacity_command(
+    account: str,
+    window: str,
+    scope: str = "account",
+    until: str = "either",
+    interval_seconds: int = 60,
+    timeout_seconds: int = 3600,
+    max_age_seconds: int | None = None,
+) -> int:
+    """Observe a selected window without refreshing providers or changing quotas."""
+    from usage_dashboard.client.capacity_watch import (
+        CapacityWatcher,
+        Condition,
+        Scope,
+        WatchRequestError,
+        watch_capacity,
+    )
+
+    token = os.environ.get("USAGE_DASHBOARD_AGENT_TOKEN", "")
+    try:
+        if not token:
+            raise _CapacityCommandError("USAGE_DASHBOARD_AGENT_TOKEN is required")
+        endpoint = _capacity_url(os.environ.get("USAGE_DASHBOARD_URL", ""))
+        if any(not value.strip() or len(value) > 200 for value in (account, window)):
+            raise _CapacityCommandError("account and window must contain 1 to 200 characters")
+        if scope not in {"account", "provider_scoped"}:
+            raise _CapacityCommandError("scope must be account or provider_scoped")
+        if until not in {"exhausted", "reset", "either"}:
+            raise _CapacityCommandError("until must be exhausted, reset or either")
+
+        def fetch(timeout: float) -> dict[str, Any]:
+            try:
+                return _fetch_capacity(endpoint, token, account, max_age_seconds, timeout=timeout)
+            except _CapacityCommandError as exc:
+                raise WatchRequestError("capacity request failed") from exc
+
+        def emit(event: dict[str, object]) -> None:
+            json.dump(event, sys.stdout, sort_keys=True)
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+
+        return watch_capacity(
+            CapacityWatcher(account, window, cast(Scope, scope)), fetch, emit,
+            until=cast(Condition, until), interval_seconds=interval_seconds,
+            timeout_seconds=timeout_seconds,
+        )
+    except (_CapacityCommandError, ValueError) as exc:
+        print(f"watch-capacity: {exc}", file=sys.stderr)
+        return 1
 
 
 def main() -> None:
@@ -673,6 +726,21 @@ def main() -> None:
         help="Maximum accepted observation age; server validates supported bounds",
     )
 
+    watch_parser = sub.add_parser(
+        "watch-capacity", help="Wait for a selected quota window to exhaust or reset"
+    )
+    watch_parser.add_argument("--account", required=True, help="Configured account ID")
+    watch_parser.add_argument("--window", required=True, help="Exact capacity window name")
+    watch_parser.add_argument("--scope", choices=["account", "provider_scoped"], default="account")
+    watch_parser.add_argument("--until", choices=["exhausted", "reset", "either"], default="either")
+    watch_parser.add_argument(
+        "--interval-seconds", type=int, default=60, help="Poll interval: 5-3600"
+    )
+    watch_parser.add_argument(
+        "--timeout-seconds", type=int, default=3600, help="Deadline: 1-604800"
+    )
+    watch_parser.add_argument("--max-age-seconds", type=int, default=None)
+
     args = parser.parse_args()
 
     if args.command == "login":
@@ -690,6 +758,12 @@ def main() -> None:
             login_codex(codex_home=args.codex_home, codex_bin=args.codex_bin)
     elif args.command == "capacity":
         raise SystemExit(capacity(account=args.account, max_age_seconds=args.max_age_seconds))
+    elif args.command == "watch-capacity":
+        raise SystemExit(watch_capacity_command(
+            account=args.account, window=args.window, scope=args.scope, until=args.until,
+            interval_seconds=args.interval_seconds, timeout_seconds=args.timeout_seconds,
+            max_age_seconds=args.max_age_seconds,
+        ))
     else:
         parser.print_help()
         sys.exit(1)

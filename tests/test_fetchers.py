@@ -755,7 +755,7 @@ class TestFetchZaiWeeklyTokens:
         # 2026-06 timestamp, which made an inverted (start > end) range look
         # like a valid one and hid the bug that the window started at the
         # reset instant rather than one window before it.
-        reset = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(days=2)
+        reset = datetime.now(timezone.utc) + timedelta(days=2)
         data = _zai_response_data()
         weekly = [
             e for e in data["data"]["limits"]
@@ -783,7 +783,7 @@ class TestFetchZaiWeeklyTokens:
         # Guard the actual production failure: a future reset time used as the
         # window start returns HTTP 200 with tokensUsage=None, so the line just
         # never appeared. Assert we never issue such a request.
-        reset = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(days=6)
+        reset = datetime.now(timezone.utc) + timedelta(days=6)
         data = _zai_response_data()
         weekly = [
             e for e in data["data"]["limits"]

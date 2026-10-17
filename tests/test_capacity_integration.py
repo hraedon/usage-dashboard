@@ -86,6 +86,50 @@ def test_cli_consumes_real_api_contract(capacity_server):
     assert "integration-agent" not in result.stdout + result.stderr
 
 
+def run_watch(origin, *args, token="integration-agent"):
+    return subprocess.run(
+        [sys.executable, "-m", "usage_dashboard.cli", "watch-capacity", *args],
+        env={
+            **os.environ,
+            "USAGE_DASHBOARD_URL": origin,
+            "USAGE_DASHBOARD_AGENT_TOKEN": token,
+        },
+        capture_output=True, text=True, timeout=20,
+    )
+
+
+def test_watch_reports_real_exhaustion_without_raw_account_data(capacity_server):
+    result = run_watch(capacity_server, "--account", "claude", "--window", "session")
+    assert result.returncode == 0, result.stderr
+    events = [json.loads(line) for line in result.stdout.splitlines()]
+    assert len(events) == 1
+    assert events[0]["schema_version"] == "capacity-watch-v1"
+    assert events[0]["event"] == "condition_met"
+    assert events[0]["conditions"] == ["exhausted"]
+    assert events[0]["remaining_percent"] == 0
+    for private in ("integration-agent", "provider-private-diagnostic", "integration-operator"):
+        assert private not in result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("account,event", [("codex", "baseline"), ("umans", "unknown")])
+def test_watch_real_http_reaches_bounded_timeout(capacity_server, account, event):
+    result = run_watch(
+        capacity_server, "--account", account, "--window", "session", "--timeout-seconds", "1"
+    )
+    assert result.returncode == 2, result.stderr
+    events = [json.loads(line) for line in result.stdout.splitlines()]
+    assert [e["event"] for e in events] == [event, "timeout"]
+
+
+def test_watch_real_http_auth_failure_has_safe_terminal_event(capacity_server):
+    result = run_watch(
+        capacity_server, "--account", "claude", "--window", "session", token="bad-watch-token"
+    )
+    assert result.returncode == 1
+    assert json.loads(result.stdout)["event"] == "error"
+    assert "bad-watch-token" not in result.stdout + result.stderr
+
+
 def test_cli_filters_real_accounts_and_preserves_unknown(capacity_server):
     result = run_capacity(capacity_server + "/api/v1/", "--account", "umans")
     assert result.returncode == 0, result.stderr

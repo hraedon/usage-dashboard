@@ -7,7 +7,7 @@ from unittest.mock import MagicMock, patch
 import httpx
 import pytest
 
-from usage_dashboard.cli import _capacity_url, capacity, main
+from usage_dashboard.cli import _capacity_url, capacity, main, watch_capacity_command
 
 
 def response(status_code: int, body: object = None) -> MagicMock:
@@ -177,3 +177,27 @@ def test_main_registers_capacity_command(monkeypatch, capsys) -> None:
             raise AssertionError("capacity command did not exit with a status")
 
     assert json.loads(capsys.readouterr().out)["schema_version"] == "agent-capacity-v1"
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"account": ""}, {"window": " "}, {"scope": "invalid"}, {"until": "invalid"},
+    {"interval_seconds": 4}, {"timeout_seconds": 0},
+])
+def test_watch_invalid_configuration_makes_no_request(monkeypatch, capsys, kwargs):
+    monkeypatch.setenv("USAGE_DASHBOARD_URL", "https://dashboard.example")
+    monkeypatch.setenv("USAGE_DASHBOARD_AGENT_TOKEN", "agent-secret")
+    with patch("usage_dashboard.cli.httpx.Client") as client_factory:
+        assert watch_capacity_command(**{"account": "codex", "window": "weekly", **kwargs}) == 1
+    client_factory.assert_not_called()
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "watch-capacity:" in captured.err
+    assert "agent-secret" not in captured.err
+
+
+def test_watch_missing_credentials_fail_before_request(monkeypatch, capsys):
+    monkeypatch.delenv("USAGE_DASHBOARD_AGENT_TOKEN", raising=False)
+    with patch("usage_dashboard.cli.httpx.Client") as client_factory:
+        assert watch_capacity_command("codex", "weekly") == 1
+    client_factory.assert_not_called()
+    assert "USAGE_DASHBOARD_AGENT_TOKEN is required" in capsys.readouterr().err
