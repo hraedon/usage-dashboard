@@ -315,6 +315,7 @@ def main() -> None:
         schedule_config=ScheduleConfig.load(os.environ.get("SCHEDULES_DIR") or None),
         scheduler=scheduler,
         enrolment=enrolment,
+        agent_api_key=os.environ.get("AGENT_API_KEY") or None,
     )
 
     scheduler.start()
