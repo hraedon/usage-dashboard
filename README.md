@@ -34,6 +34,14 @@ SQLite storage.
 
 ### API
 
+**Agents:** use [`GET /api/v1/agent/capacity`](docs/agent-api.md) for structured
+account capacity, freshness, quota windows and assessment reasons. An optional
+read-only agent token avoids sharing the refresh-capable dashboard credential.
+No Kubernetes access or HTML scraping is needed. See the linked contract for
+authentication, query parameters, response semantics and a Python example.
+The [`usage-dashboard capacity` CLI](docs/agent-cli.md) calls the same endpoint
+and emits JSON for agents with shell access.
+
 | Endpoint | Auth | Description |
 |----------|------|-------------|
 | `GET /readings` | Bearer token | Returns latest reading per provider as JSON |
