@@ -466,7 +466,9 @@ def _make_auth_dependency(
 def create_app(
     api_key: str,
     db: Database,
-    configured_providers: Iterable[Provider] | None = None,
+    configured_providers: (
+        Iterable[Provider] | Callable[[], Iterable[Provider]] | None
+    ) = None,
     schedule_config: ScheduleConfig | None = None,
     scheduler: FetchScheduler | None = None,
     enrolment: EnrolmentService | None = None,
@@ -484,19 +486,30 @@ def create_app(
     # Only report providers that are actually configured. A provider that was
     # never configured is omitted entirely rather than fabricated as "offline",
     # so a real outage (configured but not reporting) is distinguishable from
-    # an absent config (WI-003). ``None`` means "assume all providers".
-    providers: list[Provider] = (
-        list(configured_providers)
-        if configured_providers is not None
-        else list(Provider)
-    )
+    # an absent config (WI-003). ``None`` means "assume all providers". A
+    # callable is resolved per request so Plan 006 enrolment can add or remove a
+    # provider without recreating the app; iterable callers keep their original
+    # snapshot semantics.
+    if callable(configured_providers):
+        provider_source: Callable[[], Iterable[Provider]] = configured_providers
+    else:
+        providers = (
+            tuple(Provider)
+            if configured_providers is None
+            else tuple(configured_providers)
+        )
+
+        def static_provider_source() -> Iterable[Provider]:
+            return providers
+
+        provider_source = static_provider_source
 
     def _reported_readings() -> list[Reading]:
         readings: dict[Provider, Reading] = db.get_latest_readings()
         now = datetime.now(timezone.utc).replace(tzinfo=None)
         return [
             readings.get(provider) or make_offline_reading(provider, now)
-            for provider in providers
+            for provider in provider_source()
         ]
 
     @api.get("/readings", **EXTERNAL)
