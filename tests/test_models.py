@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from datetime import datetime
 
+import pytest
+
+from usage_dashboard.client.format import format_countdown
 from usage_dashboard.shared.models import (
     ALERT_NONE,
     ALERT_WARN,
@@ -9,6 +12,7 @@ from usage_dashboard.shared.models import (
     Provider,
     Reading,
     ReadingStatus,
+    ScopedLimit,
     make_offline_reading,
     make_stale_reading,
 )
@@ -59,6 +63,55 @@ def test_reading_from_dict_parses_datetime():
     assert restored.session_resets_at == datetime(2026, 1, 15, 10, 0, 0)
     assert restored.weekly_resets_at == datetime(2026, 1, 19, 0, 0, 0)
     assert restored.fetched_at == datetime(2026, 1, 14, 12, 0, 0)
+
+
+@pytest.mark.parametrize("wire,expected", [
+    ("2026-10-24T05:30:00+05:30", datetime(2026, 10, 24)),
+    ("2026-10-23T20:00:00-04:00", datetime(2026, 10, 24)),
+    ("2026-10-24T00:30:00+14:00", datetime(2026, 10, 23, 10, 30)),
+    ("2026-10-24T23:30:00-12:00", datetime(2026, 10, 25, 11, 30)),
+    ("2026-10-24T05:30:00.123456+05:30", datetime(2026, 10, 24, microsecond=123456)),
+    ("2026-10-24T00:00:00Z", datetime(2026, 10, 24)),
+    ("2026-10-24T00:00:00", datetime(2026, 10, 24)),
+])
+def test_all_wire_timestamps_preserve_their_utc_instant(wire, expected):
+    data = _make_reading().to_dict()
+    for field in ("session_resets_at", "weekly_resets_at", "fetched_at"):
+        data[field] = wire
+    data["scoped_limits"] = [{"name": "Monthly", "percent": 20, "resets_at": wire}]
+    reading = Reading.from_dict(data)
+    assert reading.session_resets_at == expected
+    assert reading.weekly_resets_at == expected
+    assert reading.fetched_at == expected
+    assert reading.scoped_limits is not None
+    assert reading.scoped_limits[0].resets_at == expected
+    assert reading.to_dict()["fetched_at"] == expected.strftime("%Y-%m-%dT%H:%M:%SZ")
+    assert ScopedLimit.from_dict(data["scoped_limits"][0]).resets_at == expected
+
+
+@pytest.mark.parametrize("wire", [
+    "0001-01-01T00:00:00+14:00", "9999-12-31T23:59:59-12:00",
+])
+@pytest.mark.parametrize("field", [
+    "session_resets_at", "weekly_resets_at", "fetched_at", "scoped_limits",
+])
+def test_unrepresentable_utc_timestamp_is_a_value_error(wire, field):
+    data = _make_reading().to_dict()
+    if field == "scoped_limits":
+        data[field] = [{"name": "Monthly", "percent": 20, "resets_at": wire}]
+    else:
+        data[field] = wire
+    with pytest.raises(ValueError):
+        Reading.from_dict(data)
+
+
+def test_reset_countdown_uses_the_offset_timestamp_instant():
+    data = _make_reading().to_dict()
+    data["session_resets_at"] = "2026-10-24T21:00:00+02:00"
+    reading = Reading.from_dict(data)
+    assert format_countdown(reading.session_resets_at, now=datetime(2026, 10, 24, 18)) == (
+        "1h 0m", True,
+    )
 
 
 def test_reading_to_dict_none_fields():

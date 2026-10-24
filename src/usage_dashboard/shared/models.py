@@ -152,11 +152,17 @@ def _format_dt(dt: datetime | None) -> str | None:
 def _parse_dt(value: str | None) -> datetime | None:
     if value is None:
         return None
-    return datetime.fromisoformat(value.replace("Z", "+00:00")).replace(tzinfo=None)
+    return _parse_required_dt(value)
 
 
 def _parse_required_dt(value: str) -> datetime:
-    return datetime.fromisoformat(value.replace("Z", "+00:00")).replace(tzinfo=None)
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is not None:
+        try:
+            parsed = parsed.astimezone(timezone.utc)
+        except OverflowError:
+            raise ValueError("timestamp is outside the supported UTC range") from None
+    return parsed.replace(tzinfo=None)
 
 
 @dataclass(frozen=True, slots=True)
