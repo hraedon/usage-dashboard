@@ -224,6 +224,79 @@ class TestDashboardEndpoint:
 
         asyncio.run(_test())
 
+    def test_dashboard_exposes_each_account_reading_time(self, tmp_path):
+        configured = [Provider.CODEX, Provider.CLAUDE, Provider.CLAUDE_WORK, Provider.OLLAMA]
+        app, db = _create_app_with_db(tmp_path, configured_providers=configured)
+        times = {
+            Provider.CODEX: datetime(2026, 1, 14, 9, 1, 2),
+            Provider.CLAUDE: datetime(2026, 1, 14, 10, 3, 4),
+            Provider.CLAUDE_WORK: datetime(2026, 1, 14, 11, 5, 6),
+            Provider.OLLAMA: datetime(2026, 1, 14, 12, 7, 8),
+        }
+        from usage_dashboard.shared.models import ScopedLimit
+
+        for provider, fetched in times.items():
+            db.store_reading(_make_reading(
+                provider=provider, fetched_at=fetched,
+                scoped_limits=[ScopedLimit('<img src=x onerror="synthetic">', 25, None)],
+                detail='<script>alert("synthetic")</script>',
+            ))
+
+        async def _test():
+            async with _client(app) as client:
+                response = await client.get("/dashboard")
+            assert response.status_code == 200
+            assert '<script>' not in response.text
+            assert '<img src=x' not in response.text
+            assert '&lt;img src=x onerror=&quot;synthetic&quot;&gt;' in response.text
+            assert API_KEY not in response.text
+            cards = dict(re.findall(
+                r'<section class="card[^>]*data-provider="([^"]+)"[^>]*>(.*?)</section>',
+                response.text, re.DOTALL,
+            ))
+            for provider, fetched in times.items():
+                card = cards["claude" if provider == Provider.CLAUDE_WORK else provider.value]
+                prefix = "work " if provider == Provider.CLAUDE_WORK else (
+                    "me " if provider == Provider.CLAUDE else ""
+                )
+                assert (
+                    f'{prefix}Reading time <time datetime="{fetched.isoformat()}Z">'
+                    f'{fetched:%Y-%m-%d %H:%M:%S} UTC</time>'
+                ) in card
+            assert cards["claude"].count('<time datetime=') == 2
+            assert cards["codex"].count('<time datetime=') == 1
+            assert "Latest reading time 2026-01-14 12:07:08 UTC" in response.text
+
+        asyncio.run(_test())
+
+    def test_dashboard_reading_time_for_work_only_quotaless_and_offline(self):
+        for provider, status in [
+            (Provider.CLAUDE_WORK, ReadingStatus.CURRENT),
+            (Provider.OPENCODE, ReadingStatus.STALE),
+            (Provider.CODEX, ReadingStatus.OFFLINE),
+        ]:
+            reading = _make_reading(
+                provider=provider, status=status,
+                session_percent=None, weekly_percent=None,
+                detail='<script>alert("synthetic")</script>',
+            )
+            text = _render_dashboard_html([reading], datetime(2026, 1, 14, 13))
+            assert text.count('<time datetime="2026-01-14T12:00:00Z">') == 1
+            assert 'Reading time <time' in text
+            assert '<script>' not in text
+            assert '&lt;script&gt;alert(&quot;synthetic&quot;)&lt;/script&gt;' in text
+            assert API_KEY not in text
+
+    def test_dashboard_reading_time_normalizes_aware_utc_without_mutating_reading(self):
+        fetched = datetime(2026, 1, 14, 17, 30, 15, tzinfo=timezone(timedelta(hours=5, minutes=30)))
+        reading = _make_reading(provider=Provider.CODEX, fetched_at=fetched)
+        text = _render_dashboard_html([reading], datetime(2026, 1, 14, 13, tzinfo=timezone.utc))
+        assert (
+            '<time datetime="2026-01-14T12:00:15Z">2026-01-14 12:00:15 UTC</time>'
+        ) in text
+        assert "Latest reading time 2026-01-14 12:00:15 UTC" in text
+        assert reading.fetched_at is fetched
+
     def test_dashboard_shows_quotaless_detail_line(self, tmp_path):
         app, db = _create_app_with_db(tmp_path)
         db.store_reading(

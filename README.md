@@ -133,6 +133,14 @@ from one column on a phone to up to four on a desktop — and the bare hostname
 (`/`) redirects to `/dashboard`. It's unauthenticated by design (usage stats
 only), so keep the hostname internal.
 
+Each card shows its account's **Reading time** in UTC; Claude's folded `me` and
+`work` accounts retain separate times. The footer shows the latest reading time
+across the page, so it does not describe every account. These labels display the
+existing `fetched_at`: stale readings retain the original reading's time, while
+an offline placeholder's time can reflect when it was constructed. They do not
+guarantee a successful fetch; use the existing stale/offline status alongside
+them. Adaptive refresh timing is unchanged.
+
 Images are built and pushed to `ghcr.io/hraedon/usage-dashboard-server` and `ghcr.io/hraedon/usage-dashboard-client` via GitHub Actions on push to `main`.
 
 ### Secrets

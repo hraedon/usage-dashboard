@@ -252,6 +252,15 @@ def _bar_row(label: str, percent: float | None, resets_at: datetime | None, now:
     )
 
 
+def _reading_time_utc(reading: Reading) -> datetime:
+    fetched = reading.fetched_at
+    return (
+        fetched.replace(tzinfo=timezone.utc)
+        if fetched.tzinfo is None
+        else fetched.astimezone(timezone.utc)
+    )
+
+
 def _account_rows(reading: Reading, now: datetime, label: str = "") -> str:
     prefix = f"{label} " if label else ""
     rows = ""
@@ -265,6 +274,15 @@ def _account_rows(reading: Reading, now: datetime, label: str = "") -> str:
         )
     for sl in reading.scoped_limits or []:
         rows += _bar_row(f"{prefix}{sl.name}", sl.percent, sl.resets_at, now)
+    # Use the reading's own timestamp: the page-wide maximum can hide a
+    # slower account. Offline placeholders also carry fetched_at, so avoid
+    # implying that this timestamp proves a successful provider fetch.
+    fetched = _reading_time_utc(reading)
+    timestamp = fetched.isoformat().replace("+00:00", "Z")
+    rows += (
+        f'<div class="reading-time">{html.escape(prefix)}Reading time '
+        f'<time datetime="{timestamp}">{fetched:%Y-%m-%d %H:%M:%S} UTC</time></div>'
+    )
     return rows
 
 
@@ -327,7 +345,7 @@ def _render_dashboard_html(readings: list[Reading], now: datetime) -> str:
             f"{body}</section>"
         )
 
-    fetched = max((r.fetched_at for r in readings), default=now)
+    fetched = max((_reading_time_utc(r) for r in readings), default=now)
     provider_count = len(cards)
     provider_word = "provider" if provider_count == 1 else "providers"
     # The Umans wallet capsule (Plan 004): the web counterpart of the touch
@@ -347,7 +365,7 @@ def _render_dashboard_html(readings: list[Reading], now: datetime) -> str:
         f"{provider_count} {provider_word}</span></h1></header>"
     )
     footer = (
-        f"fetched {fetched.strftime('%Y-%m-%d %H:%M:%S')} UTC "
+        f"Latest reading time {fetched.strftime('%Y-%m-%d %H:%M:%S')} UTC "
         "&middot; refreshes every 5&ndash;30m (adaptive)"
     )
     return f"""<!DOCTYPE html>
@@ -414,6 +432,8 @@ h2 {{ margin:0 0 10px; font-size:1.05rem; letter-spacing:0.04em; }}
 .resets.reset-near, .resets.reset-expired {{ color:{_CSS_YELLOW};
   font-weight:700; }}
 .resets.reset-distant {{ color:#969696; }}
+.reading-time {{ margin:6px 0 8px; color:#969696; font-size:0.75rem;
+  line-height:1.4; font-variant-numeric:tabular-nums; overflow-wrap:anywhere; }}
 .detail {{ font-size:1.0rem; color:#ccc; font-variant-numeric:tabular-nums;
   overflow-wrap:anywhere; }}
 footer {{ text-align:center; color:#555; font-size:0.7rem; margin-top:12px; }}
