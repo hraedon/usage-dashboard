@@ -311,7 +311,7 @@ def main() -> None:
     app = create_app(
         api_key=api_key,
         db=database,
-        configured_providers=scheduler.configured_providers(),
+        configured_providers=scheduler.configured_providers,
         schedule_config=ScheduleConfig.load(os.environ.get("SCHEDULES_DIR") or None),
         scheduler=scheduler,
         enrolment=enrolment,
