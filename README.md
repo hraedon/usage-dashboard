@@ -63,6 +63,11 @@ SQLite storage.
 
 Status values: `current` | `stale` | `offline`
 
+Reading timestamps with explicit timezone offsets are normalized to UTC before
+comparison or countdown display. Timestamps without offsets retain their UTC
+interpretation, and optional missing reset times remain absent. Wire output
+uses UTC `Z` timestamps; inputs outside the representable UTC range are refused.
+
 `detail` is an optional pre-formatted text line shown under the percentage
 bars (z.ai's weekly-window token total, e.g. `week req 2,273  tok 284.0M`) or
 as the whole tile body for quota-less providers.
