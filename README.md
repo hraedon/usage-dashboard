@@ -1,6 +1,6 @@
 # usage-dashboard
 
-A two-component system for monitoring AI usage across [Claude](https://claude.ai), [z.ai](https://z.ai), [Ollama](https://ollama.com), [Codex](https://chatgpt.com/codex), and [OpenCode Go](https://opencode.ai). A server fetches usage data from all configured providers, normalizes it into a unified format, stores in SQLite, and serves it via an authenticated API. A client polls the server and renders usage as color-coded progress bars — a fullscreen touch GUI for a **Raspberry Pi 4B + Touch Display 2** (with optional scheduled backlight-sleep + tap-to-wake, and a tap-the-status-line overlay for unit diagnostics + brightness). Plans that discount off-peak use get a glanceable z.ai hint: its tile title tints green off-peak / orange during peak hours, with a countdown to the next boundary. The server also serves a mobile-friendly HTML view at `/dashboard`.
+A two-component system for monitoring AI usage across [Claude](https://claude.ai), [z.ai](https://z.ai), [Ollama](https://ollama.com), [Codex](https://chatgpt.com/codex), [OpenCode Go](https://opencode.ai), and [Google Antigravity](https://antigravity.google) (the Gemini pool plus Gemini 4 Argon). A server fetches usage data from all configured providers, normalizes it into a unified format, stores in SQLite, and serves it via an authenticated API. A client polls the server and renders usage as color-coded progress bars — a fullscreen touch GUI for a **Raspberry Pi 4B + Touch Display 2** (with optional scheduled backlight-sleep + tap-to-wake, and a tap-the-status-line overlay for unit diagnostics + brightness). Plans that discount off-peak use get a glanceable z.ai hint: its tile title tints green off-peak / orange during peak hours, with a countdown to the next boundary. The server also serves a mobile-friendly HTML view at `/dashboard`.
 
 ## Architecture
 
@@ -271,6 +271,37 @@ The work account shows as a **second, muted set of bars in the Claude tile** —
 `me` and `work` — not a separate tile. With no work credential enrolled it stays
 completely hidden.
 
+#### Google Antigravity (Gemini / Argon) — Plan 007
+
+Quota is read through the official `agy` CLI (pinned in the image). It runs its
+documented zero-turn `agy -p /usage --output-format json` once per poll. The
+CLI owns the Google login under `ANTIGRAVITY_HOME` (`/data/antigravity`, on the
+PVC). The dashboard never reads the token or talks to Google itself.
+`ANTIGRAVITY_MODE=cli` enables the tile; until you sign in it reads
+"login required — sign in on /login".
+
+**Sign in from the `/login` pane** (internal ingress):
+
+1. Press **Start sign-in** on the Google Antigravity card.
+2. Click **Open Google sign-in** and sign in.
+3. Copy the code the Google page shows and paste it into the pane before the
+   **60 s** countdown ends. The CLI fixes that window.
+
+The sign-in runs in a staging home and is checked against a real quota read
+before it replaces anything. A timeout or Cancel changes nothing: just start
+again. The tile updates immediately. The `kubectl exec` fallback runs the same
+ceremony on your terminal:
+
+```bash
+kubectl -n usage-dashboard exec -it "$POD" -- usage-dashboard login antigravity
+```
+
+After the exec path, tap refresh on a panel (or `POST /refresh`) to pick the
+login up straight away. Don't run the exec path while a pane sign-in is in
+progress: the last verified login wins. To sign out, delete
+`/data/antigravity` in the pod. Never copy a desktop `~/.gemini` login into
+the pod; the pod should own its own login.
+
 #### Footprint on the PVC
 
 The server keeps one resident `codex app-server` child (~92 MB RSS, measured in
@@ -278,7 +309,10 @@ production with plugins disabled) rather than starting one per poll. Each *start
 uncheckpointed SQLite WALs and a leaked temp directory — which at one start per
 5-minute poll is ~8.3 MB/day and fills the 1 GiB PVC in about four months,
 taking `readings.db` with it. Growth is per-start, not per-request, so one child
-bounds it. Plugins are disabled for the same reason: an authenticated App Server
+bounds it. The Antigravity CLI, by contrast, runs once per poll (~5 s,
+~220 MB peak RSS, then it exits), because with `--log-file /dev/null` a start
+leaves essentially nothing behind. Without that flag, every run writes a
+~34 kB log that isn't pruned per run. Plugins are disabled for the same reason: an authenticated App Server
 otherwise downloads ~50 MB of plugin catalog and Office templates the dashboard
 can never reach. `CODEX_HOME` settles at ~3 MB.
 
@@ -291,7 +325,9 @@ exists, only enrolment replaces it — a stale Secret can no longer overwrite a
 freshly enrolled credential.
 
 Codex keeps its own credentials under `/data/codex`; the dashboard never reads
-or writes them.
+or writes them. The same holds for Antigravity under `/data/antigravity`. The
+dashboard only moves a verified sign-in's whole directory into place; it never
+opens the token file.
 
 #### Telling expired auth from a transport failure
 
@@ -368,6 +404,16 @@ OpenCode Go currently renders on the web `/dashboard` only — it is deliberatel
 rows, and because the per-tile overhead (title + padding) is charged once per
 row, that cuts the height left for bars by roughly two thirds. See the comment
 on `_PROVIDER_ORDER` in `client/layout.py` for what adding it would take.
+
+On the Pi, **Gemini pairs half-width with Codex**, and that pair shows weekly
+windows only: Codex `W`, Gemini `W` (the Flash/Pro pool) and `A` (Gemini 4
+Argon). Tap the tile for every window. Without Antigravity, Codex keeps its
+full-width row. The web `/dashboard` shows a Gemini card with Session, Weekly
+and Argon.
+
+> **Upgrade order:** panels built before Plan 007 discard *all* readings when
+> the server reports a provider they don't know. Update the Pis before rolling
+> out a server with `ANTIGRAVITY_MODE=cli`.
 
 ## Backlight sleep schedule
 

@@ -118,6 +118,17 @@ spec:
               value: "/data/codex"
             - name: CODEX_BIN
               value: "/usr/local/bin/codex"
+            # Google Antigravity (Plan 007): the official `agy` CLI owns the
+            # Google login under ANTIGRAVITY_HOME. Nothing is injected; sign in
+            # from the /login pane (or `usage-dashboard login antigravity` via
+            # kubectl exec). `cli` enables the Gemini/Argon tile.
+            - name: ANTIGRAVITY_MODE
+              value: "cli"
+            # On the PVC, so the login survives pod restarts.
+            - name: ANTIGRAVITY_HOME
+              value: "/data/antigravity"
+            - name: AGY_BIN
+              value: "/usr/local/bin/agy"
             # Umans wallet (Plan 004): the corner balance line on the Pi.
             # Absent/empty secret key leaves the provider unconfigured.
             - name: UMANS_API_KEY

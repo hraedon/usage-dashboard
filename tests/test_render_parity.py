@@ -61,6 +61,14 @@ def _fleet(now: datetime) -> list[Reading]:
             )],
         ),
         _reading(Provider.CODEX, now, session_percent=None, session_resets_at=None),
+        _reading(
+            Provider.ANTIGRAVITY, now,
+            session_percent=0.0, session_resets_at=None, weekly_percent=12.0,
+            scoped_limits=[ScopedLimit(
+                name="Argon", percent=100.0,
+                resets_at=now + timedelta(days=3), is_active=False,
+            )],
+        ),
         _reading(Provider.ZAI, now, detail="week req 1568 tok 183.0M"),
         _reading(Provider.OLLAMA, now),
         _reading(
@@ -210,3 +218,30 @@ class TestWalletParity:
         html_out = _render_dashboard_html(fleet, now)
         assert layout.wallet_text is None
         assert 'class="wallet"' not in html_out
+
+
+class TestAntigravityParity:
+    """Plan 007: the Pi's paired Gemini tile shows Gemini weekly + Argon; the
+    web card must carry both (it may show more, never less)."""
+
+    def test_web_has_the_gemini_card_with_the_argon_bar(self) -> None:
+        now = _OFF_PEAK
+        layout = build_main_layout(_fleet(now), _SIZE, now=now)
+        gemini = next(t for t in layout.tiles if t.provider is Provider.ANTIGRAVITY)
+        html_out = _render_dashboard_html(_fleet(now), now)
+        card = re.search(
+            r'<section class="card[^"]*" data-provider="antigravity".*?</section>',
+            html_out, re.S,
+        )
+        assert card is not None, "web /dashboard has no Antigravity card"
+        assert gemini.title.lower() in card.group(0).lower()  # "Gemini"
+        assert "Argon" in card.group(0)
+        assert "Weekly" in card.group(0)
+        for bar in gemini.bars:
+            assert bar.percent_text in card.group(0)
+
+    def test_web_card_follows_codex(self) -> None:
+        html_out = _render_dashboard_html(_fleet(_OFF_PEAK), _OFF_PEAK)
+        assert html_out.index('data-provider="codex"') < html_out.index(
+            'data-provider="antigravity"'
+        ) < html_out.index('data-provider="zai"')

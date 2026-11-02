@@ -4,15 +4,16 @@ Conventions and quick reference for agents (and humans) working on usage-dashboa
 
 ## What this is
 
-A two-component system for monitoring AI usage across Claude, z.ai, Ollama, Codex, and OpenCode Go providers:
+A two-component system for monitoring AI usage across Claude, z.ai, Ollama, Codex, OpenCode Go, and Google Antigravity (Gemini / Gemini 4 Argon) providers:
 
 - **Server** (k8s Deployment): Fetches usage data from all providers, normalizes into unified readings, stores in SQLite, serves via authenticated FastAPI endpoint. Also serves `/dashboard`, an unauthenticated mobile-friendly HTML view (private-network use; shows nothing beyond what the display shows — `/readings` keeps bearer auth)
 - **Clients**: The touch GUI polls the server API and uses colour/threshold + countdown logic from `client/format.py`. **Touch GUI** (`usage-dashboard-gui`, `client/gui.py`) — the primary target: a fullscreen pygame app for a **Pi 4B + Touch Display 2** (720×1280), run under a minimal X server (`xinit`+`xrandr`), *not* bare KMS/DRM (which presents black on this panel). Optional scheduled backlight-sleep + tap-to-wake (`BACKLIGHT_SLEEP`/`UNIT_ID`, server `/schedule`) and a tap-the-status-line overlay: unit diagnostics on the left (`client/diagnostics.py` — hostname/IPs, server, running commit, updater health read from the two status files `deploy/pi/update.sh` writes under the state dir) + brightness `+`/`-` on the right (`BRIGHTNESS_STEPS`, persisted to `BRIGHTNESS_STATE_FILE`; `client/brightness.py`). See `deploy/pi/` for the install + auto-update tooling. Off-peak windows (`shared/offpeak.py`) drive display hints: the z.ai tile title tints green off-peak / orange during peak hours, with a countdown to the next boundary
 
 Key modules:
 - `src/usage_dashboard/shared/models.py` — Normalized reading schema (Provider enum, Reading dataclass)
-- `src/usage_dashboard/server/` — Fetchers (Claude, z.ai, Ollama, Codex, OpenCode Go), SQLite DB, API, scheduler
+- `src/usage_dashboard/server/` — Fetchers (Claude, z.ai, Ollama, Codex, OpenCode Go, Antigravity), SQLite DB, API, scheduler
 - `src/usage_dashboard/server/codex_app_server.py` — client for the official `codex app-server` (JSONL over stdio). **Protocol facts in its docstring were verified against a real binary, not docs** — keep it that way. **One long-lived child** (`persistent=True`) — not one per fetch. Latency would allow per-fetch (~0.7s vs a 300s poll), but each *start* leaks ~29 kB of uncheckpointed SQLite WAL plus a `.tmp/git-*` dir into `CODEX_HOME`: ~8.3 MB/day, which fills the 1 GiB PVC — and the readings DB with it — in ~4 months. Growth is per-start, not per-request. Resident cost is ~92 MB RSS in production (plugins disabled). Plugins are disabled in the default args because an authenticated App Server otherwise downloads ~50 MB of plugin catalog and Office templates this client can never reach (55.9 MB → 3.1 MB). Never bound a read with `select()` here: the child writes notifications and responses together, and `select()` cannot see lines already in Python's buffer
+- `src/usage_dashboard/server/fetch_antigravity.py` — Google Antigravity via the official `agy` CLI (Plan 007): a **per-fetch** subprocess running the documented zero-turn `agy -p /usage --output-format json`. Facts in its docstring were **verified against agy 1.4.12, not docs**. Load-bearing flags: `--log-file /dev/null` (otherwise a new ~34 kB log per run, never pruned per run: ~10 MB/day; a fixed path *appends*), `AGY_CLI_DISABLE_AUTO_UPDATE=true` (`1` is silently ignored), `--disable-slash-commands=false` plus a `num_turns == 0` check (a saved setting can turn `/usage` into a model prompt). The child gets a minimal env allowlist, never the pod's secrets. Signed out, the CLI blocks 60 s on a paste prompt, so the fetch kills it on the prompt and reports an auth failure. Untouched buckets report a sliding "now + window" reset, which is dropped so the idle ladder can widen
 - `src/usage_dashboard/claude_credentials.py` — quarantined parser for Claude Code's `.credentials.json`. Fails closed and names the installed CLI version; it is the only place that knows that (undocumented) schema
 - `src/usage_dashboard/client/` — HTTP fetcher with adaptive refresh, pygame touch GUI
 - `src/usage_dashboard/deploy/` — `redeploy.py`: opt-in self-redeploy of the Pi's installer-managed components (units/scripts) from the pulled checkout (`AUTO_REDEPLOY=1`); driven by `deploy/pi/update.sh` via the root `usage-dashboard-redeploy` helper. Content-addressed + atomic-write + unit-verify + GUI rollback
@@ -60,6 +61,16 @@ cookie (plus the OpenCode `wrk_…` workspace id, now store-side metadata).
 After any successful enrolment the scheduler adopts the new credential
 in-memory (`update_credentials`) and fetches — no rollout restart needed.
 `kubectl exec` remains the fallback path.
+
+Antigravity (Plan 007) is the Claude interaction on the Codex ownership model:
+`login antigravity` runs the official `agy` sign-in (Google URL → paste the
+code within its **fixed 60 s** window) inside a **staging** `HOME` beside
+`/data/antigravity`. The same run answers `/usage`, so it doubles as the
+verification, and only then is the staging dir renamed into place (file lock
+shared with the fetcher). A failed, timed-out or cancelled ceremony is deleted
+and never displaces a working login. The pane lifts the Google link into
+`verification_url` (an anchored Google-OAuth match, so ceremony output can't
+steer the button elsewhere) and shows a countdown. Enabled by `ANTIGRAVITY_MODE=cli`; never copy a desktop token in.
 
 Claude usage remains an **unsupported** dependency (undocumented
 `GET /api/oauth/usage` plus that credential file); Codex usage is supported.

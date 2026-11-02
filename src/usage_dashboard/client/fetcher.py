@@ -7,9 +7,11 @@ from typing import Any
 
 import httpx
 
-from usage_dashboard.shared.models import Reading
+from usage_dashboard.shared.models import Provider, Reading
 
 logger = logging.getLogger(__name__)
+
+_KNOWN_PROVIDERS = frozenset(p.value for p in Provider)
 
 
 class ClientFetcher:
@@ -133,7 +135,14 @@ class ClientFetcher:
             )
             response.raise_for_status()
             data: list[dict[str, Any]] = response.json()
-            new_readings = [Reading.from_dict(item) for item in data]
+            # Skip providers this build doesn't know. A server can ship one
+            # before every panel has updated (Plan 007 added Antigravity), and
+            # one unknown row must not cost the panel every other reading.
+            new_readings = [
+                Reading.from_dict(item)
+                for item in data
+                if item.get("provider") in _KNOWN_PROVIDERS
+            ]
             self._update_interval(new_readings)
             with self._lock:
                 self._readings = new_readings

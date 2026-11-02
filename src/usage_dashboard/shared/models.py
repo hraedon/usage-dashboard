@@ -17,6 +17,10 @@ class Provider(Enum):
     OLLAMA = "ollama"
     CODEX = "codex"
     OPENCODE = "opencode"
+    # Google Antigravity (Plan 007), read through the official ``agy`` CLI.
+    # The session/weekly pair is the shared Gemini (Flash/Pro) pool; Gemini 4
+    # Argon's separate weekly-only bucket rides along as a scoped limit.
+    ANTIGRAVITY = "antigravity"
     # The Umans Code prepaid wallet (Plan 004). Not a quota provider: the
     # reading is quota-less and its ``detail`` carries the formatted balance
     # ("$16.32" or "$16.32, promo: $7.14"). The touch layout gives it no tile

@@ -127,3 +127,23 @@ class TestResolveCookie:
         restarted = TokenStore(path)
         assert _resolve_cookie(restarted, "ollama-1", "ollama") == "ollama-1"
         assert _resolve_cookie(restarted, "oc-0", "opencode") == "oc-0"
+
+
+class TestAntigravityMode:
+    """Plan 007: ``ANTIGRAVITY_MODE=cli`` is the only enabled mode."""
+
+    def test_cli_mode_builds_the_config(self) -> None:
+        from usage_dashboard.server.main import _build_antigravity_config
+
+        config = _build_antigravity_config("cli", "/data/antigravity", "/usr/local/bin/agy")
+        assert config is not None
+        assert config.home == "/data/antigravity"
+        assert config.binary == "/usr/local/bin/agy"
+
+    def test_disabled_and_unknown_modes_leave_it_unconfigured(self, caplog) -> None:
+        from usage_dashboard.server.main import _build_antigravity_config
+
+        assert _build_antigravity_config("disabled", "/h", "agy") is None
+        assert _build_antigravity_config("", "/h", "agy") is None
+        assert _build_antigravity_config("app_server", "/h", "agy") is None
+        assert "Unknown ANTIGRAVITY_MODE" in caplog.text

@@ -7,6 +7,13 @@ spawned as a subprocess on a PTY (the official login expects a terminal and a
 pasted-back code), and Codex enrolment is ``cli.login_codex`` called directly
 with injected output callbacks, because that flow has no terminal dependency.
 
+Antigravity (Plan 007) is the Claude shape again: the CLI module on a PTY,
+wrapping the official ``agy`` sign-in, which prints a Google URL and waits
+60 s for a pasted code. Its URL is also lifted into the job's
+``verification_url`` so the pane can offer a one-click "open sign-in" button
+(the transcript keeps the link readable too, since URLs are exempt from run
+masking), and the paste window becomes a countdown.
+
 Serialization is deliberate. One active job at a time: the token store is one
 JSON file, a Claude credential family must have exactly one refresher, and
 the Codex ceremony needs exclusive ``CODEX_HOME`` ownership. Concurrent
@@ -61,6 +68,16 @@ _ANSI_ESCAPE = re.compile(
 
 _REDACTED = "<redacted>"
 
+# Antigravity's sign-in link, as the official CLI prints it. Anchored to
+# Google's OAuth endpoint so ceremony output can never steer the pane's
+# "open sign-in" button anywhere else. The link carries only public values
+# (client id, PKCE challenge, state), never a secret.
+_GOOGLE_SIGNIN_URL = re.compile(
+    r"https://accounts\.google\.com/o/oauth2/(?:v2/)?auth\?[^\s\"'<>]+"
+)
+# The CLI's paste window, announced as it starts (agy 1.4.12: 60 s).
+_AUTH_WAIT = re.compile(r"Waiting for authentication \(timeout (\d+)s\)")
+
 # How many transcript lines to keep per job — the pane polls, so this is the
 # window an operator who looked away can scroll back through.
 _TRANSCRIPT_MAX_LINES = 400
@@ -76,6 +93,8 @@ CAPABILITIES: dict[str, dict[str, Any]] = {
     "codex": {"mode": "device-code"},
     "ollama": {"mode": "credential-paste"},
     "opencode": {"mode": "credential-paste", "fields": ["credential", "workspace_id"]},
+    # Offered only when the server enables the provider (ANTIGRAVITY_MODE).
+    "antigravity": {"mode": "interactive"},
 }
 
 
@@ -119,6 +138,9 @@ class EnrolmentJob:
         self.error: str | None = None
         self.verification_url: str | None = None
         self.user_code: str | None = None
+        # Epoch seconds when the ceremony stops accepting a pasted code, for
+        # ceremonies that announce a window (Antigravity's 60 s).
+        self.input_deadline: float | None = None
         self.transcript: deque[str] = deque(maxlen=_TRANSCRIPT_MAX_LINES)
         self._lock = threading.Lock()
         self._master_fd: int | None = None
@@ -130,6 +152,15 @@ class EnrolmentJob:
         if not cleaned:
             return
         with self._lock:
+            if self.provider == "antigravity":
+                # Lifted before redaction, so the button's link is exactly
+                # what the CLI printed whatever redact() does to the copy.
+                url = _GOOGLE_SIGNIN_URL.search(cleaned)
+                if url is not None:
+                    self.verification_url = url.group(0)
+                wait = _AUTH_WAIT.search(cleaned)
+                if wait is not None:
+                    self.input_deadline = time.time() + int(wait.group(1))
             self.transcript.append(redact(cleaned))
 
     def set_device_code(self, url: str, code: str) -> None:
@@ -143,16 +174,26 @@ class EnrolmentJob:
             self._process = process
 
     def write_input(self, text: str) -> None:
-        """Feed one operator line to the ceremony's stdin (the PTY master)."""
+        """Feed one operator line to the ceremony's stdin (the PTY master).
+
+        The write happens under the lock that ``detach_pty`` takes, so it can
+        never land on a descriptor that was closed and then reused by the OS
+        for something else (a DB file, a socket).
+        """
+        data = text.rstrip("\n") + "\n"
         with self._lock:
             fd = self._master_fd
-        if fd is None:
-            raise EnrolmentError("job is not accepting input")
-        data = text.rstrip("\n") + "\n"
-        try:
-            os.write(fd, data.encode("utf-8"))
-        except OSError as exc:
-            raise EnrolmentError(f"could not write to the ceremony: {exc}") from exc
+            if fd is None:
+                raise EnrolmentError("job is not accepting input")
+            try:
+                os.write(fd, data.encode("utf-8"))
+            except OSError as exc:
+                raise EnrolmentError(f"could not write to the ceremony: {exc}") from exc
+
+    def detach_pty(self) -> None:
+        """Stop accepting input before the PTY master is closed."""
+        with self._lock:
+            self._master_fd = None
 
     def terminate(self) -> None:
         """Cancel a running subprocess ceremony (SIGTERM, then reap)."""
@@ -170,6 +211,7 @@ class EnrolmentJob:
             self.exit_code = exit_code
             self.error = error
             self.finished_at = time.time()
+            self.input_deadline = None
             self._master_fd = None
 
     def to_dict(self) -> dict[str, Any]:
@@ -185,6 +227,12 @@ class EnrolmentJob:
                 "error": self.error,
                 "verification_url": self.verification_url,
                 "user_code": self.user_code,
+                "accepts_input": self._master_fd is not None,
+                "input_seconds_left": (
+                    max(0, round(self.input_deadline - time.time()))
+                    if self.input_deadline is not None
+                    else None
+                ),
                 "transcript": list(self.transcript),
             }
 
@@ -211,6 +259,9 @@ class EnrolmentService:
         codex_pause: Callable[[], bool] | None = None,
         codex_resume: Callable[[], bool] | None = None,
         command_override: list[str] | None = None,
+        antigravity_home: str | None = None,
+        agy_bin: str = "agy",
+        antigravity_command_override: list[str] | None = None,
     ) -> None:
         self._token_store = token_store
         self._claude_bin = claude_bin
@@ -221,6 +272,10 @@ class EnrolmentService:
         self._codex_pause = codex_pause
         self._codex_resume = codex_resume
         self._command_override = command_override
+        # None = Antigravity disabled on this server: not offered, not startable.
+        self._antigravity_home = antigravity_home
+        self._agy_bin = agy_bin
+        self._antigravity_command_override = antigravity_command_override
         self._lock = threading.Lock()
         self._jobs: dict[str, EnrolmentJob] = {}
         self._active_id: str | None = None
@@ -271,7 +326,11 @@ class EnrolmentService:
             return {
                 "active": active.to_dict() if active else None,
                 "last": last.to_dict() if last else None,
-                "providers": CAPABILITIES,
+                "providers": {
+                    name: caps
+                    for name, caps in CAPABILITIES.items()
+                    if name != "antigravity" or self._antigravity_home is not None
+                },
             }
 
     # ------------------------------------------------------------------
@@ -303,6 +362,10 @@ class EnrolmentService:
             raise EnrolmentError("account must be 'personal' or 'work'")
         command = self._claude_command(account)
         job = self._new_job("claude", account)
+        return self._spawn_pty_job(job, command)
+
+    def _spawn_pty_job(self, job: EnrolmentJob, command: list[str]) -> dict[str, Any]:
+        """Run *command* on a PTY as *job*'s ceremony and stream it."""
         job.emit(f"$ {' '.join(command)}")
         try:
             master, slave = pty.openpty()
@@ -361,6 +424,7 @@ class EnrolmentService:
         self, job: EnrolmentJob, process: subprocess.Popen[bytes], master: int
     ) -> None:
         exit_code = process.wait()
+        job.detach_pty()
         try:
             os.close(master)
         except OSError:
@@ -375,6 +439,41 @@ class EnrolmentService:
         job.finish(0)
         self._finish_active(job)
         self._notify_success(job.provider)
+
+    # ------------------------------------------------------------------
+    # Antigravity (interactive, PTY-driven CLI subprocess; Plan 007)
+    # ------------------------------------------------------------------
+
+    def _antigravity_command(self, home: str) -> list[str]:
+        if self._antigravity_command_override is not None:
+            return list(self._antigravity_command_override)
+        return [
+            self._python_bin,
+            "-m",
+            "usage_dashboard.cli",
+            "login",
+            "antigravity",
+            "--antigravity-home",
+            home,
+            "--agy-bin",
+            self._agy_bin,
+        ]
+
+    def start_antigravity(self) -> dict[str, Any]:
+        """Run the official Antigravity sign-in on a PTY.
+
+        The CLI command signs in inside a staging home, verifies the result
+        with a real ``/usage`` read, and only then swaps it into place, so no
+        outcome here can displace a working login. That is also why, unlike
+        Codex, the runtime fetcher needs no pause.
+        """
+        home = self._antigravity_home
+        if home is None:
+            raise EnrolmentError(
+                "Antigravity is not enabled on this server (set ANTIGRAVITY_MODE=cli)"
+            )
+        job = self._new_job("antigravity", None)
+        return self._spawn_pty_job(job, self._antigravity_command(home))
 
     def cancel(self, job_id: str) -> dict[str, Any]:
         job = self.get_job(job_id)
