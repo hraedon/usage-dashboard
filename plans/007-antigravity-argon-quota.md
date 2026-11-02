@@ -11,8 +11,10 @@ Runtime-verified locally (2026-11-01):
   resetting 2026-11-04T15:18:24Z, on both `/readings` and `/dashboard`.
 - Three forced refreshes added no CLI log files.
 - A real pane ceremony through the API with the real binary surfaced the
-  704-char Google link, unredacted, as `verification_url` (the transcript copy
-  stays redacted) and a 60 s countdown.
+  704-char Google link, intact, as `verification_url`, plus a 60 s countdown.
+  At the time, the transcript copy masked the PKCE challenge. Since #47
+  (merged into main concurrently), URLs are exempt from run masking, so the
+  transcript keeps the link readable too.
 - That ceremony then hit the real 60 s timeout and failed cleanly; a second
   one was cancelled (exit 143). Both left the existing login byte-identical
   with no staging dir and no stray `agy` process.

@@ -439,9 +439,9 @@ class TestLoginApi:
 # Plan 007 — Antigravity on the PTY transport
 # ---------------------------------------------------------------------------
 
-# 43 token-charset chars, like a real PKCE challenge: long enough that the
-# transcript redactor masks it, which is exactly why the link has to be lifted
-# into a structured field before redaction.
+# 43 token-charset chars, like a real PKCE challenge: long enough to trip the
+# run-masking rule if URLs were not exempt from it (#47), so the tests notice
+# if the sign-in link ever gets mangled on its way to the pane.
 _PKCE = "JafNPs6Tjm1RKUa8tAy_w_6jvAEUOwHzfjrm2tb2Gbs"
 _SIGNIN_URL = (
     "https://accounts.google.com/o/oauth2/auth?access_type=offline"
@@ -487,12 +487,12 @@ class TestAntigravityJob:
 
         _wait_for(prompted, what="paste-window announcement")
         snap = service.get_job(job["job_id"]).to_dict()
-        # The structured field keeps the link usable...
+        # The structured field carries the exact link for the pane's button...
         assert snap["verification_url"] == _SIGNIN_URL
-        # ...while the transcript copy stays redacted.
+        # ...and, since #47 exempts URLs from run masking, the transcript copy
+        # stays a usable link too (a masked PKCE challenge breaks sign-in).
         transcript = "\n".join(snap["transcript"])
-        assert _PKCE not in transcript
-        assert "<redacted>" in transcript
+        assert _SIGNIN_URL in transcript
         assert 55 <= snap["input_seconds_left"] <= 60
         assert snap["accepts_input"] is True
         assert snap["user_code"] is None  # no device code: the pane shows a button
@@ -677,3 +677,22 @@ def test_ceremony_exit_detaches_before_closing_the_master(
     jobs.append(service.get_job(started["job_id"]))
     _wait_for(lambda: jobs[0].to_dict()["state"] != "running", what="exit")
     assert closed_while_attached == []
+
+
+def test_pane_never_reveals_a_css_hidden_element_with_an_empty_display():
+    """#42's bug, which Plan 007 briefly reintroduced for #signinbox: setting
+    ``style.display = ""`` falls back to the stylesheet, so an element hidden
+    by an ``#id { display: none }`` rule stays hidden forever."""
+    import re
+
+    from usage_dashboard.server.login_page import render_login_html
+
+    page = render_login_html()
+    hidden_by_css = set(re.findall(r"#([\w-]+)\s*\{[^}]*display:\s*none", page))
+    assert {"signinbox", "codebox", "keybanner", "agy-card", "jobbox"} <= hidden_by_css
+    revealed_empty = set(
+        re.findall(r'\$\("([\w-]+)"\)\.style\.display\s*=\s*[^;]*?""', page)
+    )
+    assert not hidden_by_css & revealed_empty, (
+        f"set to an empty display while CSS hides them: {hidden_by_css & revealed_empty}"
+    )

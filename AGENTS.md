@@ -69,8 +69,8 @@ code within its **fixed 60 s** window) inside a **staging** `HOME` beside
 verification, and only then is the staging dir renamed into place (file lock
 shared with the fetcher). A failed, timed-out or cancelled ceremony is deleted
 and never displaces a working login. The pane lifts the Google link into
-`verification_url` (the redactor would mask its PKCE challenge) and shows a
-countdown. Enabled by `ANTIGRAVITY_MODE=cli`; never copy a desktop token in.
+`verification_url` (an anchored Google-OAuth match, so ceremony output can't
+steer the button elsewhere) and shows a countdown. Enabled by `ANTIGRAVITY_MODE=cli`; never copy a desktop token in.
 
 Claude usage remains an **unsupported** dependency (undocumented
 `GET /api/oauth/usage` plus that credential file); Codex usage is supported.

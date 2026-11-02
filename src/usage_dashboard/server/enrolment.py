@@ -9,9 +9,10 @@ with injected output callbacks, because that flow has no terminal dependency.
 
 Antigravity (Plan 007) is the Claude shape again: the CLI module on a PTY,
 wrapping the official ``agy`` sign-in, which prints a Google URL and waits
-60 s for a pasted code. Its URL is lifted out of the transcript into the
-job's ``verification_url`` (the redactor would otherwise mask the PKCE
-challenge and break the link), and the paste window becomes a countdown.
+60 s for a pasted code. Its URL is also lifted into the job's
+``verification_url`` so the pane can offer a one-click "open sign-in" button
+(the transcript keeps the link readable too, since URLs are exempt from run
+masking), and the paste window becomes a countdown.
 
 Serialization is deliberate. One active job at a time: the token store is one
 JSON file, a Claude credential family must have exactly one refresher, and
@@ -152,8 +153,8 @@ class EnrolmentJob:
             return
         with self._lock:
             if self.provider == "antigravity":
-                # Before redaction: the transcript copy is masked, the
-                # structured field keeps the link usable.
+                # Lifted before redaction, so the button's link is exactly
+                # what the CLI printed whatever redact() does to the copy.
                 url = _GOOGLE_SIGNIN_URL.search(cleaned)
                 if url is not None:
                     self.verification_url = url.group(0)

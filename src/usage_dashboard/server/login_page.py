@@ -259,7 +259,7 @@ function renderJob(job) {
   // A sign-in link with no device code (Antigravity): a button plus the
   // paste-window countdown.
   if (job.state === "running" && job.verification_url && !job.user_code) {
-    $("signinbox").style.display = "";
+    $("signinbox").style.display = "block";
     $("signinurl").href = job.verification_url;
   } else { $("signinbox").style.display = "none"; }
   inputDeadline = job.state === "running" && job.input_seconds_left != null
