@@ -828,3 +828,110 @@ class TestWalletLine:
         ]
         layout = build_main_layout(readings, _SIZE, now=_NOW)
         assert layout.wallet_text == "Umans: $16.32"
+
+
+def _gemini(**over: object) -> Reading:
+    base: dict = {
+        "session_percent": 0.0,
+        "session_resets_at": None,
+        "weekly_percent": 12.0,
+        "scoped_limits": [ScopedLimit(
+            name="Argon", percent=100.0, resets_at=_NOW + timedelta(days=3),
+        )],
+    }
+    base.update(over)
+    return _reading(Provider.ANTIGRAVITY, **base)
+
+
+class TestCodexGeminiPair:
+    """Plan 007, owner request: Antigravity pairs with Codex, and that row
+    shows only weekly windows (the limits that actually run out)."""
+
+    def _fleet(self) -> list[Reading]:
+        return _all_configured() + [_reading(Provider.CODEX), _gemini()]
+
+    def test_codex_and_gemini_share_a_row(self) -> None:
+        layout = build_main_layout(self._fleet(), _SIZE, now=_NOW)
+        assert [t.provider for t in layout.tiles] == [
+            Provider.CLAUDE, Provider.CODEX, Provider.ANTIGRAVITY,
+            Provider.ZAI, Provider.OLLAMA,
+        ]
+        by = {t.provider: t for t in layout.tiles}
+        codex, gemini = by[Provider.CODEX], by[Provider.ANTIGRAVITY]
+        assert codex.rect.y == gemini.rect.y
+        assert codex.rect.x + codex.rect.w <= gemini.rect.x
+        assert codex.compact and gemini.compact
+        assert codex.rect.w < by[Provider.CLAUDE].rect.w
+        # z.ai + Ollama still pair beneath, on their own row.
+        assert by[Provider.ZAI].rect.y == by[Provider.OLLAMA].rect.y > codex.rect.y
+
+    def test_the_pair_shows_weekly_windows_only(self) -> None:
+        layout = build_main_layout(self._fleet(), _SIZE, now=_NOW)
+        by = {t.provider: t for t in layout.tiles}
+        assert [b.label for b in by[Provider.CODEX].bars] == ["W"]
+        # Gemini pool weekly, then Argon (compact scoped label = initial).
+        assert [b.label for b in by[Provider.ANTIGRAVITY].bars] == ["W", "A"]
+        assert by[Provider.ANTIGRAVITY].bars[1].percent_text == "100%"
+
+    def test_other_pairs_keep_their_session_bars(self) -> None:
+        layout = build_main_layout(self._fleet(), _SIZE, now=_NOW)
+        zai = next(t for t in layout.tiles if t.provider is Provider.ZAI)
+        assert [b.label for b in zai.bars] == ["S", "W"]
+
+    def test_the_tile_is_titled_gemini(self) -> None:
+        layout = build_main_layout(self._fleet(), _SIZE, now=_NOW)
+        gemini = next(t for t in layout.tiles if t.provider is Provider.ANTIGRAVITY)
+        assert gemini.title == "GEMINI"
+        stale = build_main_layout(
+            [_reading(Provider.CODEX), _gemini(status=ReadingStatus.STALE, stale=True)],
+            _SIZE, now=_NOW,
+        )
+        assert stale.tiles[1].title.startswith("GEMINI")
+        assert stale.tiles[1].title != "GEMINI"  # carries the status suffix
+
+    def test_without_codex_gemini_is_full_width_with_every_window(self) -> None:
+        layout = build_main_layout(_all_configured() + [_gemini()], _SIZE, now=_NOW)
+        gemini = next(t for t in layout.tiles if t.provider is Provider.ANTIGRAVITY)
+        assert not gemini.compact
+        assert [b.label for b in gemini.bars] == ["Session", "Weekly", "Argon"]
+
+    def test_without_gemini_codex_is_unchanged(self) -> None:
+        # The pairs are explicit: an absent Antigravity must not leave Codex
+        # pairing up with z.ai and orphaning Ollama.
+        layout = build_main_layout(
+            _all_configured() + [_reading(Provider.CODEX)], _SIZE, now=_NOW
+        )
+        by = {t.provider: t for t in layout.tiles}
+        assert not by[Provider.CODEX].compact
+        assert [b.label for b in by[Provider.CODEX].bars] == ["Session", "Weekly"]
+        assert by[Provider.ZAI].rect.y == by[Provider.OLLAMA].rect.y
+
+    def test_detail_view_lists_every_window(self) -> None:
+        detail = build_detail_layout(_gemini(), now=_NOW)
+        assert detail.title == "GEMINI"
+        labels = [line.label for line in detail.lines]
+        assert "Session" in labels and "Weekly" in labels and "Argon" in labels
+
+    def test_tiny_portrait_uses_three_columns_past_four_tiles(self) -> None:
+        layout = build_main_layout(self._fleet(), (240, 320), now=_NOW)
+        assert all(t.ultra_compact for t in layout.tiles)
+        rows = sorted({t.rect.y for t in layout.tiles})
+        assert len(rows) == 2
+        gemini = next(t for t in layout.tiles if t.provider is Provider.ANTIGRAVITY)
+        assert gemini.compact_title == "GEM"
+
+
+def test_weekly_only_pair_never_renders_a_blank_tile() -> None:
+    """Plan 007 review: Codex can report a session window only, and Gemini a
+    5h bucket only; weekly-only filtering must not strip their only bar."""
+    codex = _reading(Provider.CODEX, weekly_percent=None, weekly_resets_at=None)
+    gemini = _gemini(
+        session_percent=10.0, session_resets_at=_NOW + timedelta(hours=1),
+        weekly_percent=None, scoped_limits=None,
+    )
+    for size in ((800, 480), (720, 1280)):
+        layout = build_main_layout([codex, gemini], size, now=_NOW)
+        by = {t.provider: t for t in layout.tiles}
+        assert by[Provider.CODEX].compact  # still paired
+        assert [b.label for b in by[Provider.CODEX].bars] == ["S"]
+        assert [b.label for b in by[Provider.ANTIGRAVITY].bars] == ["S"]

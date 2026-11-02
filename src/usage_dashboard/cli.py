@@ -5,7 +5,9 @@ its own: Codex enrols through the official App Server's device-code login (and
 Codex keeps the tokens), and Claude enrols through the official Claude Code
 login, whose credential is imported into the dashboard's token store and then
 deleted from the temporary profile. Ollama and OpenCode Go still capture a
-browser session cookie, which is all their usage pages expose.
+browser session cookie, which is all their usage pages expose. Google
+Antigravity (Plan 007) enrols through the official ``agy`` CLI's own sign-in,
+and the CLI keeps the Google token.
 """
 from __future__ import annotations
 
@@ -15,6 +17,7 @@ import logging
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -34,8 +37,20 @@ from usage_dashboard.server.codex_app_server import (
     CodexAppServerClient,
     CodexAppServerConfig,
 )
+from usage_dashboard.server.fetch_antigravity import (
+    ARGON_LABEL,
+    DEFAULT_AGY_BIN,
+    DEFAULT_ANTIGRAVITY_HOME,
+    cli_env,
+    install_home,
+    make_staging_home,
+    parse_result_text,
+    parse_usage,
+    usage_command,
+    workspace_dir,
+)
 from usage_dashboard.server.fetch_claude import fetch_claude_usage
-from usage_dashboard.server.fetch_types import FetchError
+from usage_dashboard.server.fetch_types import FetchAuthError, FetchError
 from usage_dashboard.server.token_store import TokenStore, TokenStoreError
 from usage_dashboard.shared.models import Provider
 
@@ -502,6 +517,113 @@ def login_codex(
     _emit("The dashboard's App Server resumes and reads the new login on its next poll.")
 
 
+# ---------------------------------------------------------------------------
+# Antigravity enrolment (Plan 007)
+#
+# There is no `agy login` subcommand. Signed out, the print-mode usage query
+# itself runs the sign-in: it prints a Google URL, reads a pasted code from
+# stdin for 60 s (a fixed window in agy 1.4.12), and then answers the query.
+# So one run is both the ceremony and its verification.
+#
+# It runs in a fresh *staging* home beside the live one, and that staging dir
+# becomes the live home only after the run has returned real quota. A failed,
+# timed-out or cancelled ceremony is deleted, so it can never displace a
+# working login. The swap moves the CLI's own state directory wholesale; this
+# module never opens or parses the token file.
+# ---------------------------------------------------------------------------
+
+# Outer bound on the ceremony. The CLI gives up on its own after its 60 s
+# paste window; this only catches a CLI that never exits.
+_ANTIGRAVITY_LOGIN_TIMEOUT = 180.0
+
+
+def _raise_on_sigterm(signum: int, _frame: object) -> None:
+    # The login pane cancels a ceremony with SIGTERM. Python's default action
+    # skips `finally`, which would strand the staging dir and the agy child.
+    raise SystemExit(128 + signum)
+
+
+def login_antigravity(
+    home: str | None = None,
+    agy_bin: str | None = None,
+    timeout: float = _ANTIGRAVITY_LOGIN_TIMEOUT,
+) -> None:
+    """Sign a Google account into the Antigravity CLI under *home*."""
+    home = home or os.environ.get("ANTIGRAVITY_HOME") or DEFAULT_ANTIGRAVITY_HOME
+    binary = agy_bin or os.environ.get("AGY_BIN") or DEFAULT_AGY_BIN
+
+    print(f"Signing in to Google Antigravity (home: {home}).")
+    print("The official agy CLI prints a Google sign-in link next. Open it, sign")
+    print("in, copy the code the page shows, and paste it here within 60 seconds.")
+    print("A timeout is harmless: nothing changes, just start again.\n", flush=True)
+
+    previous_handler = signal.signal(signal.SIGTERM, _raise_on_sigterm)
+    staging: str | None = None
+    proc: subprocess.Popen[bytes] | None = None
+    installed = False
+    try:
+        staging = make_staging_home(home)
+        try:
+            proc = subprocess.Popen(  # noqa: S603 - fixed argv, no shell
+                usage_command(binary),
+                # stdin/stderr stay on the operator's terminal: the CLI prints
+                # its link and prompt on stderr and reads the code from stdin.
+                stdout=subprocess.PIPE,
+                cwd=workspace_dir(staging),
+                env=cli_env(staging),
+            )
+        except OSError as exc:
+            raise FetchError(f"could not run {binary!r}: {exc}") from exc
+        try:
+            out, _ = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired as exc:
+            raise FetchError(f"the CLI did not finish within {timeout:.0f}s") from exc
+        reading = parse_usage(parse_result_text(out.decode("utf-8", "replace")))
+        # Past this point the verified login is live. A late cancel must not
+        # turn that into a reported failure (the pane would then skip the
+        # immediate fetch), so ignore SIGTERM for the few remaining lines.
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        install_home(staging, home)
+        staging = None
+        installed = True
+    except FetchAuthError as exc:
+        print(f"\nSign-in did not complete: {exc}.", file=sys.stderr)
+        print("Your existing login, if any, is unchanged. Start again to retry.",
+              file=sys.stderr)
+        sys.exit(1)
+    except (FetchError, OSError) as exc:
+        print(f"\nEnrolment failed: {exc}", file=sys.stderr)
+        print("Your existing login, if any, is unchanged.", file=sys.stderr)
+        sys.exit(1)
+    finally:
+        if proc is not None and proc.poll() is None:
+            # agy stays in this process's session on purpose: it reads the
+            # pasted code from the terminal, and that path was verified with
+            # the real binary in-session. Anything it forked and orphaned is
+            # reaped by tini, the image's PID 1.
+            proc.kill()
+            proc.wait()
+        if staging is not None:
+            shutil.rmtree(staging, ignore_errors=True)
+        if not installed:
+            signal.signal(signal.SIGTERM, previous_handler)
+
+    print("\nAntigravity signed in and verified.")
+    argon = next(
+        (sl for sl in reading.scoped_limits or [] if sl.name == ARGON_LABEL), None
+    )
+    if argon is not None and argon.percent is not None:
+        print(f"  Gemini 4 Argon weekly: {argon.percent:.0f}% used")
+    else:
+        print("  No separate Argon bucket on this plan (Ultra folds it into Gemini).")
+    if reading.weekly_percent is not None:
+        print(f"  Gemini weekly: {reading.weekly_percent:.0f}% used")
+    print("Signed in from the /login pane, the tile updates now. From kubectl exec,")
+    print("tap refresh on a panel (or POST /refresh) to pick it up immediately;")
+    print("otherwise a signed-out tile retries within the hour.")
+    signal.signal(signal.SIGTERM, previous_handler)
+
+
 def main() -> None:
     logging.basicConfig(
         level=logging.INFO,
@@ -517,7 +639,7 @@ def main() -> None:
     login_parser = sub.add_parser("login", help="Log in to a provider")
     login_parser.add_argument(
         "provider",
-        choices=["claude", "ollama", "opencode", "codex"],
+        choices=["claude", "ollama", "opencode", "codex", "antigravity"],
         help="Provider to log in to",
     )
     login_parser.add_argument(
@@ -549,6 +671,17 @@ def main() -> None:
         help="[codex] Codex executable (default: $CODEX_BIN or `codex`)",
     )
     login_parser.add_argument(
+        "--antigravity-home",
+        default=None,
+        help="[antigravity] Home the agy CLI keeps its login under (default: "
+        "$ANTIGRAVITY_HOME or /data/antigravity). Must match the server's",
+    )
+    login_parser.add_argument(
+        "--agy-bin",
+        default=None,
+        help="[antigravity] agy executable (default: $AGY_BIN or `agy`)",
+    )
+    login_parser.add_argument(
         "--headless",
         action="store_true",
         help="[ollama|opencode] Run the browser headless (rarely clears an "
@@ -575,6 +708,8 @@ def main() -> None:
             login_opencode(headless=args.headless, verify=not args.no_verify)
         elif args.provider == "codex":
             login_codex(codex_home=args.codex_home, codex_bin=args.codex_bin)
+        elif args.provider == "antigravity":
+            login_antigravity(home=args.antigravity_home, agy_bin=args.agy_bin)
     else:
         parser.print_help()
         sys.exit(1)

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
 import time
 from pathlib import Path
@@ -411,3 +412,247 @@ class TestLoginApi:
                 assert "verification failed" in response.json()["detail"]
 
         asyncio.run(run())
+
+
+# ---------------------------------------------------------------------------
+# Plan 007 — Antigravity on the PTY transport
+# ---------------------------------------------------------------------------
+
+# 43 token-charset chars, like a real PKCE challenge: long enough that the
+# transcript redactor masks it, which is exactly why the link has to be lifted
+# into a structured field before redaction.
+_PKCE = "JafNPs6Tjm1RKUa8tAy_w_6jvAEUOwHzfjrm2tb2Gbs"
+_SIGNIN_URL = (
+    "https://accounts.google.com/o/oauth2/auth?access_type=offline"
+    "&client_id=000000000000-fakefakefakefakefakefakefakefake.apps.googleusercontent.com"
+    f"&code_challenge={_PKCE}&code_challenge_method=S256&state=abc123"
+)
+
+# What agy 1.4.12 prints signed out (stderr), then the wrapper's tail.
+_FAKE_AGY_CEREMONY = f"""
+import sys
+sys.stderr.write("Authentication required. Please visit the URL to log in:\\n")
+sys.stderr.write("  {_SIGNIN_URL}\\n\\n")
+sys.stderr.write("Waiting for authentication (timeout 60s)...\\n")
+sys.stderr.write("Or, paste the authorization code here and press Enter:\\n")
+sys.stderr.flush()
+line = sys.stdin.readline()
+print("GOT:" + line.strip())
+"""
+
+
+@pytest.fixture()
+def agy_service(store: TokenStore, tmp_path: Path) -> tuple[EnrolmentService, list[str]]:
+    script = tmp_path / "fake_agy_ceremony.py"
+    script.write_text(_FAKE_AGY_CEREMONY, encoding="utf-8")
+    notified: list[str] = []
+    service = EnrolmentService(
+        store,
+        antigravity_home=str(tmp_path / "antigravity"),
+        antigravity_command_override=[sys.executable, str(script)],
+        on_success=notified.append,
+    )
+    return service, notified
+
+
+class TestAntigravityJob:
+    def test_link_and_countdown_survive_redaction(self, agy_service):
+        service, notified = agy_service
+        job = service.start_antigravity()
+        assert job["provider"] == "antigravity"
+
+        def prompted() -> bool:
+            return service.get_job(job["job_id"]).to_dict()["input_seconds_left"] is not None
+
+        _wait_for(prompted, what="paste-window announcement")
+        snap = service.get_job(job["job_id"]).to_dict()
+        # The structured field keeps the link usable...
+        assert snap["verification_url"] == _SIGNIN_URL
+        # ...while the transcript copy stays redacted.
+        transcript = "\n".join(snap["transcript"])
+        assert _PKCE not in transcript
+        assert "<redacted>" in transcript
+        assert 55 <= snap["input_seconds_left"] <= 60
+        assert snap["accepts_input"] is True
+        assert snap["user_code"] is None  # no device code: the pane shows a button
+
+        service.send_input(job["job_id"], "4/0AVG-one-time-code")
+        _wait_for(
+            lambda: service.get_job(job["job_id"]).to_dict()["state"] != "running",
+            what="ceremony completion",
+        )
+        done = service.get_job(job["job_id"]).to_dict()
+        assert done["state"] == "succeeded"
+        assert done["accepts_input"] is False
+        assert done["input_seconds_left"] is None
+        assert notified == ["antigravity"]
+
+    def test_only_a_google_oauth_link_is_lifted(self, store: TokenStore, tmp_path: Path):
+        script = tmp_path / "evil.py"
+        script.write_text(
+            "print('Visit https://evil.example/o/oauth2/auth?x=1')\n"
+            "print('or https://accounts.google.com.evil.example/o/oauth2/auth?x=1')\n",
+            encoding="utf-8",
+        )
+        service = EnrolmentService(
+            store,
+            antigravity_home=str(tmp_path / "antigravity"),
+            antigravity_command_override=[sys.executable, str(script)],
+        )
+        job = service.start_antigravity()
+        _wait_for(
+            lambda: service.get_job(job["job_id"]).to_dict()["state"] != "running",
+            what="job end",
+        )
+        assert service.get_job(job["job_id"]).to_dict()["verification_url"] is None
+
+    def test_claude_jobs_never_lift_links(self, service: EnrolmentService):
+        # The lifting is Antigravity-only; Claude's transcript is unchanged.
+        job = service.start_claude("personal")
+        service.cancel(job["job_id"])
+        _wait_for(
+            lambda: service.get_job(job["job_id"]).to_dict()["state"] != "running",
+            what="cancel",
+        )
+        assert service.get_job(job["job_id"]).to_dict()["input_seconds_left"] is None
+
+    def test_disabled_server_neither_offers_nor_starts_it(self, store: TokenStore):
+        service = EnrolmentService(store)
+        assert "antigravity" not in service.status()["providers"]
+        with pytest.raises(EnrolmentError, match="ANTIGRAVITY_MODE"):
+            service.start_antigravity()
+
+    def test_enabled_server_offers_it_as_interactive(self, agy_service):
+        service, _ = agy_service
+        assert service.status()["providers"]["antigravity"] == {"mode": "interactive"}
+
+    def test_real_command_runs_the_cli_module(self, store: TokenStore):
+        service = EnrolmentService(
+            store, antigravity_home="/data/antigravity", agy_bin="/usr/local/bin/agy"
+        )
+        assert service._antigravity_command("/data/antigravity") == [
+            sys.executable, "-m", "usage_dashboard.cli", "login", "antigravity",
+            "--antigravity-home", "/data/antigravity",
+            "--agy-bin", "/usr/local/bin/agy",
+        ]
+
+
+class TestAntigravityLoginApi:
+    """The route is INTERNAL_ONLY and bearer-gated like the other ceremonies."""
+
+    _app = TestLoginApi._app
+    _client = TestLoginApi._client
+    _get = TestLoginApi._get
+
+    def test_round_trip(self, tmp_path: Path, agy_service):
+        service, _ = agy_service
+        app = self._app(tmp_path, service)
+
+        async def run():
+            async with self._client(app) as client:
+                headers = {"Authorization": f"Bearer {API_KEY}"}
+                denied = await client.post("/internal/v1/login/antigravity")
+                assert denied.status_code == 401
+                started = await client.post(
+                    "/internal/v1/login/antigravity", headers=headers
+                )
+                assert started.status_code == 200
+                job_id = started.json()["job_id"]
+                for _ in range(200):
+                    job = (
+                        await client.get(
+                            f"/internal/v1/login/jobs/{job_id}", headers=headers
+                        )
+                    ).json()
+                    if job["verification_url"]:
+                        break
+                    await asyncio.sleep(0.05)
+                assert job["verification_url"] == _SIGNIN_URL
+                again = await client.post(
+                    "/internal/v1/login/antigravity", headers=headers
+                )
+                assert again.status_code == 409  # one ceremony at a time
+                await client.post(
+                    f"/internal/v1/login/jobs/{job_id}/input",
+                    json={"text": "code"},
+                    headers=headers,
+                )
+                for _ in range(200):
+                    job = (
+                        await client.get(
+                            f"/internal/v1/login/jobs/{job_id}", headers=headers
+                        )
+                    ).json()
+                    if job["state"] != "running":
+                        break
+                    await asyncio.sleep(0.05)
+                assert job["state"] == "succeeded"
+
+        asyncio.run(run())
+
+    def test_disabled_server_refuses(self, tmp_path: Path, store: TokenStore):
+        app = self._app(tmp_path, EnrolmentService(store))
+
+        async def run():
+            async with self._client(app) as client:
+                response = await client.post(
+                    "/internal/v1/login/antigravity",
+                    headers={"Authorization": f"Bearer {API_KEY}"},
+                )
+                assert response.status_code == 409
+                assert "ANTIGRAVITY_MODE" in response.json()["detail"]
+
+        asyncio.run(run())
+
+    def test_pane_carries_the_antigravity_controls(self, tmp_path: Path):
+        page = self._get(self._app(tmp_path, None), "/login", key=None).text
+        assert 'id="agy-card"' in page
+        assert "/internal/v1/login/antigravity" in page
+        assert "Open Google sign-in" in page
+        # The paste box follows the job's PTY, not a hard-coded provider.
+        assert "job.accepts_input" in page
+
+
+def test_input_is_refused_once_the_pty_is_detached(store: TokenStore, tmp_path: Path):
+    """Plan 007 review: a paste racing ceremony exit must never be written to
+    a closed (and possibly reused) descriptor."""
+    job = enrolment_mod.EnrolmentJob("job-x", "antigravity", None)
+    read_fd, write_fd = os.pipe()
+    try:
+        job.attach_pty(write_fd, None)  # type: ignore[arg-type]
+        job.write_input("first")
+        assert os.read(read_fd, 64) == b"first\n"
+        job.detach_pty()
+        assert job.to_dict()["accepts_input"] is False
+        with pytest.raises(EnrolmentError, match="not accepting input"):
+            job.write_input("late")
+    finally:
+        os.close(read_fd)
+        os.close(write_fd)
+
+
+def test_ceremony_exit_detaches_before_closing_the_master(
+    store: TokenStore, tmp_path: Path, monkeypatch
+):
+    script = tmp_path / "quick.py"
+    script.write_text("print('bye')\n", encoding="utf-8")
+    service = EnrolmentService(
+        store,
+        antigravity_home=str(tmp_path / "antigravity"),
+        antigravity_command_override=[sys.executable, str(script)],
+    )
+    real_close = os.close
+    closed_while_attached: list[int] = []
+    jobs: list[enrolment_mod.EnrolmentJob] = []
+
+    def checking_close(fd: int) -> None:
+        for job in jobs:
+            if job._master_fd == fd:
+                closed_while_attached.append(fd)
+        real_close(fd)
+
+    monkeypatch.setattr(enrolment_mod.os, "close", checking_close)
+    started = service.start_antigravity()
+    jobs.append(service.get_job(started["job_id"]))
+    _wait_for(lambda: jobs[0].to_dict()["state"] != "running", what="exit")
+    assert closed_while_attached == []

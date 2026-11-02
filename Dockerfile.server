@@ -27,16 +27,21 @@ RUN pip install --no-cache-dir --prefix=/install --no-deps .
 # SHA256; `latest` must never appear here, because an unattended image rebuild
 # would otherwise change the protocol the server speaks without a code change.
 #
-# `codex` is the App Server the dashboard reads Codex usage through. `claude`
+# `codex` is the App Server the dashboard reads Codex usage through. `agy` is
+# the official Google Antigravity CLI (Plan 007); its zero-turn `/usage` print
+# mode is how the Gemini/Argon tile is read, and its own sign-in is the
+# enrolment ceremony. `claude`
 # is only ever run by the operator during `usage-dashboard login claude`, but
 # it must live in THIS image: the Longhorn PVC holding the token store is RWO,
 # so enrolment has to happen via `kubectl exec` in the one pod that mounts it.
 #
-# Size: these add roughly 480 MB to the image. That is the price of enrolling a
+# Size: these add roughly 715 MB to the image (agy alone is 234 MB). That is the price of enrolling a
 # clean deployment from a terminal with no token copy/paste and no sacrificial
 # VM. Check the published checksums before bumping either pin:
 #   https://github.com/openai/codex/releases
 #   https://downloads.claude.ai/claude-code-releases/<version>/manifest.json
+#   https://antigravity-cli-auto-updater-974169037036.us-central1.run.app/manifests/linux_amd64.json
+#     (version, versioned GCS url, sha512; the build id is part of the url)
 # ---------------------------------------------------------------------------
 FROM python:3.12-slim AS clis
 
@@ -47,6 +52,9 @@ ARG CODEX_VERSION=0.155.1
 ARG CODEX_SHA256=a0ef8b2debc3bf747e07b1a039354de31300ac0dcc2276498ba281470b5d9115
 ARG CLAUDE_VERSION=2.1.276
 ARG CLAUDE_SHA256=8a56c8a14bd3cb246e2bdb7e60aefe0f609bff78c8bbcc5ea6b1817c111c6145
+ARG AGY_VERSION=1.4.12
+ARG AGY_BUILD=4768735748292608
+ARG AGY_SHA512=ea01c73b772187bca928852cf96235f0d846d6da5ebdac188b9ae719597465737f325540d483ee5f3f62d151029001713344972a187ddfb98cc7b97f7204b7f4
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends curl ca-certificates \
@@ -71,17 +79,37 @@ RUN curl -fsSL -o /tmp/claude \
     && install -m 0755 /tmp/claude /usr/local/bin/claude \
     && rm -f /tmp/claude
 
-# Prove both binaries actually run in this image before it ships.
-RUN /usr/local/bin/codex --version && /usr/local/bin/claude --version
+# The tarball holds a single binary named `antigravity`; it is installed under
+# the CLI's documented command name.
+RUN curl -fsSL -o /tmp/agy.tar.gz \
+      "https://storage.googleapis.com/antigravity-public/antigravity-cli/${AGY_VERSION}-${AGY_BUILD}/linux-x64/cli_linux_x64.tar.gz" \
+    && echo "${AGY_SHA512}  /tmp/agy.tar.gz" | sha512sum -c - \
+    && tar -xzf /tmp/agy.tar.gz -C /tmp antigravity \
+    && install -m 0755 /tmp/antigravity /usr/local/bin/agy \
+    && rm -f /tmp/agy.tar.gz /tmp/antigravity
+
+# Prove the binaries actually run in this image before it ships.
+RUN /usr/local/bin/codex --version && /usr/local/bin/claude --version \
+    && /usr/local/bin/agy --version
 
 
 FROM python:3.12-slim
+
+# tini as PID 1 (Plan 007). The server spawns CLI children (`agy` per fetch,
+# `codex app-server`, the enrolment ceremonies) and kills them on timeouts.
+# Anything a killed child had forked is reparented to PID 1, and a Python
+# server as PID 1 never reaps it. agy 1.4.12 verifiably forks (signed out it
+# launches xdg-open), so without this, zombies would accumulate in the pod.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends tini \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
 COPY --from=builder /install /usr/local
 COPY --from=clis /usr/local/bin/codex /usr/local/bin/codex
 COPY --from=clis /usr/local/bin/claude /usr/local/bin/claude
+COPY --from=clis /usr/local/bin/agy /usr/local/bin/agy
 
 VOLUME ["/data"]
 
@@ -91,6 +119,10 @@ ENV DB_PATH="/data/readings.db" \
     FETCH_INTERVAL="300" \
     PORT="8080" \
     CODEX_HOME="/data/codex" \
-    CODEX_BIN="/usr/local/bin/codex"
+    CODEX_BIN="/usr/local/bin/codex" \
+    ANTIGRAVITY_HOME="/data/antigravity" \
+    AGY_BIN="/usr/local/bin/agy" \
+    AGY_CLI_DISABLE_AUTO_UPDATE="true"
 
+ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["python", "-m", "usage_dashboard.server.main"]
