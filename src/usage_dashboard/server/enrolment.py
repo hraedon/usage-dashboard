@@ -45,12 +45,19 @@ from usage_dashboard.server.token_store import TokenStore
 
 logger = logging.getLogger(__name__)
 
-# Long runs of token-charset characters. Real URLs stay intact: their
-# `://`, `/`, `.` and `?` break the run into short pieces, while OAuth
-# access tokens, refresh tokens and session-cookie values do not contain
-# any of those characters and routinely exceed 40 chars. One-time codes
-# (the thing the operator must read) are short by design and survive.
+# Long runs of token-charset characters. OAuth access tokens, refresh tokens
+# and session-cookie values routinely exceed 40 chars; one-time codes (the
+# thing the operator must read) are short by design and survive.
 _TOKEN_RUN = re.compile(r"[A-Za-z0-9_-]{40,}")
+
+# URLs are exempt from the run rule: the authorize URL's PKCE
+# ``code_challenge`` and ``state`` are 43-char base64url values, and masking
+# them hands the operator a link the IdP rejects ("Invalid request format").
+# Inside a URL only unmistakable token material is masked: Anthropic
+# ``sk-ant-`` keys and ``token``-named query values.
+_URL = re.compile(r"https?://\S+")
+_ANTHROPIC_TOKEN = re.compile(r"sk-ant-[A-Za-z0-9_-]+")
+_TOKEN_PARAM = re.compile(r"([?&#](?:access_|refresh_|id_)?token=)[^&#\s]+")
 
 # ANSI escape sequences (CUU/CUD/EL/SGR/OSC…): a PTY makes the official CLI
 # believe a terminal is present, so it may emit cursor addressing and colour.
@@ -94,9 +101,21 @@ class EnrolmentError(Exception):
     """An enrolment request could not be started, continued or accepted."""
 
 
+def _redact_url(url: str) -> str:
+    url = _ANTHROPIC_TOKEN.sub(_REDACTED, url)
+    return _TOKEN_PARAM.sub(lambda m: m.group(1) + _REDACTED, url)
+
+
 def redact(text: str) -> str:
     """Mask token-shaped runs while keeping URLs and one-time codes readable."""
-    return _TOKEN_RUN.sub(_REDACTED, text)
+    parts: list[str] = []
+    pos = 0
+    for match in _URL.finditer(text):
+        parts.append(_TOKEN_RUN.sub(_REDACTED, text[pos : match.start()]))
+        parts.append(_redact_url(match.group()))
+        pos = match.end()
+    parts.append(_TOKEN_RUN.sub(_REDACTED, text[pos:]))
+    return "".join(parts)
 
 
 class EnrolmentJob:

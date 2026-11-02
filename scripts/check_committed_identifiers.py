@@ -61,11 +61,13 @@ MIN_IDENTIFIER_LENGTH = 4
 # matches all of those forms; see _phrase_pattern.
 _PHRASE_SEPARATOR = r"[\s._\-]+"
 _BINARY_SNIFF_LEN = 8192
-# Dirs skipped by the identifier scan: .venv is build output. The always-on
-# guard below handles root-level samples/ (which holds real identifier-bearing
-# data); nested directories named samples/ (e.g. tests/samples/) are legitimate
-# code dirs and SHOULD be scanned.
-_SKIP_DIRS = frozenset({".venv"})
+# Nothing is skipped by PATH. What is scanned is decided by git tracked-ness:
+# every tracked (or staged) file is scanned. .venv used to be skipped as build
+# output, which let a force-added token file under it pass; a tracked file under
+# any .venv/ is now refused outright (leaked_tracked_files). Nested directories
+# named samples/ (e.g. tests/samples/) are legitimate code dirs and ARE scanned;
+# only the root-level guarded dirs below are refused.
+_VENV_DIR = ".venv"
 # Root-level gitignored data dirs that must never contain a tracked file. The
 # guard matches the first path component so a legitimate nested code dir named
 # ``samples`` (e.g. ``tests/samples/``) is not a false positive.
@@ -387,9 +389,9 @@ def _read_staged_blob(path: Path) -> bytes:
 def _paths_from_git(args: list[str]) -> list[Path]:
     """Run a NUL-delimited git path command and return Paths.
 
-    No filtering is applied here — the always-on samples/ guard needs to see
-    every tracked path so it can detect a force-add. The identifier scan
-    filters out _SKIP_DIRS separately.
+    No filtering is applied here or later: the always-on guards need to see every
+    tracked path so they can detect a force-add, and the identifier scan reads
+    every tracked path (no path-based skip).
     """
     paths: list[Path] = []
     for raw in _run_git(args).split("\0"):
@@ -434,14 +436,16 @@ def collect_staged_paths() -> list[Path]:
 
     Scans only what is about to be committed rather than the whole tree, so the
     local gate is fast enough to run on every commit. Deletions are excluded
-    (``--diff-filter=ACM``) because there is nothing to scan. ``--no-renames``
+    (``--diff-filter=ACMT``) because there is nothing to scan. Type changes (T) ARE
+    included: re-staging a regular file as a symlink whose target names a forbidden
+    identifier is otherwise invisible to the hook. ``--no-renames``
     decomposes renames into add+delete so the new path (e.g. a file moved into
     ``samples/``) is included as an addition and caught by the always-on guard.
     """
     return _paths_from_git(
         [
             "git", "diff", "--cached", "--name-only",
-            "--diff-filter=ACM", "--no-renames", "-z",
+            "--diff-filter=ACMT", "--no-renames", "-z",
         ]
     )
 
@@ -517,7 +521,10 @@ def leaked_tracked_files(paths: list[Path], guarded: frozenset[str]) -> list[Pat
       nested code directory named ``samples`` (e.g. ``tests/samples/``) is not a
       false positive;
     * a **root-level ``.env``** or ``.env.<something>``, except the deliberately
-      tracked ``.env.example``.
+      tracked ``.env.example``;
+    * anything under a **``.venv/``** directory at any depth -- a virtualenv is
+      never source, and it used to be skipped by the scan, so a force-added file
+      there was the one tracked path nothing read.
     """
     leaked: list[Path] = []
     for path in paths:
@@ -525,6 +532,9 @@ def leaked_tracked_files(paths: list[Path], guarded: frozenset[str]) -> list[Pat
             path.name.startswith(".") and _VIM_COLLISION_SUFFIX.fullmatch(path.suffix)
         )
         if path.suffix in _EDITOR_SWAP_SUFFIXES or is_vim_collision:
+            leaked.append(path)
+            continue
+        if _VENV_DIR in path.parts[:-1]:
             leaked.append(path)
             continue
         if path.parts and path.parts[0] in guarded:
@@ -536,6 +546,288 @@ def leaked_tracked_files(paths: list[Path], guarded: frozenset[str]) -> list[Pat
         ):
             leaked.append(path)
     return leaked
+
+
+# Set by main() from --staged. In staged mode the publication verdict must come
+# from the INDEX -- the bytes the commit records -- not the worktree: otherwise a
+# commit that stages visibility="public" while the worktree still says
+# "private-until-review" (the publication flip, exactly where this matters) is
+# judged private and skipped. A one-element list so main() can set it without a
+# global statement.
+_DECLARATION_FROM_INDEX: list[bool] = [False]
+
+
+def _staged_declaration_text() -> str | None:
+    """The stage-0 index content of the declaration, or None if it is not staged.
+
+    Absence from the index is the only None. A conflicted entry, a non-regular
+    entry (symlink, submodule) or an undecodable blob is a GateError: those are
+    present-but-unreadable, not "never opted in".
+    """
+    listing = _run_git(
+        ["git", "ls-files", "--stage", "-z", "--", f":(top,literal){_DECLARATION_FILENAME}"]
+    )
+    entries = [e for e in listing.split("\0") if e]
+    if not entries:
+        return None
+    if len(entries) != 1:
+        raise GateError(
+            f"{_DECLARATION_FILENAME} has a conflicted index entry; the gate cannot "
+            "tell whether this repo is public, so it will not pass."
+        )
+    meta = entries[0].split("\t", 1)[0].split()
+    if len(meta) != 3 or meta[2] != "0" or meta[0] not in ("100644", "100755"):
+        raise GateError(
+            f"{_DECLARATION_FILENAME} is staged but is not a regular file; the gate "
+            "cannot tell whether this repo is public, so it will not pass."
+        )
+    # Bytes, decoded as UTF-8 here: _run_git decodes with the LOCALE codec, which
+    # on Windows (cp1252) accepts any byte and would hide a non-UTF-8 blob.
+    blob_argv = ["git", "cat-file", "blob", meta[1]]
+    try:
+        blob = subprocess.run(blob_argv, capture_output=True, check=True).stdout
+    except (subprocess.CalledProcessError, OSError) as exc:
+        raise GateError(
+            f"could not read the staged {_DECLARATION_FILENAME} ({exc}); the gate "
+            "cannot tell whether this repo is public, so it will not pass."
+        ) from exc
+    try:
+        return blob.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise GateError(
+            f"the staged {_DECLARATION_FILENAME} is not valid UTF-8 ({exc}); the gate "
+            "cannot tell whether this repo is public, so it will not pass."
+        ) from exc
+
+
+def _git_or_none(args: list[str]) -> str | None:
+    """Return the stdout of a git command, or None when it fails (optional lookups)."""
+    # No UnicodeDecodeError arm: unreachable in practice. The only caller asks
+    # `rev-parse --verify -q HEAD`, whose stdout is a hex object id or nothing and
+    # whose stderr -q silences. Were a decode error ever raised here it now
+    # propagates and the gate exits 1. Do not translate it into GateError: that
+    # would read as "no HEAD", which is the never-opted-in skip. Re-check this
+    # before adding a caller.
+    try:
+        return _run_git(args)
+    except GateError:
+        return None
+
+
+def _text_declares_private(text: str) -> bool:
+    """True only when a declaration cleanly names "private-until-review".
+
+    Anything else -- public, an unknown value, a missing key, unparseable text --
+    is not a safe last word before a deletion: a public -> garbage -> delete
+    sequence would otherwise launder a public declaration into "never opted in".
+    """
+    try:
+        section = tomllib.loads(text).get("publication")
+    except tomllib.TOMLDecodeError:
+        return False
+    declared = section.get("visibility") if isinstance(section, dict) else None
+    if not isinstance(declared, str):
+        return False
+    return declared.strip().casefold() == "private-until-review"
+
+
+# Every history read on the absence path ignores replace refs and the
+# commit-graph cache: both rewrite the parent graph without touching a commit
+# object, and the walk below would trust either. (Bare "git" first, as _run_git
+# passes it.)
+_HISTORY_GIT = ["git", "--no-replace-objects", "-c", "core.commitGraph=false"]
+
+
+def _history_run(args: list[str], stdin: bytes | None = None) -> bytes:
+    """Run a history-reading git command (see _HISTORY_GIT); a failure is a GateError."""
+    try:
+        return subprocess.run(
+            [*_HISTORY_GIT, *args], input=stdin, capture_output=True, check=True
+        ).stdout
+    except (subprocess.CalledProcessError, OSError) as exc:
+        raise GateError(f"could not read the declaration history ({exc})") from exc
+
+
+def _require_whole_history() -> None:
+    """Refuse, rather than judge, a history the gate cannot see whole or trust.
+
+    Each check closes a demonstrated exit 0 on a public repo with no denylist:
+    a shallow clone (the graft read as a root; actions/checkout is shallow by
+    default); a grafts file (rewrites parents); a partial/--filter clone (a
+    declaration blob it does not have answers "missing", the same as no
+    declaration); and objects whose bytes do not match their id or a forged
+    commit-graph (git fsck verifies both; the walk itself verifies neither).
+    """
+    # Anything but a literal "false" (including a git too old to know the flag,
+    # which echoes it back) is treated as shallow.
+    if _run_git(["git", "rev-parse", "--is-shallow-repository"]).strip() != "false":
+        raise GateError(
+            f"{_DECLARATION_FILENAME} is absent and this is a shallow clone, so the "
+            "history that decides whether it was ever declared public cannot be "
+            "read; the gate will not treat it as never opted in. Fetch full "
+            "history (git fetch --unshallow; in CI, actions/checkout with "
+            "fetch-depth: 0), or restore the declaration."
+        )
+    grafts = _run_git(["git", "rev-parse", "--git-path", "info/grafts"]).strip()
+    if os.path.lexists(grafts):
+        raise GateError(
+            f"{_DECLARATION_FILENAME} is absent and this repository has a grafts file "
+            f"({grafts}), which rewrites the history that decides whether it was ever "
+            "declared public; the gate will not judge it. Remove the grafts file, or "
+            "restore the declaration."
+        )
+    listing = _history_run(["rev-list", "--objects", "--missing=print", "HEAD", "--all"])
+    if any(line.startswith(b"?") for line in listing.splitlines()):
+        raise GateError(
+            f"{_DECLARATION_FILENAME} is absent and this clone is missing objects "
+            "(a partial/--filter clone, or a damaged repository), so a missing "
+            "declaration cannot be told from an unavailable one; the gate will not "
+            "treat it as never opted in. Use a full clone (no --filter), or restore "
+            "the declaration."
+        )
+    _require_verified_objects()
+
+
+def _require_verified_objects() -> None:
+    """Refuse an object store git fsck does not verify, or one selected by the environment.
+
+    Runs before every absence verdict, the "unborn" one included: commits
+    rewritten as blobs, a pack whose index was removed, or GIT_OBJECT_DIRECTORY
+    pointed at an empty store all made a repository WITH history look like one
+    with no commits (exit 0).
+    """
+    for var in ("GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES"):
+        if os.environ.get(var):
+            raise GateError(
+                f"{_DECLARATION_FILENAME} is absent and {var} is set, so the history the "
+                "gate would judge is not this repository's own object store; unset it, "
+                "or restore the declaration."
+            )
+    # fsck with the default config, so a commit-graph present is verified too.
+    fsck_argv = ["git", "--no-replace-objects", "fsck", "--full", "--no-dangling", "--no-progress"]
+    try:
+        subprocess.run(fsck_argv, capture_output=True, check=True)
+    except (subprocess.CalledProcessError, OSError) as exc:
+        raise GateError(
+            f"{_DECLARATION_FILENAME} is absent and this repository fails git fsck "
+            f"({exc}); a history whose objects do not verify cannot decide whether "
+            "it was ever declared public, so the gate will not treat it as never "
+            "opted in. Repair the repository (or re-clone), or restore the declaration."
+        ) from exc
+
+
+def _absent_declaration_verdict() -> bool:
+    """Verdict for a repo whose declaration is ABSENT: False, unless that is unsafe.
+
+    Absence is the "never opted in" skip. But deleting a declaration that said
+    public does not make the remote private: it only disarms the gate. So the
+    whole history decides, not one log query: a commit WITH a declaration is safe
+    only if it cleanly says "private-until-review"; a commit WITHOUT one is safe
+    only if every parent is safe (a root commit without one is safe -- never opted
+    in). The state being judged (the index or worktree with no declaration) has
+    HEAD as its parent, so absence is a skip exactly when HEAD is safe -- and,
+    since an orphan branch or a fresh root cut from a public repo is still that
+    public repo, only when every tip of the graph of HEAD and all refs (local,
+    remote-tracking, tags; not refs/stash, a local snapshot) is safe too. A tip
+    is a commit no other walked commit descends from: a ref at an ANCESTOR of a
+    clean private declaration is superseded by it, which is what lets a repo
+    with old public-era tags leave the publication system.
+
+    Limit, stated plainly: a lineage whose every ref was deleted locally is not
+    judged. Whether its commits are still in the object database depends on
+    garbage collection (git gc --prune makes the state indistinguishable from a
+    repo that never had them), and counting dangling commits would refuse
+    ordinary rebased-away and dropped-stash history. CI judges a fresh full
+    clone, which carries the remote's refs. This covers plain
+    and merge deletions, laundering through an invalid declaration, a merge that
+    joins an unsafe absent lineage to a private one, and orphan branches. To leave
+    the publication system, declare "private-until-review" and remove the file in
+    a later commit.
+
+    A history the gate cannot see whole or trust is refused, not judged (see
+    _require_whole_history).
+    """
+    if _git_or_none(["git", "rev-parse", "--verify", "-q", "HEAD"]) is None:
+        _require_verified_objects()
+        # Genuinely unborn only when the object database holds no commit at all
+        # (the first commit). A HEAD that does not resolve in a repository WITH
+        # history -- a broken symref, an orphan branch, refs deleted so the
+        # lineage is dangling -- would otherwise read as a safe root.
+        kinds = _history_run(["cat-file", "--batch-all-objects", "--batch-check=%(objecttype)"])
+        if b"commit" in kinds.split():
+            raise GateError(
+                f"{_DECLARATION_FILENAME} is absent and HEAD does not resolve, but this "
+                "repository holds commits; the gate cannot tell whether it was ever "
+                "declared public, so it will not treat it as never opted in. Restore "
+                "the declaration, or check out a branch."
+            )
+        return False
+    _require_whole_history()
+    graph: dict[str, list[str]] = {}
+    order: list[str] = []
+    walk = _history_run(
+        ["rev-list", "--topo-order", "--parents", "HEAD", "--exclude=refs/stash", "--all"]
+    )
+    for line in walk.decode("ascii", "replace").splitlines():
+        if line.strip():
+            commit, *parents = line.split()
+            graph[commit] = parents
+            order.append(commit)
+    head = _run_git(["git", "rev-parse", "--verify", "HEAD^{commit}"]).strip()
+    parented = {p for parents in graph.values() for p in parents}
+    tips = [c for c in order if c not in parented]
+    # %(objectmode) (git >= 2.45): a symlink or gitlink at publication.toml is
+    # reported as a blob too, and its target string could read as a private
+    # declaration. Only a regular file is a declaration, as on every other path.
+    checked = (
+        _history_run(
+            ["cat-file", "--batch-check=%(objectmode) %(objecttype) %(objectname)"],
+            "".join(f"{c}:{_DECLARATION_FILENAME}\n" for c in order).encode(),
+        )
+        .decode("utf-8", "replace")
+        .splitlines()
+    )
+    if len(checked) != len(order):
+        raise GateError("could not read the declaration history (short batch-check output)")
+    present: dict[str, str | None] = {}
+    for commit, row in zip(order, checked, strict=True):
+        fields = row.split()
+        if row.endswith(" missing"):
+            present[commit] = None
+        elif len(fields) != 3 or fields[0] not in ("100644", "100755") or fields[1] != "blob":
+            present[commit] = ""  # present but not a regular file: never a clean private
+        else:
+            present[commit] = fields[2]
+    blobs = sorted({oid for oid in present.values() if oid})
+    private_blob: dict[str, bool] = {}
+    if blobs:
+        out = _history_run(["cat-file", "--batch"], "".join(f"{oid}\n" for oid in blobs).encode())
+        pos = 0
+        for oid in blobs:
+            header_end = out.index(b"\n", pos)
+            size = int(out[pos:header_end].split()[2])
+            data = out[header_end + 1 : header_end + 1 + size]
+            pos = header_end + 1 + size + 1
+            try:
+                private_blob[oid] = _text_declares_private(data.decode("utf-8"))
+            except UnicodeDecodeError:
+                private_blob[oid] = False
+    safe: dict[str, bool] = {}
+    for commit in reversed(order):  # --topo-order lists children first
+        entry = present[commit]
+        if entry is not None:
+            safe[commit] = bool(entry) and private_blob.get(entry, False)
+        else:
+            safe[commit] = all(safe.get(p, True) for p in graph[commit])
+    if safe.get(head, False) and all(safe[t] for t in tips):
+        return False
+    raise GateError(
+        f"{_DECLARATION_FILENAME} is absent, but this repository's history declared a "
+        'visibility other than "private-until-review" (on this branch, or on another '
+        "ref) without a later clean private declaration; removing a declaration does "
+        "not make the remote private, so the gate will not treat it as never opted "
+        'in. Restore it, or declare "private-until-review" before removing it.'
+    )
 
 
 def _declares_public() -> bool:
@@ -554,17 +846,44 @@ def _declares_public() -> bool:
     """
     try:
         repo_root = Path(_run_git(["git", "rev-parse", "--show-toplevel"]).strip())
-    except GateError:
-        # Not a git repo (or git is unusable). The caller's other git work will
-        # surface that; do not convert it into a publication verdict here.
-        return False
+    except GateError as exc:
+        # Fail closed. This used to return False ("not public"), which turned a
+        # broken or missing git into a skip in --message-file / --rev-range mode:
+        # those modes return straight after the verdict, so nothing later
+        # surfaced the error and a public repo exited 0 having scanned nothing.
+        raise GateError(
+            "could not resolve the repository root, so the gate cannot read the "
+            f"publication declaration and will not pass: {exc}"
+        ) from exc
 
-    path = repo_root / _DECLARATION_FILENAME
-    if not path.is_file():
-        return False
+    text: str | None
+    if _DECLARATION_FROM_INDEX[0]:
+        text = _staged_declaration_text()
+        if text is None:
+            return _absent_declaration_verdict()
+    else:
+        path = repo_root / _DECLARATION_FILENAME
+        # Only genuine absence is the "never opted in" skip. A path that exists
+        # but is not a regular file (a directory, or a symlink -- dangling or
+        # not) used to take the same branch via `not path.is_file()`, so a
+        # stray directory or link silently disarmed a public repo's gate.
+        if not os.path.lexists(path):
+            return _absent_declaration_verdict()
+        if path.is_symlink() or not path.is_file():
+            raise GateError(
+                f"{_DECLARATION_FILENAME} is present but is not a regular file; the "
+                "gate cannot tell whether this repo is public, so it will not pass."
+            )
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            raise GateError(
+                f"{_DECLARATION_FILENAME} is present but could not be read ({exc}); "
+                "the gate cannot tell whether this repo is public, so it will not pass."
+            ) from exc
     try:
-        raw = tomllib.loads(path.read_text(encoding="utf-8"))
-    except (OSError, tomllib.TOMLDecodeError) as exc:
+        raw = tomllib.loads(text)
+    except tomllib.TOMLDecodeError as exc:
         raise GateError(
             f"{_DECLARATION_FILENAME} is present but could not be parsed ({exc}); "
             "the gate cannot tell whether this repo is public, so it will not pass."
@@ -722,7 +1041,8 @@ def _run(args: argparse.Namespace) -> int:
             "\nThese are gitignored by convention, and .gitignore is advisory — "
             "git add -f walks straight past it. A guarded data directory holds "
             "real identifier-bearing data (hostnames, service accounts, principal "
-            "handles); an editor swap file holds the BUFFER of the file being "
+            "handles); anything under .venv/ is never source; an editor swap "
+            "file holds the BUFFER of the file being "
             "edited, secrets typed but not yet saved included; a root-level .env "
             "holds credentials (.env.example is the exempt template).\n\n"
             "Remove them from the index: git rm --cached -r <path>.",
@@ -741,7 +1061,7 @@ def _run(args: argparse.Namespace) -> int:
     if identifiers is None:
         return 0
 
-    scan_paths = [p for p in paths if not any(part in _SKIP_DIRS for part in p.parts)]
+    scan_paths = paths  # tracked-ness decides; no path-based skip (see _VENV_DIR)
     unreadable: list[Path] = []
     # --staged judges the index blobs (what the commit records), never the
     # worktree; the CI default scans the checked-out tracked tree (WI-031).
@@ -790,6 +1110,7 @@ def main(argv: list[str] | None = None) -> int:
         "hook), e.g. origin/main..HEAD.",
     )
     args = parser.parse_args(argv)
+    _DECLARATION_FROM_INDEX[0] = bool(args.staged)
 
     try:
         return _run(args)

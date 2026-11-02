@@ -79,6 +79,27 @@ class TestRedaction:
     def test_short_values_pass_through(self):
         assert redact("code: AB12-CD34") == "code: AB12-CD34"
 
+    def test_authorize_url_pkce_params_survive(self):
+        # Regression: the 43-char code_challenge/state were masked, so the
+        # operator's link failed at claude.com with "Invalid request format".
+        challenge = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+        state = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+        url = (
+            "https://claude.com/cai/oauth/authorize?code=true"
+            "&client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e&response_type=code"
+            f"&code_challenge={challenge}&code_challenge_method=S256&state={state}"
+        )
+        line = f"If the browser didn't open, visit: {url}"
+        assert redact(line) == line
+
+    def test_token_material_inside_urls_is_still_masked(self):
+        secret = "y" * 60
+        out = redact(f"https://example.com/cb?access_token={secret}&x=1 sk-ant-oat01-{secret}")
+        assert secret not in out
+        assert "access_token=<redacted>&x=1" in out
+        out = redact(f"https://example.com/k/sk-ant-oat01-{secret}")
+        assert secret not in out
+
 
 class TestClaudeJob:
     def test_streams_transcript_and_feeds_input(self, service: EnrolmentService):

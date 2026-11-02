@@ -216,7 +216,7 @@ let activeJob = null, pollTimer = null, lastTranscriptLen = -1;
 let inputDeadline = null;
 
 function showKey(msg) {
-  $("keybanner").style.display = "";
+  $("keybanner").style.display = "block";
   if (msg) $("keymsg").textContent = msg;
 }
 function setMsg(id, text, ok) {
@@ -244,14 +244,14 @@ async function api(path, body, method) {
 
 function renderJob(job) {
   if (!job) { $("jobbox").style.display = "none"; return; }
-  $("jobbox").style.display = "";
+  $("jobbox").style.display = "block";
   $("jobname").textContent =
     job.provider + (job.account ? " · " + job.account : "") + " · " + job.job_id;
   const st = $("jobstate");
   st.textContent = job.state;
   st.className = job.state;
   if (job.verification_url && job.user_code) {
-    $("codebox").style.display = "";
+    $("codebox").style.display = "block";
     $("vurl").href = job.verification_url;
     $("vurl").textContent = job.verification_url;
     $("vcode").textContent = job.user_code;
