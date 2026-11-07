@@ -7,7 +7,8 @@ from unittest.mock import MagicMock, patch
 import httpx
 import pytest
 
-from usage_dashboard.cli import _capacity_url, capacity, main
+from usage_dashboard.cli import main
+from usage_dashboard.client.capacity import _capacity_url, capacity
 
 
 def response(status_code: int, body: object = None) -> MagicMock:
@@ -42,7 +43,9 @@ def test_capacity_prints_200_snapshot_and_sends_optional_filters(monkeypatch, ca
     body = snapshot(assessment="known_blocked")
     client = client_for(response(200, body))
 
-    with patch("usage_dashboard.cli.httpx.Client", return_value=client) as client_factory:
+    with patch(
+        "usage_dashboard.client.capacity.httpx.Client", return_value=client
+    ) as client_factory:
         status = capacity(account="claude_work", max_age_seconds=3600)
 
     assert status == 0
@@ -61,7 +64,7 @@ def test_capacity_accepts_unknown_observation_as_success(monkeypatch, capsys) ->
     body = snapshot()
     client = client_for(response(200, body))
 
-    with patch("usage_dashboard.cli.httpx.Client", return_value=client):
+    with patch("usage_dashboard.client.capacity.httpx.Client", return_value=client):
         assert capacity() == 0
 
     assert json.loads(capsys.readouterr().out)["accounts"][0]["assessment"] == "unknown"
@@ -71,7 +74,7 @@ def test_capacity_rejects_missing_token_without_request(monkeypatch, capsys) -> 
     monkeypatch.setenv("USAGE_DASHBOARD_URL", "https://dashboard.example")
     monkeypatch.delenv("USAGE_DASHBOARD_AGENT_TOKEN", raising=False)
 
-    with patch("usage_dashboard.cli.httpx.Client") as client_factory:
+    with patch("usage_dashboard.client.capacity.httpx.Client") as client_factory:
         assert capacity() == 1
 
     captured = capsys.readouterr()
@@ -85,7 +88,7 @@ def test_capacity_hides_non_200_response_body(monkeypatch, capsys) -> None:
     monkeypatch.setenv("USAGE_DASHBOARD_AGENT_TOKEN", "secret")
     client = client_for(response(401, {"detail": "secret response diagnostic"}))
 
-    with patch("usage_dashboard.cli.httpx.Client", return_value=client):
+    with patch("usage_dashboard.client.capacity.httpx.Client", return_value=client):
         assert capacity() == 1
 
     captured = capsys.readouterr()
@@ -99,7 +102,7 @@ def test_capacity_rejects_unsupported_schema(monkeypatch, capsys) -> None:
     monkeypatch.setenv("USAGE_DASHBOARD_AGENT_TOKEN", "secret")
     client = client_for(response(200, {"schema_version": "agent-capacity-v2"}))
 
-    with patch("usage_dashboard.cli.httpx.Client", return_value=client):
+    with patch("usage_dashboard.client.capacity.httpx.Client", return_value=client):
         assert capacity() == 1
 
     captured = capsys.readouterr()
@@ -115,7 +118,7 @@ def test_capacity_hides_transport_diagnostics(monkeypatch, capsys) -> None:
     client.__exit__.return_value = False
     client.get.side_effect = httpx.ConnectError("response body and secret")
 
-    with patch("usage_dashboard.cli.httpx.Client", return_value=client):
+    with patch("usage_dashboard.client.capacity.httpx.Client", return_value=client):
         assert capacity() == 1
 
     captured = capsys.readouterr()
@@ -132,7 +135,7 @@ def test_capacity_hides_request_construction_errors(monkeypatch, capsys, error):
     monkeypatch.setenv("USAGE_DASHBOARD_AGENT_TOKEN", "secret")
     client = client_for(response(200, snapshot()))
     client.get.side_effect = error
-    with patch("usage_dashboard.cli.httpx.Client", return_value=client):
+    with patch("usage_dashboard.client.capacity.httpx.Client", return_value=client):
         assert capacity() == 1
     captured = capsys.readouterr()
     assert captured.out == ""
@@ -168,7 +171,7 @@ def test_main_registers_capacity_command(monkeypatch, capsys) -> None:
         ["usage-dashboard", "capacity", "--account", "claude", "--max-age-seconds", "30"],
     )
 
-    with patch("usage_dashboard.cli.httpx.Client", return_value=client):
+    with patch("usage_dashboard.client.capacity.httpx.Client", return_value=client):
         try:
             main()
         except SystemExit as exc:
