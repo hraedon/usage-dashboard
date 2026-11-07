@@ -143,6 +143,15 @@ only), so keep the hostname internal.
 
 Images are built and pushed to `ghcr.io/hraedon/usage-dashboard-server` and `ghcr.io/hraedon/usage-dashboard-client` via GitHub Actions on push to `main`.
 
+For rolling manifest changes out to an existing cluster, `deploy/cluster-apply.sh`
+applies everything except the secret (the committed file holds placeholders —
+applying it would clobber the live credential values), waits for the rollout,
+and then runs `scripts/verify_drift.py`, which structurally diffs the live
+objects against the committed manifests (env wiring, secret key names, ingress
+paths, configmap values — never credential values). Run it after any out-of-band
+`kubectl` change; the 2026-11-07 `AGENT_API_KEY` drift (manifest declared the
+env, the live deployment silently lacked it) is the failure class it exists for.
+
 ### Secrets
 
 | Key | Required | Description |
