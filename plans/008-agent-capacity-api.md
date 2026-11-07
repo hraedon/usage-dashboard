@@ -1,8 +1,10 @@
 # Plan 008 — Agent capacity API
 
-Status: rebased onto main on 2026-10-17 (after Plans 005 auth migration and
-006 browser enrolment); not deployed. Originally implemented as commit
-`a64d814` on `feat/agent-capacity-api` and carried as PR 37. Numbered 004,
+Status: merged and deployed 2026-11-07 as PR 37 (deployment record and live
+verification in the PR comment; image sha256:677ccac1). Rebased onto main on
+2026-10-17 (after Plans 005 auth migration and 006 browser enrolment).
+Originally implemented as commit `a64d814` on `feat/agent-capacity-api`.
+Numbered 004,
 then 005, then 007 as other plans landed on main first; the 007 slot was
 subsequently claimed on main by the Antigravity quota feature (PR 51), so
 this plan renumbers to 008 at the 2026-11-07 merge of main. Earlier

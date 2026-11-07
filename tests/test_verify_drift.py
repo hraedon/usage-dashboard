@@ -105,17 +105,17 @@ class TestDeploymentEnvDrift:
 class TestSecretKeyDrift:
     def test_missing_manifest_key_and_extra_live_key(self) -> None:
         manifest = {"metadata": {"name": "server-secrets"},
-                    "stringData": {"api-key": "REDACTED", "agent-api-key": ""}}
+                    "stringData": {"api-key": "<placeholder>", "agent-api-key": ""}}
         live = {"metadata": {"name": "server-secrets"},
                 "data": {"api-key": "b64", "umans-api-key": "b64"}}
         findings = vd.diff_secret(manifest, live)
         assert any("agent-api-key" in f and "absent live" in f for f in findings)
         assert any("umans-api-key" in f and "WARNING" in f for f in findings)
-        assert all("REDACTED" not in f for f in findings)
+        assert all("<placeholder>" not in f for f in findings)
 
     def test_values_are_never_compared_or_printed(self) -> None:
         manifest = {"metadata": {"name": "s"}, "stringData": {"api-key": "manifest-value"}}
-        live = {"metadata": {"name": "s"}, "data": {"api-key": "b64tbWFuaWZlc3QtdmFsdWU="}}
+        live = {"metadata": {"name": "s"}, "data": {"api-key": "b64<live-value-not-shown>"}}
         assert vd.diff_secret(manifest, live) == []
 
 
