@@ -232,3 +232,20 @@ class TestPokeWake:
         start = time.monotonic()
         f._wait_for_next_poll()
         assert time.monotonic() - start < 2.0
+
+
+class TestUnknownProviders:
+    """Plan 007 review: a server can serve a provider a panel's build doesn't
+    know yet. One unknown row must not cost the panel every reading."""
+
+    @patch("usage_dashboard.client.fetcher.httpx.get")
+    def test_unknown_provider_rows_are_skipped(self, mock_get):
+        known = _make_reading(Provider.CLAUDE).to_dict()
+        future = dict(known, provider="some-future-provider")
+        response = MagicMock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = [future, known]
+        mock_get.return_value = response
+        f = ClientFetcher("http://srv", "key")
+        f._fetch_once()
+        assert [r.provider for r in f.get_latest_readings()] == [Provider.CLAUDE]

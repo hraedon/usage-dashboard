@@ -50,6 +50,13 @@ for the planned pieces):
   consumption of `/readings` (Plan 003) and the Go plan's dollar-quota bars are
   exposed only via the web dashboard. Rendered on `/dashboard` only — deliberately
   kept off the Pi panel (a 5th full-width row would collapse bar height).
+- **Google Antigravity** (Gemini pool + **Gemini 4 Argon**) — see `plans/007`.
+  Read through the official `agy` CLI's zero-turn `-p /usage --output-format json`
+  print mode; the CLI owns the Google login (no dashboard OAuth surface). The
+  Gemini pool's 5h/weekly map to `session`/`weekly`, Argon's separate weekly
+  bucket to a `ScopedLimit`. Enrolled from the `/login` pane (paste-back, 60 s
+  window). On the Pi it pairs half-width with Codex, both showing weekly windows
+  only (owner request, 2026-11-01).
 
 **Reading schema** now also carries `detail`, `models`, and `throttle` (the §6
 schema shows only the original fields).

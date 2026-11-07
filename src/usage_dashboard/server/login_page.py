@@ -72,7 +72,15 @@ pre#transcript {
 #codebox a { color: var(--blue); word-break: break-all; }
 #codebox .code { font: 700 1.3rem var(--mono); letter-spacing: .12em;
   margin-top: 8px; }
+#signinbox { display: none; margin-top: 10px; padding: 12px;
+  background: var(--card2); border: 1px solid var(--line); border-radius: 8px; }
+#signinbox a.signin { display: inline-block; background: #1e3a5f;
+  border: 1px solid #2b4f7e; border-radius: 8px; padding: 8px 14px;
+  color: var(--text); text-decoration: none; font-size: .88rem; }
+#countdown { font: 700 1.1rem var(--mono); margin-left: 12px; }
+#countdown.low { color: var(--orange); }
 #keybanner { display: none; }
+#agy-card { display: none; }
 details { color: var(--dim); font-size: .8rem; }
 details ol { margin: 6px 0; padding-left: 18px; }
 code { font-family: var(--mono); color: var(--text); }
@@ -104,6 +112,15 @@ code { font-family: var(--mono); color: var(--text); }
       and enter this code:</div>
       <div class="code" id="vcode">—</div>
     </div>
+    <div id="signinbox">
+      <div class="row">
+        <a id="signinurl" class="signin" target="_blank" rel="noopener">Open Google sign-in</a>
+        <span id="countdown"></span>
+      </div>
+      <div style="margin-top:8px;font-size:.82rem;color:var(--dim)">Sign in, copy the
+      code the page shows, and paste it below before the timer runs out. A timeout
+      changes nothing — just start again.</div>
+    </div>
     <pre id="transcript"></pre>
     <div class="row" id="inputrow" style="margin-top:8px">
       <input type="text" id="jobinput" placeholder="paste the code the ceremony is waiting for…"
@@ -133,6 +150,18 @@ code { font-family: var(--mono); color: var(--text); }
       <button id="codexbtn" class="primary">Start enrolment</button>
     </div>
     <div class="msg" id="codex-msg"></div>
+  </div>
+
+  <div class="card" id="agy-card">
+    <h2>Google Antigravity (Gemini / Argon)</h2>
+    <p>Official <code>agy</code> CLI sign-in. Open the Google link it prints,
+    then paste the code back here — the CLI allows 60 seconds. The new login
+    is checked against real quota before it replaces anything. Takes effect
+    immediately.</p>
+    <div class="row">
+      <button id="agybtn" class="primary">Start sign-in</button>
+    </div>
+    <div class="msg" id="agy-msg"></div>
   </div>
 
   <div class="card">
@@ -182,6 +211,9 @@ const $ = (id) => document.getElementById(id);
 const KEYNAME = "ud-login-key";
 let key = sessionStorage.getItem(KEYNAME) || "";
 let activeJob = null, pollTimer = null, lastTranscriptLen = -1;
+// Local end of the ceremony's paste window, re-anchored on every poll from
+// the server's seconds-left (so the two clocks never need to agree).
+let inputDeadline = null;
 
 function showKey(msg) {
   $("keybanner").style.display = "block";
@@ -224,6 +256,15 @@ function renderJob(job) {
     $("vurl").textContent = job.verification_url;
     $("vcode").textContent = job.user_code;
   } else { $("codebox").style.display = "none"; }
+  // A sign-in link with no device code (Antigravity): a button plus the
+  // paste-window countdown.
+  if (job.state === "running" && job.verification_url && !job.user_code) {
+    $("signinbox").style.display = "block";
+    $("signinurl").href = job.verification_url;
+  } else { $("signinbox").style.display = "none"; }
+  inputDeadline = job.state === "running" && job.input_seconds_left != null
+    ? Date.now() + job.input_seconds_left * 1000 : null;
+  renderCountdown();
   const lines = job.transcript || [];
   const pre = $("transcript");
   if (lines.length !== lastTranscriptLen) {
@@ -231,11 +272,20 @@ function renderJob(job) {
     pre.scrollTop = pre.scrollHeight;
     lastTranscriptLen = lines.length;
   }
-  const interactive = job.state === "running" && job.provider === "claude";
+  const interactive = job.state === "running" && job.accepts_input;
   $("inputrow").style.display = interactive ? "" : "none";
   $("cancelbtn").style.display = job.state === "running" && job.provider !== "codex"
     ? "" : "none";
 }
+
+function renderCountdown() {
+  const el = $("countdown");
+  if (inputDeadline === null) { el.textContent = ""; return; }
+  const left = Math.max(0, Math.round((inputDeadline - Date.now()) / 1000));
+  el.textContent = left > 0 ? left + "s left" : "time is up";
+  el.className = left <= 15 ? "low" : "";
+}
+setInterval(renderCountdown, 1000);
 
 function schedulePoll() {
   clearTimeout(pollTimer);
@@ -251,9 +301,13 @@ async function poll() {
       if (activeJob.state === "succeeded") {
         setMsg("claude-msg", "Enrolled; credentials live.", true);
         setMsg("codex-msg", "Enrolled; Codex client resumed.", true);
+        if (activeJob.provider === "antigravity")
+          setMsg("agy-msg", "Signed in and verified; the Gemini tile updates now.", true);
       }
     } else {
       const s = await api("/internal/v1/login/status");
+      // The server only offers Antigravity when it is enabled.
+      $("agy-card").style.display = (s.providers || {}).antigravity ? "block" : "none";
       activeJob = s.active;
       renderJob(activeJob);
     }
@@ -283,6 +337,8 @@ $("claudebtn").onclick = () =>
     { account: $("claude-account").value }), "claude-msg");
 $("codexbtn").onclick = () =>
   guard(() => api("/internal/v1/login/codex", {}), "codex-msg");
+$("agybtn").onclick = () =>
+  guard(() => api("/internal/v1/login/antigravity", {}), "agy-msg");
 $("cancelbtn").onclick = async () => {
   if (activeJob) try { await api("/internal/v1/login/jobs/"
       + activeJob.job_id + "/cancel", {}); } catch (e) { console.warn(e); }

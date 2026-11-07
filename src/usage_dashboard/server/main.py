@@ -16,6 +16,11 @@ from usage_dashboard.server.codex_app_server import (
 )
 from usage_dashboard.server.db import Database
 from usage_dashboard.server.enrolment import EnrolmentService
+from usage_dashboard.server.fetch_antigravity import (
+    DEFAULT_AGY_BIN,
+    DEFAULT_ANTIGRAVITY_HOME,
+    AntigravityConfig,
+)
 from usage_dashboard.server.schedule_config import ScheduleConfig
 from usage_dashboard.server.scheduler import FetchScheduler
 from usage_dashboard.server.token_store import TokenStore
@@ -133,6 +138,25 @@ def _build_codex_client(
     )
 
 
+def _build_antigravity_config(mode: str, home: str, binary: str) -> AntigravityConfig | None:
+    """The Antigravity CLI config for *mode*, or None if disabled (Plan 007).
+
+    ``cli`` is the only enabled mode. As with Codex, anything else leaves the
+    provider unconfigured, so its tile is absent rather than showing a
+    failure the operator never asked for.
+    """
+    if mode != "cli":
+        if mode not in ("disabled", ""):
+            logger.warning(
+                "Unknown ANTIGRAVITY_MODE %r; Antigravity is disabled. Expected "
+                "'cli' or 'disabled'.",
+                mode,
+            )
+        return None
+    logger.info("Antigravity enabled in cli mode (home=%s, bin=%s)", home, binary)
+    return AntigravityConfig(binary=binary, home=home)
+
+
 def _optional_int_env(name: str) -> int | None:
     """Parse an optional integer env var; unset/empty means None (use defaults)."""
     value = os.environ.get(name)
@@ -177,6 +201,11 @@ def main() -> None:
     codex_mode = (os.environ.get("CODEX_MODE") or "disabled").strip().lower()
     codex_home = os.environ.get("CODEX_HOME") or DEFAULT_CODEX_HOME
     codex_bin = os.environ.get("CODEX_BIN") or DEFAULT_CODEX_BIN
+    # Optional Google Antigravity quota (Plan 007). The official `agy` CLI
+    # owns the Google login under ANTIGRAVITY_HOME; the dashboard holds none.
+    antigravity_mode = (os.environ.get("ANTIGRAVITY_MODE") or "disabled").strip().lower()
+    antigravity_home = os.environ.get("ANTIGRAVITY_HOME") or DEFAULT_ANTIGRAVITY_HOME
+    agy_bin = os.environ.get("AGY_BIN") or DEFAULT_AGY_BIN
     # Optional Umans wallet key (Plan 004): adds the corner balance line on
     # the Pi; absent leaves the provider unconfigured.
     umans_key = os.environ.get("UMANS_API_KEY") or None
@@ -233,6 +262,10 @@ def main() -> None:
         else None
     )
 
+    antigravity_config = _build_antigravity_config(
+        antigravity_mode, antigravity_home, agy_bin
+    )
+
     scheduler = FetchScheduler(
         db=database,
         claude_token=claude_token,
@@ -250,6 +283,7 @@ def main() -> None:
         codex_client=codex_client,
         codex_factory=codex_factory,
         umans_key=umans_key,
+        antigravity_config=antigravity_config,
         interval_seconds=fetch_interval,
         failure_cap_seconds=failure_backoff_cap,
         token_store=token_store,
@@ -295,6 +329,11 @@ def main() -> None:
             # The resume bracket already rebuilt the client against the new
             # login; the next scheduled poll reads it.
             return
+        if provider == "antigravity":
+            # The ceremony swapped a verified login into ANTIGRAVITY_HOME;
+            # there is no credential to reload, only a fetch to run.
+            scheduler.fetch_now()
+            return
         _reload_credentials()
         scheduler.fetch_now()
 
@@ -306,6 +345,8 @@ def main() -> None:
         on_success=_after_enrolment,
         codex_pause=scheduler.pause_codex,
         codex_resume=scheduler.resume_codex,
+        antigravity_home=antigravity_home if antigravity_config is not None else None,
+        agy_bin=agy_bin,
     )
 
     app = create_app(

@@ -1,11 +1,13 @@
-# Plan 007 — Agent capacity API
+# Plan 008 — Agent capacity API
 
 Status: rebased onto main on 2026-10-17 (after Plans 005 auth migration and
 006 browser enrolment); not deployed. Originally implemented as commit
 `a64d814` on `feat/agent-capacity-api` and carried as PR 37. Numbered 004,
-then 005, then 007 as other plans landed on main first. Earlier qualification
-records described pre-rebase trees and were dropped; the PR carries current
-evidence.
+then 005, then 007 as other plans landed on main first; the 007 slot was
+subsequently claimed on main by the Antigravity quota feature (PR 51), so
+this plan renumbers to 008 at the 2026-11-07 merge of main. Earlier
+qualification records described pre-rebase trees and were dropped; the PR
+carries current evidence.
 
 Integration review (2026-09-12): preserved wallet rendering and the operator
 API aliases; updated Umans query semantics to distinguish unconfigured (404)

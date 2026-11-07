@@ -115,6 +115,7 @@ _CSS_YELLOW = "#eab308"
 _WEB_PROVIDER_ORDER: tuple[Provider, ...] = (
     Provider.CLAUDE,
     Provider.CODEX,
+    Provider.ANTIGRAVITY,
     Provider.ZAI,
     Provider.OLLAMA,
     Provider.OPENCODE,
@@ -122,6 +123,8 @@ _WEB_PROVIDER_ORDER: tuple[Provider, ...] = (
 _WEB_PROVIDER_NAMES: dict[Provider, str] = {
     Provider.CLAUDE: "Claude",
     Provider.CODEX: "Codex",
+    # Antigravity's bars are the Gemini pool plus Gemini 4 Argon (Plan 007).
+    Provider.ANTIGRAVITY: "Gemini",
     Provider.ZAI: "ZAI",
     Provider.OLLAMA: "Ollama",
     Provider.OPENCODE: "OpenCode Go",
@@ -671,6 +674,13 @@ def create_app(
     async def login_codex(_user: str = Depends(auth)) -> dict[str, Any]:
         try:
             return await asyncio.to_thread(_require_enrolment().start_codex)
+        except EnrolmentError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @internal.post("/login/antigravity", **INTERNAL_ONLY)
+    async def login_antigravity(_user: str = Depends(auth)) -> dict[str, Any]:
+        try:
+            return await asyncio.to_thread(_require_enrolment().start_antigravity)
         except EnrolmentError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 

@@ -6,6 +6,7 @@ from functools import partial
 from unittest.mock import MagicMock
 
 from usage_dashboard.server.db import Database
+from usage_dashboard.server.fetch_antigravity import AntigravityConfig
 from usage_dashboard.server.fetch_types import FetchAuthError, FetchError
 from usage_dashboard.server.scheduler import FetchScheduler
 from usage_dashboard.server.token_store import TokenStore
@@ -773,6 +774,7 @@ class TestConfiguredProviders:
             opencode_workspace_id="wrk_X",
             opencode_cookie="oc",
             umans_key="u",
+            antigravity_config=AntigravityConfig(),
         )
         assert scheduler.configured_providers() == list(Provider)
 

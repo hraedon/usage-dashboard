@@ -88,6 +88,26 @@ def _four_provider_readings() -> list[Reading]:
     return [*_readings(), codex]
 
 
+def _five_provider_readings() -> list[Reading]:
+    """Plan 007: the fleet with Antigravity, whose tile pairs with Codex and
+    carries the Argon scoped bar alongside the Gemini pool."""
+    gemini = Reading(
+        provider=Provider.ANTIGRAVITY,
+        status=ReadingStatus.CURRENT,
+        session_percent=0.0,
+        session_resets_at=None,
+        weekly_percent=12.0,
+        weekly_resets_at=_NOW.replace(tzinfo=timezone.utc),
+        fetched_at=_NOW,
+        stale=False,
+        scoped_limits=[ScopedLimit(
+            name="Argon", percent=100.0,
+            resets_at=_NOW.replace(tzinfo=timezone.utc),
+        )],
+    )
+    return [*_four_provider_readings(), gemini]
+
+
 class _FakeFetcher:
     def __init__(self, readings: list[Reading]) -> None:
         self._readings = readings
@@ -371,19 +391,27 @@ def test_responsive_main_detail_and_overlay_render_at_audit_sizes() -> None:
         change=None,
     )
 
-    for size in _AUDIT_SIZES:
+    fleets = (
+        (_four_provider_readings(), [
+            Provider.CLAUDE, Provider.CODEX, Provider.ZAI, Provider.OLLAMA,
+        ]),
+        (_five_provider_readings(), [
+            Provider.CLAUDE, Provider.CODEX, Provider.ANTIGRAVITY,
+            Provider.ZAI, Provider.OLLAMA,
+        ]),
+    )
+    for (readings, expected_order), size in (
+        (fleet, size) for fleet in fleets for size in _AUDIT_SIZES
+    ):
         pygame.display.init()
         pygame.font.init()
         screen = pygame.display.set_mode(size)
         try:
-            readings = _four_provider_readings()
             gui = DashboardGui(_FakeFetcher(readings), size)  # type: ignore[arg-type]
             layout = build_main_layout(
                 readings, size, tile_overhead=gui._tile_overhead,
             )
-            assert [tile.provider for tile in layout.tiles] == [
-                Provider.CLAUDE, Provider.CODEX, Provider.ZAI, Provider.OLLAMA,
-            ]
+            assert [tile.provider for tile in layout.tiles] == expected_order
             screen.fill((0, 0, 0))
             gui._draw_main(layout)
 

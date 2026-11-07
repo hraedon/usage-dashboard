@@ -9,6 +9,10 @@ from typing import Any, Callable
 
 from usage_dashboard.server.codex_app_server import CodexAppServerClient
 from usage_dashboard.server.db import Database
+from usage_dashboard.server.fetch_antigravity import (
+    AntigravityConfig,
+    fetch_antigravity_usage,
+)
 from usage_dashboard.server.fetch_claude import fetch_claude_usage, refresh_claude_token
 from usage_dashboard.server.fetch_codex import fetch_codex_usage
 from usage_dashboard.server.fetch_ollama import fetch_ollama_usage
@@ -51,6 +55,9 @@ _REAUTH_DETAIL: dict[Provider, str] = {
     Provider.OLLAMA: "cookie expired — re-login",
     Provider.OPENCODE: "cookie expired or bad workspace — re-login",
     Provider.CODEX: "login required — run `usage-dashboard login codex`",
+    # Plan 007: the official `agy` CLI owns the Google login, so (like Codex)
+    # there is nothing for the dashboard to refresh.
+    Provider.ANTIGRAVITY: "login required — sign in on /login",
 }
 
 
@@ -88,6 +95,7 @@ class FetchScheduler:
         codex_client: CodexAppServerClient | None = None,
         codex_factory: Callable[[], CodexAppServerClient] | None = None,
         umans_key: str | None = None,
+        antigravity_config: AntigravityConfig | None = None,
         interval_seconds: int = 300,
         offline_threshold: int = 24,
         rate_limit_default_seconds: int = 300,
@@ -135,6 +143,10 @@ class FetchScheduler:
         self._update_lock = threading.RLock()
         # Umans wallet (Plan 004): a key alone configures the provider.
         self._umans_key = umans_key
+        # Antigravity (Plan 007): configured by the operator enabling it, not
+        # by a credential — the CLI owns the login, so a missing one is an
+        # actionable "sign in" tile rather than an absent provider.
+        self._antigravity_config = antigravity_config
         self._offline_threshold = offline_threshold
         self._rate_limit_default_seconds = rate_limit_default_seconds
         # The idle ladder widens the poll gap when a provider's reading is not
@@ -388,6 +400,13 @@ class FetchScheduler:
                         self._opencode_workspace_id,
                         self._opencode_cookie,
                     ),
+                )
+            )
+        if self._antigravity_config is not None:
+            tasks.append(
+                (
+                    Provider.ANTIGRAVITY,
+                    partial(fetch_antigravity_usage, self._antigravity_config),
                 )
             )
         if self._umans_key is not None:

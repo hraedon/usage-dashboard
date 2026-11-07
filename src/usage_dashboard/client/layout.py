@@ -32,13 +32,37 @@ from usage_dashboard.shared.offpeak import (
 _PROVIDER_ORDER: list[Provider] = [
     Provider.CLAUDE,
     Provider.CODEX,
+    Provider.ANTIGRAVITY,
     Provider.ZAI,
     Provider.OLLAMA,
 ]
 
-# Providers rendered half-width so two consecutive ones share a row, freeing
-# vertical space. Claude/Codex stay full-width; z.ai + ollama pair up beneath.
-_PAIRED_PROVIDERS: frozenset[Provider] = frozenset({Provider.ZAI, Provider.OLLAMA})
+# Adjacent providers rendered half-width, sharing one row to free vertical
+# space. Pairs are explicit rather than "any two members of a set" so that one
+# absent provider never re-pairs its neighbours: without Antigravity, Codex
+# keeps its full-width row instead of pairing up with z.ai.
+_PAIRED_ROWS: frozenset[tuple[Provider, Provider]] = frozenset({
+    (Provider.CODEX, Provider.ANTIGRAVITY),
+    (Provider.ZAI, Provider.OLLAMA),
+})
+
+# Pairs whose half-width tiles show only weekly windows (owner request,
+# 2026-11-01): the weekly limits are the ones that run out for Codex and
+# Gemini 4 Argon, and dropping the 5h bars keeps the shared row short. The
+# detail view still lists every window.
+_WEEKLY_ONLY_ROWS: frozenset[tuple[Provider, Provider]] = frozenset({
+    (Provider.CODEX, Provider.ANTIGRAVITY),
+})
+
+# Tile titles where the enum value is not what the tile measures. The
+# Antigravity tile's bars are the Gemini pool plus Gemini 4 Argon.
+_TILE_NAMES: dict[Provider, str] = {
+    Provider.ANTIGRAVITY: "GEMINI",
+}
+
+
+def _tile_name(provider: Provider) -> str:
+    return _TILE_NAMES.get(provider, provider.value.upper())
 # Below this per-cell width, the label/reset columns leave an unhelpful sliver
 # for a bar even with compact labels.
 _MIN_PAIRED_TILE_WIDTH = 150
@@ -164,20 +188,27 @@ def _ultra_compact_columns(size: tuple[int, int], tile_count: int) -> int:
     """Choose a tiny fallback column count from the display orientation.
 
     Portrait gets a two-column matrix so each tile has enough width for its
-    provider marker and percentage summary. Landscape has room for one column
-    per provider, keeping the short vertical dimension to one touchable row.
+    provider marker and percentage summary. Landscape has room for up to four
+    columns, so up to four providers share one touchable row; a fifth wraps to
+    a second row (still two summary lines per tile at 320x240).
+
+    Past four tiles (Plan 007 added Antigravity), portrait goes to three
+    columns: a third row would leave each tile ~83px on 240x320, a few pixels
+    short of a title plus two summary lines. The narrower cell still fits
+    them; the renderer drops the S/W prefix before it would truncate a value.
     """
     if tile_count <= 1:
         return 1
     width, height = size
     if height > width:
-        return min(2, tile_count)
+        return min(2 if tile_count <= 4 else 3, tile_count)
     return min(4, tile_count)
 
 
 _ULTRA_COMPACT_TITLES: dict[Provider, str] = {
     Provider.CLAUDE: "CLD",
     Provider.CODEX: "CDX",
+    Provider.ANTIGRAVITY: "GEM",
     Provider.ZAI: "ZAI",
     Provider.OLLAMA: "OLL",
 }
@@ -203,6 +234,7 @@ def _bars_for(
     account: str = "",
     muted: bool = False,
     compact: bool = False,
+    weekly_only: bool = False,
 ) -> list[BarSpec]:
     bars: list[BarSpec] = []
     # Full-width tiles spell out "Session"/"Weekly"; the compact S/W
@@ -213,6 +245,12 @@ def _bars_for(
         (s_label, reading.session_percent, reading.session_resets_at),
         (w_label, reading.weekly_percent, reading.weekly_resets_at),
     ]
+    if weekly_only and any(pct is not None for _, pct, _ in windows[1:]):
+        # Scoped windows stay: the only one a weekly-only row carries is
+        # Argon's, which is itself weekly. A reading with *no* weekly-shaped
+        # window (e.g. Codex reporting only a session limit) keeps what it has
+        # rather than rendering a blank tile.
+        windows = windows[1:]
     # Per-model scoped windows (e.g. Fable) render as extra bars after the
     # aggregate two; the label is the model name so the tile stays legible.
     # On a compact tile the scoped label is cut to its initial, matching the
@@ -387,11 +425,7 @@ def build_main_layout(
         while idx < len(tile_plan):
             provider = tile_plan[idx][0]
             nxt = tile_plan[idx + 1][0] if idx + 1 < len(tile_plan) else None
-            if (
-                can_pair
-                and provider in _PAIRED_PROVIDERS
-                and nxt in _PAIRED_PROVIDERS
-            ):
+            if can_pair and nxt is not None and (provider, nxt) in _PAIRED_ROWS:
                 rows_plan.append([tile_plan[idx], tile_plan[idx + 1]])
                 idx += 2
             else:
@@ -411,6 +445,9 @@ def build_main_layout(
         built: list[BuiltTile] = []
         weight = 1
         is_paired = len(row_tiles) > 1
+        weekly_only = (
+            is_paired and (row_tiles[0][0], row_tiles[1][0]) in _WEEKLY_ONLY_ROWS
+        )
         for provider, reading in row_tiles:
             # Quota-less providers have no percentages — show detail instead.
             # But a reading whose only windows are scoped ones is NOT
@@ -430,7 +467,7 @@ def build_main_layout(
                 detail = None
             else:
                 bars = [] if is_quotaless else _bars_for(
-                    reading, now, compact=is_paired
+                    reading, now, compact=is_paired, weekly_only=weekly_only
                 )
                 detail = reading.detail if is_quotaless else None
             # Provider name + status; model breakdown goes in the subtitle,
@@ -439,7 +476,7 @@ def build_main_layout(
             # subtitle slot carries the peak-window countdown instead ("peak
             # in 3h 24m" / "ends in 1h 24m") so the burn-price hint in the
             # title colour gets a "when" attached.
-            title = provider.value.upper() + fmt.status_suffix(reading)
+            title = _tile_name(provider) + fmt.status_suffix(reading)
             if provider is Provider.OLLAMA and not is_paired:
                 subtitle = _model_subtitle(reading.models)
             elif provider is Provider.ZAI:
@@ -844,6 +881,6 @@ def build_detail_layout(
         lines.extend(_detail_lines(sec_reading, now))
     return DetailLayout(
         provider=reading.provider,
-        title=reading.provider.value.upper() + fmt.status_suffix(reading),
+        title=_tile_name(reading.provider) + fmt.status_suffix(reading),
         lines=lines,
     )
