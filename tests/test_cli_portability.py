@@ -1,52 +1,60 @@
-"""The CLI entry module must import on any OS without POSIX-only stdlib modules.
+"""The CLI entry module must import on any OS, Windows included.
 
-`usage-dashboard capacity` is the command agents are documented to call, and
-agents do not all run on Linux. Found 2026-11-07 during the PR 37 deployment
-round: a module-level import chain through ``server.fetch_antigravity``
-pulled ``fcntl``, so even ``--help`` died with ModuleNotFoundError on
-Windows. The quarantine is now: enrolment commands import their pty/fcntl
-backends lazily at call time, and the capacity command lives in the portable
-``usage_dashboard.client.capacity``.
+Found 2026-11-07 during the PR 37 deployment round: ``usage-dashboard
+capacity`` — the command agents are documented to call — could not even be
+imported on Windows, because ``cli.py`` pulled ``server.token_store`` and
+``server.fetch_antigravity`` at module level and both import ``fcntl``. The
+enrolment commands are POSIX-bound by design (pty ceremonies, fcntl-locked
+homes, run on the server pod); the capacity command is not.
 
-This test pins the quarantine in a fresh interpreter (a subprocess, because
-any earlier test in the same process may legitimately have imported fcntl).
+Two pins, because CI runs on Linux and cannot feel a Windows failure:
+
+- Runtime: both modules import cleanly in a fresh interpreter. On a Windows
+  checkout this is the regression test. (Transitive ``fcntl`` via stdlib
+  ``subprocess`` is fine and POSIX-only: CPython's subprocess imports fcntl
+  on POSIX — the invariant is that OUR imports never name a POSIX-only
+  module, not that sys.modules stays clean.)
+- Static: no module-level import in ``cli.py`` or ``client/capacity.py``
+  names a POSIX-only stdlib module. Function-local imports inside the
+  enrolment commands are the sanctioned escape hatch.
 """
 
 from __future__ import annotations
 
+import ast
 import subprocess
 import sys
+from pathlib import Path
 
-POSIX_ONLY_MODULES = ("fcntl", "pty", "termios", "tty")
+POSIX_ONLY_MODULES = frozenset({"fcntl", "pty", "termios", "tty"})
+
+CLI_PACKAGE_ROOT = Path(__file__).resolve().parent.parent / "src" / "usage_dashboard"
+PORTABLE_MODULES = ("cli.py", "client/capacity.py")
 
 
-def _import_probe(module: str) -> subprocess.CompletedProcess[str]:
-    probe = (
-        "import sys\n"
-        f"import {module}\n"
-        f"leaked = sorted(set(sys.modules) & set({POSIX_ONLY_MODULES!r}))\n"
-        "print(','.join(leaked))\n"
-        "sys.exit(1 if leaked else 0)\n"
+def test_portable_cli_modules_import_on_this_platform() -> None:
+    probe = "import usage_dashboard.cli, usage_dashboard.client.capacity"
+    result = subprocess.run(
+        [sys.executable, "-c", probe], capture_output=True, text=True, timeout=120
     )
-    return subprocess.run(
-        [sys.executable, "-c", probe],
-        capture_output=True,
-        text=True,
-        timeout=120,
-    )
-
-
-def test_cli_module_import_pulls_no_posix_only_modules() -> None:
-    result = _import_probe("usage_dashboard.cli")
     assert result.returncode == 0, (
-        f"usage_dashboard.cli leaked POSIX-only modules at import: "
-        f"{result.stdout.strip() or result.stderr.strip()}"
+        "a portable CLI module failed to import on this platform: "
+        f"{result.stderr.strip()}"
     )
 
 
-def test_capacity_client_module_import_pulls_no_posix_only_modules() -> None:
-    result = _import_probe("usage_dashboard.client.capacity")
-    assert result.returncode == 0, (
-        f"usage_dashboard.client.capacity leaked POSIX-only modules at import: "
-        f"{result.stdout.strip() or result.stderr.strip()}"
-    )
+def test_portable_cli_modules_have_no_module_level_posix_imports() -> None:
+    offenders: list[str] = []
+    for rel in PORTABLE_MODULES:
+        tree = ast.parse((CLI_PACKAGE_ROOT / rel).read_text(encoding="utf-8"))
+        for node in tree.body:  # top-level statements only: lazy imports are
+            if isinstance(node, ast.Import):  # nested in functions on purpose
+                offenders.extend(
+                    f"{rel}: import {alias.name}"
+                    for alias in node.names
+                    if alias.name.split(".")[0] in POSIX_ONLY_MODULES
+                )
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                if node.module.split(".")[0] in POSIX_ONLY_MODULES:
+                    offenders.append(f"{rel}: from {node.module} import ...")
+    assert not offenders, f"module-level POSIX-only imports re-introduced: {offenders}"
