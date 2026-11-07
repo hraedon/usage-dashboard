@@ -3,7 +3,7 @@
 #
 # DELIBERATELY SKIPS k8s/server-secret.yaml: the committed file holds
 # placeholders, and applying it would overwrite the live credential values
-# with "REPLACE_WITH_SECURE_KEY" (this exact accident class is why
+# with their committed placeholder values (this accident class is why
 # scripts/verify_drift.py exists). Secret keys are provisioned out-of-band
 # with `kubectl patch`; the drift check compares the key SET, never values.
 #
