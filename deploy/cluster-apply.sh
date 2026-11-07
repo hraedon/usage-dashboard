@@ -12,7 +12,8 @@
 # applies manifests; to pick up a new :main image without a manifest change:
 #   kubectl -n usage-dashboard rollout restart deployment/usage-dashboard-server
 set -eu
-cd "$(dirname "$0")/../k8s"
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$ROOT/k8s"
 
 kubectl apply -f namespace.yaml
 kubectl apply -f server-pvc.yaml
@@ -24,4 +25,4 @@ kubectl apply -f server-ingress.yaml
 kubectl -n usage-dashboard rollout status deployment/usage-dashboard-server --timeout=180s
 
 echo "-- drift check --"
-exec python3 "$(dirname "$0")/../scripts/verify_drift.py" --k8s-dir "$(pwd)"
+exec python3 "$ROOT/scripts/verify_drift.py" --k8s-dir "$ROOT/k8s"
