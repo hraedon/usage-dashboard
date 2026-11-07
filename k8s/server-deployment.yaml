@@ -35,50 +35,11 @@ spec:
                   optional: true
             - name: DB_PATH
               value: "/data/readings.db"
-            # DEPRECATED (Plan 005), remove in Phase C once the soak is over.
-            # Claude credentials now live in the token store on the PVC, written
-            # by `usage-dashboard login claude`. The store is AUTHORITATIVE:
-            # these values seed it only when its entry is empty, so they are a
-            # migration/rollback net, not the source of truth.
-            - name: CLAUDE_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: server-secrets
-                  key: claude-token
-                  optional: true
-            - name: CLAUDE_REFRESH_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: server-secrets
-                  key: claude-refresh-token
-                  optional: true
-            - name: CLAUDE_CLIENT_ID
-              valueFrom:
-                secretKeyRef:
-                  name: server-secrets
-                  key: claude-client-id
-                  optional: true
-            # Optional second Claude account (e.g. a work login). Leave the
-            # secret keys empty to keep it hidden; set them to show a muted
-            # second set of Claude bars.
-            - name: CLAUDE_WORK_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: server-secrets
-                  key: claude-work-token
-                  optional: true
-            - name: CLAUDE_WORK_REFRESH_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: server-secrets
-                  key: claude-work-refresh-token
-                  optional: true
-            - name: CLAUDE_WORK_CLIENT_ID
-              valueFrom:
-                secretKeyRef:
-                  name: server-secrets
-                  key: claude-work-client-id
-                  optional: true
+            # Plan 005 Phase C (2026-11-07): the deprecated CLAUDE_* seed env
+            # entries are gone. Claude credentials live only in the token store
+            # on the PVC — the AUTHORITATIVE copy, written by `usage-dashboard
+            # login claude` or the /login pane. Enrol there; there is no secret
+            # seeding path left for this provider.
             - name: ZAI_API_KEY
               valueFrom:
                 secretKeyRef:

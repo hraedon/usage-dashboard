@@ -157,18 +157,18 @@ env, the live deployment silently lacked it) is the failure class it exists for.
 | Key | Required | Description |
 |-----|----------|-------------|
 | `api-key` | Yes | Shared Bearer token for server-client auth |
-| `claude-token` | No | *Deprecated (Plan 005)* — seeds an empty token-store entry only; enrol with `usage-dashboard login claude` |
-| `claude-refresh-token` | No | *Deprecated* — as above |
-| `claude-client-id` | No | *Deprecated* — as above |
-| `claude-work-token` | No | *Deprecated* — work account seed |
-| `claude-work-refresh-token` | No | *Deprecated* — work account seed |
-| `claude-work-client-id` | No | *Deprecated* — work account seed |
+| `agent-api-key` | No | Distinct read-only token for `/api/v1/agent/capacity` (Plan 008); must differ from `api-key` |
 | `zai-api-key` | No | z.ai API key |
 | `ollama-cookie` | No | ollama.com browser session cookie (`name=value`; see below) |
-| `ollama-email` | No | Unused — see *Ollama login* (kept only as a placeholder) |
-| `ollama-password` | No | Unused — see *Ollama login* (kept only as a placeholder) |
 | `opencode-workspace-id` | No | OpenCode Go workspace id (`wrk_…`; see below) |
 | `opencode-cookie` | No | opencode.ai `auth` browser cookie (bare value, no `auth=` prefix) |
+| `umans-api-key` | No | Umans wallet API key (Plan 004) |
+
+Plan 005 Phase C (2026-11-07) removed the deprecated `claude-*`/`codex-*` seed
+keys and the unused `ollama-email`/`ollama-password` placeholders: provider
+credentials live in the token store on the PVC (authoritative, written by
+`usage-dashboard login …` or the /login pane), and this Secret now carries only
+API tokens and browser cookies.
 
 ollama.com has no usage API and no plain-HTTP login — it authenticates via
 WorkOS AuthKit (a JS-driven form plus an anti-bot device-fingerprint signal),
