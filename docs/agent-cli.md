@@ -38,3 +38,8 @@ on stderr. Response bodies and request credentials are excluded from errors.
 Requests have a finite 15-second timeout. This command only reads cached
 observations: it does not trigger provider jobs, choose a model, submit work,
 or require Kubernetes credentials.
+
+Portability: `capacity` imports cleanly on any OS an agent may run on,
+Windows included. The `login` subcommands are POSIX-bound (pty-driven
+ceremonies, fcntl-locked homes) and expect the server pod's environment — run
+them on the pod or another Linux host.

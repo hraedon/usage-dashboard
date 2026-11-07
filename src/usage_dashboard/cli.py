@@ -10,7 +10,11 @@ Antigravity (Plan 007) enrols through the official ``agy`` CLI's own sign-in,
 and the CLI keeps the Google token.
 
 Also provides the `usage-dashboard capacity` command for reading the
-server's authenticated agent capacity snapshot (Plan 008).
+server's authenticated agent capacity snapshot (Plan 008). That command
+lives in `usage_dashboard.client.capacity` and is import-portable to any OS;
+this module's enrolment commands are POSIX-bound and import their pty/fcntl
+backends lazily so that importing the CLI (and running `capacity`) works
+everywhere agents run.
 """
 from __future__ import annotations
 
@@ -27,9 +31,6 @@ import tempfile
 from collections.abc import Callable, Iterable, Mapping
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
-
-import httpx
 
 from usage_dashboard.claude_credentials import (
     REQUIRED_SCOPE,
@@ -37,34 +38,18 @@ from usage_dashboard.claude_credentials import (
     ClaudeCredentialError,
     parse_credentials,
 )
+from usage_dashboard.client.capacity import capacity
 from usage_dashboard.server.codex_app_server import (
     DEFAULT_CODEX_BIN,
     DEFAULT_CODEX_HOME,
     CodexAppServerClient,
     CodexAppServerConfig,
 )
-from usage_dashboard.server.fetch_antigravity import (
-    ARGON_LABEL,
-    DEFAULT_AGY_BIN,
-    DEFAULT_ANTIGRAVITY_HOME,
-    cli_env,
-    install_home,
-    make_staging_home,
-    parse_result_text,
-    parse_usage,
-    usage_command,
-    workspace_dir,
-)
 from usage_dashboard.server.fetch_claude import fetch_claude_usage
 from usage_dashboard.server.fetch_types import FetchAuthError, FetchError
-from usage_dashboard.server.token_store import TokenStore, TokenStoreError
 from usage_dashboard.shared.models import Provider
 
 logger = logging.getLogger(__name__)
-
-_CAPACITY_TIMEOUT = 15.0
-_CAPACITY_PATH = "/api/v1/agent/capacity"
-_CAPACITY_SCHEMA = "agent-capacity-v1"
 
 
 # ---------------------------------------------------------------------------
@@ -189,6 +174,9 @@ def login_claude(
         sys.exit(1)
     provider = Provider.CLAUDE if store_key == "claude" else Provider.CLAUDE_WORK
     store_path = token_store_path or os.environ.get("TOKEN_STORE_PATH") or _DEFAULT_TOKEN_STORE
+    # POSIX-quarantined backend (fcntl file locking): imported at call time so
+    # importing this module stays portable (see the module docstring).
+    from usage_dashboard.server.token_store import TokenStore, TokenStoreError
 
     print(f"Enrolling the '{account}' Claude account (token-store key: {store_key}).")
     print("A one-time official Claude Code login follows. Over SSH or in a")
@@ -526,95 +514,6 @@ def login_codex(
     _emit("The dashboard's App Server resumes and reads the new login on its next poll.")
 
 
-class _CapacityCommandError(Exception):
-    """A safe, user-facing capacity command failure."""
-
-
-def _capacity_url(raw_url: str) -> str:
-    """Build the capacity endpoint from a dashboard origin.
-
-    The documented value is an origin, but accepting a trailing ``/api/v1``
-    makes the command less surprising when copied from an API URL. Other
-    paths, credentials, schemes, query strings and fragments are rejected.
-    """
-    value = raw_url.strip()
-    if not value:
-        raise _CapacityCommandError("USAGE_DASHBOARD_URL is required")
-    try:
-        parsed = urlparse(value)
-        hostname = parsed.hostname
-        parsed.port  # Validate malformed ports while the URL is available.
-    except ValueError as exc:
-        raise _CapacityCommandError("USAGE_DASHBOARD_URL is invalid") from exc
-    if parsed.scheme.lower() not in {"http", "https"} or not hostname:
-        raise _CapacityCommandError("USAGE_DASHBOARD_URL must be an HTTP(S) URL")
-    if parsed.username is not None or parsed.password is not None:
-        raise _CapacityCommandError("USAGE_DASHBOARD_URL must not contain credentials")
-    if parsed.query or parsed.fragment:
-        raise _CapacityCommandError("USAGE_DASHBOARD_URL must not contain a query or fragment")
-    path = parsed.path.rstrip("/")
-    if path not in {"", "/api/v1"}:
-        raise _CapacityCommandError("USAGE_DASHBOARD_URL must be an origin or end in /api/v1")
-    return f"{parsed.scheme.lower()}://{parsed.netloc}{_CAPACITY_PATH}"
-
-
-def _fetch_capacity(
-    endpoint: str,
-    token: str,
-    account: str | None,
-    max_age_seconds: int | None,
-) -> dict[str, Any]:
-    params: dict[str, str | int] = {}
-    if account is not None:
-        params["account"] = account
-    if max_age_seconds is not None:
-        params["max_age_seconds"] = max_age_seconds
-    try:
-        with httpx.Client(timeout=_CAPACITY_TIMEOUT) as client:
-            response = client.get(
-                endpoint,
-                headers={"Authorization": f"Bearer {token}"},
-                params=params,
-            )
-    except (httpx.HTTPError, httpx.InvalidURL, UnicodeError) as exc:
-        # URL/header construction can fail before HTTPX creates a request.
-        # Keep those diagnostics out of stderr too: they may include the key.
-        raise _CapacityCommandError("capacity request failed") from exc
-
-    if response.status_code != 200:
-        raise _CapacityCommandError(f"capacity server returned HTTP {response.status_code}")
-    try:
-        body = response.json()
-    except (TypeError, ValueError) as exc:
-        raise _CapacityCommandError("capacity server returned invalid JSON") from exc
-    if not isinstance(body, dict):
-        raise _CapacityCommandError("capacity server returned an unsupported response")
-    if body.get("schema_version") != _CAPACITY_SCHEMA:
-        raise _CapacityCommandError("capacity server returned an unsupported schema")
-    return body
-
-
-def capacity(
-    account: str | None = None,
-    max_age_seconds: int | None = None,
-) -> int:
-    """Print one authenticated capacity snapshot and return a process status."""
-    dashboard_url = os.environ.get("USAGE_DASHBOARD_URL", "")
-    token = os.environ.get("USAGE_DASHBOARD_AGENT_TOKEN", "")
-    if not token:
-        print("capacity: USAGE_DASHBOARD_AGENT_TOKEN is required", file=sys.stderr)
-        return 1
-    try:
-        endpoint = _capacity_url(dashboard_url)
-        snapshot = _fetch_capacity(endpoint, token, account, max_age_seconds)
-    except _CapacityCommandError as exc:
-        print(f"capacity: {exc}", file=sys.stderr)
-        return 1
-    json.dump(snapshot, sys.stdout, sort_keys=True)
-    sys.stdout.write("\n")
-    return 0
-
-
 # ---------------------------------------------------------------------------
 # Antigravity enrolment (Plan 007)
 #
@@ -647,6 +546,21 @@ def login_antigravity(
     timeout: float = _ANTIGRAVITY_LOGIN_TIMEOUT,
 ) -> None:
     """Sign a Google account into the Antigravity CLI under *home*."""
+    # POSIX-quarantined backend (fcntl-locked staging homes): imported at call
+    # time so importing this module stays portable (see the module docstring).
+    from usage_dashboard.server.fetch_antigravity import (
+        ARGON_LABEL,
+        DEFAULT_AGY_BIN,
+        DEFAULT_ANTIGRAVITY_HOME,
+        cli_env,
+        install_home,
+        make_staging_home,
+        parse_result_text,
+        parse_usage,
+        usage_command,
+        workspace_dir,
+    )
+
     home = home or os.environ.get("ANTIGRAVITY_HOME") or DEFAULT_ANTIGRAVITY_HOME
     binary = agy_bin or os.environ.get("AGY_BIN") or DEFAULT_AGY_BIN
 

@@ -17,7 +17,11 @@ import pytest
 from usage_dashboard.claude_credentials import ClaudeCredentialError
 from usage_dashboard.cli import CLAUDE_ACCOUNT_KEYS, login_claude, login_codex
 from usage_dashboard.server.fetch_types import FetchError
-from usage_dashboard.server.token_store import TokenStore
+
+try:
+    from usage_dashboard.server.token_store import TokenStore
+except ModuleNotFoundError as exc:  # fcntl on non-POSIX: these ceremonies run on Linux
+    pytest.skip(f"requires the POSIX token store backend: {exc}", allow_module_level=True)
 
 _ACCESS = "sk-ant-oat-ACCESSTOKENVALUE"
 _REFRESH = "sk-ant-ort-REFRESHTOKENVALUE"
