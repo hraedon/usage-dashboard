@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 from functools import partial
 from typing import Any, Callable
 
+from usage_dashboard.claude_credentials import CLAUDE_CODE_CLIENT_ID
 from usage_dashboard.server.codex_app_server import CodexAppServerClient
 from usage_dashboard.server.db import Database
 from usage_dashboard.server.fetch_antigravity import (
@@ -494,10 +495,24 @@ class FetchScheduler:
     ) -> tuple[str, str] | None:
         """Refresh one Claude account's tokens and persist them under
         *store_key*. Returns the new (access, refresh) pair, or None on failure.
+
+        The token endpoint rejects a ``refresh_token`` grant that omits
+        ``client_id`` (400 "Invalid request format", observed 2026-11-07 — the
+        outage Phase C's env removal exposed: refreshes had been silently
+        relying on ``CLAUDE_CLIENT_ID``). Resolve it explicitly: configured
+        value, else the store's enrolment metadata, else the public Claude Code
+        client every credential here belongs to.
         """
+        resolved_client_id = client_id
+        if not resolved_client_id and self._token_store is not None:
+            stored = self._token_store.get_metadata(store_key, "client_id")
+            if isinstance(stored, str) and stored:
+                resolved_client_id = stored
+        if not resolved_client_id:
+            resolved_client_id = CLAUDE_CODE_CLIENT_ID
         try:
             new_access, new_refresh = refresh_claude_token(
-                refresh_token, client_id=client_id
+                refresh_token, client_id=resolved_client_id
             )
         except FetchError as exc:
             logger.warning("Claude token refresh failed (%s): %s", store_key, exc)

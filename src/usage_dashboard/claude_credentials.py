@@ -18,9 +18,15 @@ not from documentation)::
         "subscriptionType":      "pro",
         "rateLimitTier":         "default_claude_ai"}}
 
-Note there is **no client id**. That is fine: ``refresh_claude_token`` omits
-``client_id`` from the refresh payload when it is None, which is the path a
-credential imported from here takes.
+Note there is **no client id** in the file. The token endpoint nonetheless
+REQUIRES one on every ``refresh_token`` grant: since 2026-11-07 (observed)
+``platform.claude.com/v1/oauth/token`` answers a client-id-less JSON refresh
+with ``400 invalid_request_error "Invalid request format"`` — the CLI's own
+refresh payload always carries ``client_id``. So an imported credential
+persists :data:`CLAUDE_CODE_CLIENT_ID` as store metadata, and the scheduler
+sends it when refreshing. Every credential this system can hold belongs to
+that public client: enrolment runs the official CLI's login, and the
+pre-Plan-005 custom flow (Plan 001) used the same public client id.
 
 ``user:profile`` is what ``GET /api/oauth/usage`` requires, and it is the scope
 ``claude setup-token`` cannot grant — which is why enrolment uses the full
@@ -35,6 +41,16 @@ from typing import Any
 _OAUTH_KEY = "claudeAiOauth"
 # Required for GET /api/oauth/usage; `claude setup-token` cannot grant it.
 REQUIRED_SCOPE = "user:profile"
+
+# The Claude Code CLI's public OAuth client id, used as the client_id of every
+# refresh_token grant this system makes. Extracted from the pinned CLI binary
+# (2.1.276: CLIENT_ID beside the oauth callback route — the same analysis
+# Plan 001 used for the pre-Plan-005 flow), NOT a guess: the token endpoint
+# rejects a refresh without it (400 "Invalid request format", observed
+# 2026-11-07 when Plan 005 Phase C removed the CLAUDE_CLIENT_ID env that had
+# been supplying one). It is not a secret — it ships inside every Claude Code
+# install.
+CLAUDE_CODE_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 
 
 class ClaudeCredentialError(Exception):
@@ -64,12 +80,16 @@ class ClaudeCredential:
     def metadata(self) -> dict[str, Any]:
         """Optional fields to persist alongside the token pair.
 
-        ``None`` values are meaningful: :meth:`TokenStore.save` removes those
-        keys, so re-enrolling with a credential that no longer carries a client
-        id does not leave the old one behind.
+        The client id falls back to :data:`CLAUDE_CODE_CLIENT_ID` because the
+        credential file carries none and the token endpoint requires one on
+        refresh; a value parsed from a future CLI version still wins.
+
+        Other ``None`` values are meaningful: :meth:`TokenStore.save` removes
+        those keys, so re-enrolling with a credential that no longer carries a
+        field does not leave a stale one behind.
         """
         return {
-            "client_id": self.client_id,
+            "client_id": self.client_id or CLAUDE_CODE_CLIENT_ID,
             "expires_at": self.expires_at,
             "scopes": list(self.scopes) or None,
             "subscription_type": self.subscription_type,

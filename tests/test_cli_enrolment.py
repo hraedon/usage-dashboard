@@ -14,7 +14,10 @@ from unittest.mock import patch
 
 import pytest
 
-from usage_dashboard.claude_credentials import ClaudeCredentialError
+from usage_dashboard.claude_credentials import (
+    CLAUDE_CODE_CLIENT_ID,
+    ClaudeCredentialError,
+)
 from usage_dashboard.cli import CLAUDE_ACCOUNT_KEYS, login_claude, login_codex
 from usage_dashboard.server.fetch_types import FetchError
 
@@ -109,11 +112,15 @@ class TestClaudeEnrolment:
         assert store.get_metadata("claude", "subscription_type") == "pro"
         assert store.get_metadata("claude", "scopes") == DEFAULT_SCOPES
 
-    def test_no_client_id_is_stored_when_the_file_has_none(self, tmp_path: Path) -> None:
-        # Claude Code 2.1.276 emits no clientId, and refresh_claude_token omits
-        # client_id when it is None — so storing a guessed one would be wrong.
+    def test_public_cli_client_id_is_stored_when_the_file_has_none(
+        self, tmp_path: Path
+    ) -> None:
+        # Claude Code 2.1.276 emits no clientId, but the token endpoint
+        # requires a client_id on every refresh (400 "Invalid request format"
+        # otherwise, observed 2026-11-07) — so enrolment persists the CLI's
+        # public client id, binary-verified in claude_credentials.py.
         store, _ = self._run(tmp_path)
-        assert store.get_metadata("claude", "client_id") is None
+        assert store.get_metadata("claude", "client_id") == CLAUDE_CODE_CLIENT_ID
 
     def test_temporary_credential_store_is_removed(self, tmp_path: Path) -> None:
         _, fake = self._run(tmp_path)

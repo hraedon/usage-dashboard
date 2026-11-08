@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 from functools import partial
 from unittest.mock import MagicMock
 
+from usage_dashboard.claude_credentials import CLAUDE_CODE_CLIENT_ID
 from usage_dashboard.server.db import Database
 from usage_dashboard.server.fetch_antigravity import AntigravityConfig
 from usage_dashboard.server.fetch_types import FetchAuthError, FetchError
@@ -367,6 +368,7 @@ class TestClaudeWorkAccount:
         assert scheduler._claude_work_token == "new-w-access"
         assert scheduler._claude_token == "p-access"
 
+
     def test_auth_failure_refreshes_the_work_account(self, tmp_path):
         from unittest.mock import patch
 
@@ -387,6 +389,87 @@ class TestClaudeWorkAccount:
         scheduler._try_refresh_claude_work.assert_called_once()
         scheduler._try_refresh_claude.assert_not_called()  # only the work account
         assert db.get_latest_readings()[Provider.CLAUDE_WORK].status is ReadingStatus.CURRENT
+
+
+class TestRefreshClientIdResolution:
+    """The refresh grant's client_id: explicit config > store metadata > the
+    public Claude Code client. The token endpoint answers a client-id-less
+    refresh with 400 "Invalid request format" (observed 2026-11-07), which is
+    the outage Plan 005 Phase C's env removal exposed — refreshes had been
+    silently relying on the CLAUDE_CLIENT_ID env ever since."""
+
+    def _refresh_call_client_id(self, scheduler, tmp_path):
+        """Run one personal refresh and return the client_id it sent."""
+        from unittest.mock import patch
+
+        with patch(
+            "usage_dashboard.server.scheduler.refresh_claude_token",
+            return_value=("new-access", "new-refresh"),
+        ) as mock_refresh:
+            assert scheduler._try_refresh_claude() is True
+        _, kwargs = mock_refresh.call_args
+        return kwargs.get("client_id")
+
+    def test_store_metadata_supplies_the_client_id(self, tmp_path):
+        db = Database(str(tmp_path / "sched.db"))
+        db.initialize()
+        token_store = TokenStore(str(tmp_path / "tokens.json"))
+        # Enrolment-shaped entry: metadata carries the client id, the
+        # constructor arg (old CLAUDE_CLIENT_ID env) is gone — post-Phase C.
+        token_store.save(
+            "claude", "access", "refresh", metadata={"client_id": "stored-client"}
+        )
+        scheduler = FetchScheduler(
+            db,
+            claude_token="access",
+            claude_refresh_token="refresh",
+            token_store=token_store,
+        )
+        assert self._refresh_call_client_id(scheduler, tmp_path) == "stored-client"
+
+    def test_falls_back_to_the_public_cli_client_id(self, tmp_path):
+        db = Database(str(tmp_path / "sched.db"))
+        db.initialize()
+        # The live store at fix time: enrolled before metadata carried a
+        # client id, and the env wiring is gone. The public client is correct
+        # for every credential this system holds.
+        token_store = TokenStore(str(tmp_path / "tokens.json"))
+        token_store.save("claude", "access", "refresh")
+        scheduler = FetchScheduler(
+            db,
+            claude_token="access",
+            claude_refresh_token="refresh",
+            token_store=token_store,
+        )
+        assert (
+            self._refresh_call_client_id(scheduler, tmp_path) == CLAUDE_CODE_CLIENT_ID
+        )
+
+    def test_falls_back_with_no_token_store_at_all(self, tmp_path):
+        db = Database(str(tmp_path / "sched.db"))
+        db.initialize()
+        scheduler = FetchScheduler(
+            db, claude_token="access", claude_refresh_token="refresh"
+        )
+        assert (
+            self._refresh_call_client_id(scheduler, tmp_path) == CLAUDE_CODE_CLIENT_ID
+        )
+
+    def test_explicit_client_id_wins_over_store_metadata(self, tmp_path):
+        db = Database(str(tmp_path / "sched.db"))
+        db.initialize()
+        token_store = TokenStore(str(tmp_path / "tokens.json"))
+        token_store.save(
+            "claude", "access", "refresh", metadata={"client_id": "stored-client"}
+        )
+        scheduler = FetchScheduler(
+            db,
+            claude_token="access",
+            claude_refresh_token="refresh",
+            claude_client_id="configured-client",
+            token_store=token_store,
+        )
+        assert self._refresh_call_client_id(scheduler, tmp_path) == "configured-client"
 
 
 class TestRateLimitBackoff:
