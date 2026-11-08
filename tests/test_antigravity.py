@@ -24,12 +24,12 @@ from typing import Any
 import pytest
 
 from usage_dashboard import cli
+from usage_dashboard.server import cli_home
 from usage_dashboard.server import fetch_antigravity as agy
+from usage_dashboard.server.cli_home import install_home, make_staging_home
 from usage_dashboard.server.fetch_antigravity import (
     AntigravityConfig,
     fetch_antigravity_usage,
-    install_home,
-    make_staging_home,
     parse_usage,
     run_usage_command,
 )
@@ -392,7 +392,7 @@ class TestHomeSwap:
         holding = threading.Event()
 
         def hold() -> None:
-            with agy.home_lock(str(home)):
+            with cli_home.home_lock(str(home)):
                 holding.set()
                 released.wait(10)
 
@@ -416,7 +416,7 @@ class TestHomeSwap:
         home = tmp_path / "antigravity"
         stale = tmp_path / "antigravity.enrol-dead"
         stale.mkdir()
-        old = time.time() - 2 * agy._STALE_STAGING_SECONDS
+        old = time.time() - 2 * cli_home.STALE_STAGING_SECONDS
         os.utime(stale, (old, old))
         fresh = tmp_path / "antigravity.enrol-live"
         fresh.mkdir()

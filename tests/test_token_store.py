@@ -38,10 +38,19 @@ class TestTokenStore:
         store2 = TokenStore(path)
         assert store2.get("claude") == ("access", "refresh")
 
-    def test_load_claude_tokens_convenience(self, tmp_path: Path) -> None:
+    def test_remove_deletes_the_whole_entry(self, tmp_path: Path) -> None:
+        # Plan 009: a Claude account whose credential moved into a CLI
+        # profile loses its store entry entirely (tokens and seed marker).
         store = TokenStore(tmp_path / "tokens.json")
-        store.save_claude_tokens("my-access", "my-refresh")
-        assert store.load_claude_tokens() == ("my-access", "my-refresh")
+        store.save("claude", "a", "r")
+        store.set_seed_marker("claude", "m")
+        store.save_credential("ollama", "cookie")
+        assert store.has_entry("claude")
+        store.remove("claude")
+        assert not store.has_entry("claude")
+        assert TokenStore(tmp_path / "tokens.json").get("claude") == (None, None)
+        assert store.get_credential("ollama") == "cookie"
+        store.remove("claude")  # idempotent
 
     def test_load_from_missing_file(self, tmp_path: Path) -> None:
         store = TokenStore(tmp_path / "nonexistent.json")
@@ -77,26 +86,26 @@ class TestTokenStore:
 class TestSeedMarker:
     def test_marker_defaults_to_none(self, tmp_path: Path) -> None:
         store = TokenStore(tmp_path / "tokens.json")
-        assert store.get_claude_seed_marker() is None
+        assert store.get_seed_marker("claude") is None
 
     def test_set_and_get_marker(self, tmp_path: Path) -> None:
         store = TokenStore(tmp_path / "tokens.json")
-        store.set_claude_seed_marker("marker-abc")
-        assert store.get_claude_seed_marker() == "marker-abc"
+        store.set_seed_marker("claude", "marker-abc")
+        assert store.get_seed_marker("claude") == "marker-abc"
 
     def test_save_preserves_marker(self, tmp_path: Path) -> None:
         # A token refresh (save) must not wipe the env-seed marker.
         store = TokenStore(tmp_path / "tokens.json")
-        store.save_claude_tokens("a0", "r0")
-        store.set_claude_seed_marker("marker-0")
-        store.save_claude_tokens("a1", "r1")  # simulate a refresh
-        assert store.get_claude_seed_marker() == "marker-0"
-        assert store.load_claude_tokens() == ("a1", "r1")
+        store.save("claude", "a0", "r0")
+        store.set_seed_marker("claude", "marker-0")
+        store.save("claude", "a1", "r1")  # simulate a refresh
+        assert store.get_seed_marker("claude") == "marker-0"
+        assert store.get("claude") == ("a1", "r1")
 
     def test_marker_persists_across_instances(self, tmp_path: Path) -> None:
         path = tmp_path / "tokens.json"
-        TokenStore(path).set_claude_seed_marker("m")
-        assert TokenStore(path).get_claude_seed_marker() == "m"
+        TokenStore(path).set_seed_marker("claude", "m")
+        assert TokenStore(path).get_seed_marker("claude") == "m"
 
 
 class TestCredentialStore:

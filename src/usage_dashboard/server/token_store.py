@@ -11,8 +11,8 @@ running server writes on every token rotation. A thread lock cannot order two
 processes, so every access takes an advisory ``flock`` on a sidecar lock file
 and re-reads the file underneath it. Mutations are read-modify-write: reload,
 apply one change, write a 0600 temp file, fsync, atomically replace, then
-fsync the directory. That keeps an enrolment writing ``claude`` from
-clobbering a rotation the server just wrote to ``codex``.
+fsync the directory. That keeps an enrolment writing one provider's entry
+from clobbering a write the server just made to another's.
 
 **Malformed content fails closed.** Unreadable JSON used to be swallowed,
 leaving an empty in-memory store whose next write replaced the file — turning
@@ -150,19 +150,20 @@ class TokenStore:
 
         self._mutate(mutate)
 
-    def load_claude_tokens(self) -> tuple[str | None, str | None]:
-        """Convenience: return (access, refresh) for the 'claude' provider."""
-        return self.get("claude")
+    def has_entry(self, provider: str) -> bool:
+        """True when the store holds any entry for *provider*."""
+        with self._thread_lock, self._flock(exclusive=False):
+            self._data = self._read()
+            return provider in self._data
 
-    def save_claude_tokens(self, access_token: str, refresh_token: str) -> None:
-        """Convenience: persist tokens for the 'claude' provider."""
-        self.save("claude", access_token, refresh_token)
+    def remove(self, provider: str) -> None:
+        """Delete *provider*'s entry entirely (Plan 009: a Claude account whose
+        credential moved into a CLI profile)."""
 
-    def get_claude_seed_marker(self) -> str | None:
-        return self.get_seed_marker("claude")
+        def mutate(data: dict[str, dict[str, Any]]) -> None:
+            data.pop(provider, None)
 
-    def set_claude_seed_marker(self, marker: str) -> None:
-        self.set_seed_marker("claude", marker)
+        self._mutate(mutate)
 
     # ------------------------------------------------------------------
     # Internals

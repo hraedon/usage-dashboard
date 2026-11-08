@@ -35,11 +35,11 @@ spec:
                   optional: true
             - name: DB_PATH
               value: "/data/readings.db"
-            # Plan 005 Phase C (2026-11-07): the deprecated CLAUDE_* seed env
-            # entries are gone. Claude credentials live only in the token store
-            # on the PVC — the AUTHORITATIVE copy, written by `usage-dashboard
-            # login claude` or the /login pane. Enrol there; there is no secret
-            # seeding path left for this provider.
+            # Plan 005 Phase C (2026-11-07) removed the CLAUDE_* seed env.
+            # Plan 009: each Claude account's credential lives in its CLI
+            # profile on the PVC (/data/claude-personal, /data/claude-work),
+            # written by `usage-dashboard login claude` or the /login pane and
+            # refreshed only by the pinned Claude Code CLI. No Secret path.
             - name: ZAI_API_KEY
               valueFrom:
                 secretKeyRef:

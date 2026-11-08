@@ -28,8 +28,8 @@ class Provider(Enum):
     UMANS = "umans"
 
 
-# Claude-family providers that share the OAuth fetch/refresh machinery, mapped
-# to their token-store namespace. The client renders them as one "Claude" tile.
+# Claude-family providers that share the CLI-profile fetch path (Plan 009),
+# mapped to their account key. The client renders them as one "Claude" tile.
 CLAUDE_PROVIDERS: dict[Provider, str] = {
     Provider.CLAUDE: "claude",
     Provider.CLAUDE_WORK: "claude_work",

@@ -8,6 +8,14 @@ import sys
 import uvicorn
 
 from usage_dashboard.server.api import create_app
+from usage_dashboard.server.claude_profile import (
+    DEFAULT_CLAUDE_BIN,
+    ClaudeProfileConfig,
+    is_enrolled,
+    profile_dir,
+    read_credential,
+)
+from usage_dashboard.server.cli_home import home_lock, recover_interrupted_swap
 from usage_dashboard.server.codex_app_server import (
     DEFAULT_CODEX_BIN,
     DEFAULT_CODEX_HOME,
@@ -21,6 +29,7 @@ from usage_dashboard.server.fetch_antigravity import (
     DEFAULT_ANTIGRAVITY_HOME,
     AntigravityConfig,
 )
+from usage_dashboard.server.fetch_types import FetchError
 from usage_dashboard.server.schedule_config import ScheduleConfig
 from usage_dashboard.server.scheduler import FetchScheduler
 from usage_dashboard.server.token_store import TokenStore
@@ -28,46 +37,77 @@ from usage_dashboard.server.token_store import TokenStore
 logger = logging.getLogger(__name__)
 
 
-def _resolve_claude_tokens(
-    token_store: TokenStore,
-    env_access: str | None,
-    env_refresh: str | None,
-    store_key: str = "claude",
-) -> tuple[str | None, str | None]:
-    """Decide which Claude tokens to run with (WI-001, revised by Plan 005).
+def _resolve_claude_profile(
+    token_store: TokenStore, store_key: str, claude_bin: str
+) -> ClaudeProfileConfig | None:
+    """Decide whether a Claude account is configured (Plan 009).
 
-    The token store is now **authoritative**. Claude credentials are created by
-    ``usage-dashboard login claude``, which writes straight into the store, so
-    the Secret is only ever a migration seed:
+    The official CLI owns the credential under the account's persistent
+    ``CLAUDE_CONFIG_DIR``; the account is configured exactly when that profile
+    holds a credential file. Re-run after enrolment, so a new sign-in is
+    adopted without a rollout.
 
-    * an empty entry is seeded once from the environment (a pre-Plan-005
-      deployment carrying its credentials in ``server-secrets``);
-    * once an entry exists, the environment can no longer displace it.
+    The token store no longer holds Claude OAuth tokens, and a pre-Plan-009
+    entry is never *used*. It does still matter in two ways:
 
-    The old behaviour re-seeded whenever the Secret's value differed from a
-    recorded marker. That is unsafe now: the Secret keeps the originally
-    provisioned tokens forever, so after enrolment writes a fresh credential, a
-    restart would find the marker unchanged... but any hand-edit of the Secret
-    would silently overwrite the newly enrolled credential with a stale pair
-    that has already been rotated away. Only enrolment replaces a credential.
-
-    *store_key* namespaces the credentials so a second account ("claude_work")
-    resolves and persists independently of the primary one.
+    * With no profile yet, it marks an account that was configured before the
+      upgrade. That account stays configured (its tile reads "login required")
+      rather than silently vanishing, until it is migrated or re-enrolled.
+    * With a profile, the entry is kept until the profile's refresh token
+      differs from it, which proves the CLI has refreshed the migrated
+      credential at least once. Until then it is the only fallback copy of a
+      working pair, so pruning it on sight could destroy the last good login.
     """
-    persisted_access, persisted_refresh = token_store.get(store_key)
-    if persisted_access and persisted_refresh:
-        return persisted_access, persisted_refresh
+    config_dir = profile_dir(store_key)
+    config = ClaudeProfileConfig(config_dir=config_dir, binary=claude_bin)
+    with home_lock(config_dir):
+        # A swap that died between its renames must be settled before the
+        # profile is judged absent, or a restart would drop the account.
+        recover_interrupted_swap(config_dir)
+        enrolled = is_enrolled(config_dir)
+    _, legacy_refresh = token_store.get(store_key)
+    if not enrolled:
+        if legacy_refresh:
+            logger.warning(
+                "A pre-Plan-009 %s credential is in the token store but there is "
+                "no Claude CLI profile at %s; it is not used. Migrate it with "
+                "scripts/migrate_claude_store_to_profile.py or re-enrol on /login",
+                store_key,
+                config_dir,
+            )
+            return config
+        return None
+    if token_store.has_entry(store_key):
+        _prune_legacy_claude_entry(token_store, store_key, config_dir, legacy_refresh)
+    return config
 
-    if env_access and env_refresh:
-        # One-time import for a deployment that predates enrolment.
-        logger.info(
-            "Seeding %s credentials from the environment into the empty token store",
-            store_key,
-        )
-        token_store.save(store_key, env_access, env_refresh)
-        return env_access, env_refresh
 
-    return persisted_access or env_access, persisted_refresh or env_refresh
+def _prune_legacy_claude_entry(
+    token_store: TokenStore,
+    store_key: str,
+    config_dir: str,
+    legacy_refresh: str | None,
+) -> None:
+    """Drop a pre-Plan-009 store entry once the CLI has demonstrably taken over."""
+    if legacy_refresh:
+        try:
+            current = read_credential(config_dir)
+        except FetchError:
+            return  # unreadable profile: keep the fallback copy
+        if current.refresh_token == legacy_refresh:
+            logger.info(
+                "Keeping the pre-Plan-009 %s store entry until the CLI first "
+                "refreshes the migrated credential",
+                store_key,
+            )
+            return
+    token_store.remove(store_key)
+    logger.info(
+        "Removed the pre-Plan-009 %s entry from the token store; the CLI "
+        "profile at %s owns the credential",
+        store_key,
+        config_dir,
+    )
 
 
 def _resolve_opencode_workspace(
@@ -87,8 +127,7 @@ def _resolve_cookie(
 ) -> str | None:
     """Decide which scraped session cookie to run with (WI-017).
 
-    Mirrors ``_resolve_claude_tokens`` but for a single opaque credential
-    string (no refresh pair): only (re)seed from the env when the Secret
+    For a single opaque credential string: only (re)seed from the env when the Secret
     differs from what we last seeded (first boot or a deliberate re-login);
     otherwise prefer the persisted cookie so a pod restart keeps it.
 
@@ -175,14 +214,11 @@ def main() -> None:
         sys.exit(1)
 
     db_path = os.environ.get("DB_PATH", "/data/readings.db")
-    claude_token = os.environ.get("CLAUDE_TOKEN") or None
-    claude_refresh_token = os.environ.get("CLAUDE_REFRESH_TOKEN") or None
-    claude_client_id = os.environ.get("CLAUDE_CLIENT_ID") or None
-    # Optional second Claude account (e.g. a work login). Absent unless its own
-    # token is set — the dashboard then shows a muted second set of Claude bars.
-    claude_work_token = os.environ.get("CLAUDE_WORK_TOKEN") or None
-    claude_work_refresh_token = os.environ.get("CLAUDE_WORK_REFRESH_TOKEN") or None
-    claude_work_client_id = os.environ.get("CLAUDE_WORK_CLIENT_ID") or None
+    # Claude (Plan 009): the official CLI owns each account's login and
+    # refresh under a persistent CLAUDE_CONFIG_DIR on the PVC. The optional
+    # work account is configured only once it has been enrolled; the dashboard
+    # then shows a muted second set of Claude bars.
+    claude_bin = os.environ.get("CLAUDE_BIN") or DEFAULT_CLAUDE_BIN
     zai_api_key = os.environ.get("ZAI_API_KEY") or None
     # z.ai weekly-token thresholds (unset = the fetcher's defaults): the token
     # totals that colour the weekly-window line warn/crit. The weekly cap is
@@ -221,31 +257,22 @@ def main() -> None:
     database = Database(db_path)
     database.initialize()
 
-    # Token store lives on the PVC alongside the DB.  Env-var tokens (from
-    # the k8s Secret) seed it on first boot; refreshed tokens persist here
-    # so pod restarts survive a rotation without touching the Secret.
+    # Token store lives on the PVC alongside the DB: scraped session cookies
+    # (seeded from the k8s Secret) and the OpenCode workspace id. Claude's
+    # credentials live in CLI profiles beside it (Plan 009), not here.
     token_store = TokenStore(os.path.join(db_dir or "/data", "tokens.json"))
 
     # Raw env values, kept BEFORE resolution overwrites the locals: the
     # enrolment reload re-runs the same seed-from-env resolution, and it must
     # see the Secret's values, not the store's (Plan 006).
     env_credentials = {
-        "claude_token": claude_token,
-        "claude_refresh_token": claude_refresh_token,
-        "claude_work_token": claude_work_token,
-        "claude_work_refresh_token": claude_work_refresh_token,
         "ollama_cookie": ollama_cookie,
         "opencode_cookie": opencode_cookie,
         "opencode_workspace_id": opencode_workspace_id,
     }
 
-    claude_token, claude_refresh_token = _resolve_claude_tokens(
-        token_store, claude_token, claude_refresh_token
-    )
-    claude_work_token, claude_work_refresh_token = _resolve_claude_tokens(
-        token_store, claude_work_token, claude_work_refresh_token,
-        store_key="claude_work",
-    )
+    claude_profile = _resolve_claude_profile(token_store, "claude", claude_bin)
+    claude_work_profile = _resolve_claude_profile(token_store, "claude_work", claude_bin)
     ollama_cookie = _resolve_cookie(token_store, ollama_cookie, "ollama")
     opencode_cookie = _resolve_cookie(token_store, opencode_cookie, "opencode")
     opencode_workspace_id = _resolve_opencode_workspace(token_store, opencode_workspace_id)
@@ -268,12 +295,8 @@ def main() -> None:
 
     scheduler = FetchScheduler(
         db=database,
-        claude_token=claude_token,
-        claude_refresh_token=claude_refresh_token,
-        claude_client_id=claude_client_id,
-        claude_work_token=claude_work_token,
-        claude_work_refresh_token=claude_work_refresh_token,
-        claude_work_client_id=claude_work_client_id,
+        claude_profile=claude_profile,
+        claude_work_profile=claude_work_profile,
         zai_key=zai_api_key,
         zai_tokens_warn=zai_tokens_warn,
         zai_tokens_crit=zai_tokens_crit,
@@ -286,7 +309,6 @@ def main() -> None:
         antigravity_config=antigravity_config,
         interval_seconds=fetch_interval,
         failure_cap_seconds=failure_backoff_cap,
-        token_store=token_store,
         retention_days=retention_days,
     )
 
@@ -297,22 +319,11 @@ def main() -> None:
         Secret can still only seed an empty entry — and swaps the result
         into the running scheduler, then fetches so the tiles show it.
         """
-        claude_t, claude_r = _resolve_claude_tokens(
-            token_store,
-            env_credentials["claude_token"],
-            env_credentials["claude_refresh_token"],
-        )
-        work_t, work_r = _resolve_claude_tokens(
-            token_store,
-            env_credentials["claude_work_token"],
-            env_credentials["claude_work_refresh_token"],
-            store_key="claude_work",
-        )
         scheduler.update_credentials(
-            claude_token=claude_t,
-            claude_refresh_token=claude_r,
-            claude_work_token=work_t,
-            claude_work_refresh_token=work_r,
+            claude_profile=_resolve_claude_profile(token_store, "claude", claude_bin),
+            claude_work_profile=_resolve_claude_profile(
+                token_store, "claude_work", claude_bin
+            ),
             ollama_cookie=_resolve_cookie(
                 token_store, env_credentials["ollama_cookie"], "ollama"
             ),
@@ -339,7 +350,7 @@ def main() -> None:
 
     enrolment = EnrolmentService(
         token_store,
-        claude_bin=os.environ.get("CLAUDE_BIN") or "claude",
+        claude_bin=claude_bin,
         codex_home=codex_home,
         codex_bin=codex_bin,
         on_success=_after_enrolment,

@@ -19,7 +19,6 @@ from usage_dashboard.shared.models import (
 )
 
 _CLAUDE_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
-_CLAUDE_TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
 _TIMEOUT = 30.0
 
 logger = logging.getLogger(__name__)
@@ -97,48 +96,6 @@ def _extract_scoped_limits(limits: object) -> list[ScopedLimit]:
             )
         )
     return scoped
-
-
-def refresh_claude_token(
-    refresh_token: str,
-    client_id: str | None = None,
-) -> tuple[str, str]:
-    payload: dict[str, str] = {
-        "grant_type": "refresh_token",
-        "refresh_token": refresh_token,
-    }
-    if client_id is not None:
-        payload["client_id"] = client_id
-    try:
-        response = httpx.post(
-            _CLAUDE_TOKEN_URL,
-            json=payload,
-            timeout=_TIMEOUT,
-        )
-        response.raise_for_status()
-        data = response.json()
-        new_access = data["access_token"]
-        new_refresh = data.get("refresh_token", refresh_token)
-        return new_access, new_refresh
-    except httpx.HTTPStatusError as exc:
-        # Surface WHY the grant was rejected: "invalid_grant" (rotation race /
-        # revocation) and "invalid_request/Invalid request format" (missing
-        # client_id — the 2026-11-07 outage) demand different runbooks, and the
-        # old bare exception name hid both behind one log line. The error body
-        # is endpoint diagnostics, never token material; keep it bounded.
-        status = exc.response.status_code
-        detail = exc.response.text.strip()[:200] or "<empty body>"
-        raise FetchError(
-            f"Claude token refresh failed: HTTP {status}: {detail}"
-        ) from exc
-    except httpx.HTTPError as exc:
-        raise FetchError(
-            f"Claude token refresh failed: {type(exc).__name__}"
-        ) from exc
-    except (KeyError, ValueError, TypeError) as exc:
-        raise FetchError(
-            f"Claude token refresh parse error: {type(exc).__name__}"
-        ) from exc
 
 
 def fetch_claude_usage(

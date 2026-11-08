@@ -361,7 +361,7 @@ The agent is responsible for determining build sequence based on architectural d
 **Pending / deferred:**
 - **Ollama scraping method:** HTTP-based login preferred; headless browser fallback. Deferred because the answer requires testing against the live site. Impact if wrong: adding Playwright to the server image increases image size by ~400MB and adds complexity.
 - **z.ai field mapping:** Exact interpretation of `unit` values. Deferred because it requires empirical testing against the API. Impact if wrong: wrong data displayed; easily fixable by adjusting the mapping.
-- **Claude OAuth token longevity:** Whether the token needs a refresh mechanism. Deferred because it depends on the user's Claude account and token lifecycle. Impact if wrong: server needs a token refresh flow or Web API fallback.
+- **Claude OAuth token longevity:** Whether the token needs a refresh mechanism. Deferred because it depends on the user's Claude account and token lifecycle. Impact if wrong: server needs a token refresh flow or Web API fallback. *Resolved (Plan 009): access tokens live ~8 h; the pinned official Claude Code CLI refreshes them in the account's persistent profile, and the dashboard performs no refresh itself.*
 
 **Intent signals:**
 - *"hang in my cubicle"* — The display is semi-public (coworkers can see it). Auth prevents snooping, but the display itself does not need to hide which providers are used.
