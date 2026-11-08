@@ -1110,6 +1110,30 @@ class TestRefreshClaudeToken:
             pass
 
     @patch("usage_dashboard.server.fetch_claude.httpx.post")
+    def test_refresh_failure_names_the_http_reason(self, mock_post):
+        # The 2026-11-07 outage was diagnosable only via cluster forensics
+        # because the log said just "HTTPStatusError". The status + bounded
+        # body snippet separate invalid_request (missing client_id) from
+        # invalid_grant (rotation race / revocation) at a glance.
+        mock_response = MagicMock()
+        mock_response.status_code = 400
+        mock_response.text = (
+            '{"error":{"type":"invalid_request_error",'
+            '"message":"Invalid request format"}}'
+        )
+        status_error = httpx.HTTPStatusError(
+            "400 Bad Request", request=MagicMock(), response=mock_response
+        )
+        mock_response.raise_for_status = MagicMock(side_effect=status_error)
+        mock_post.return_value = mock_response
+        try:
+            refresh_claude_token("old-refresh")
+            assert False, "Should have raised FetchError"
+        except FetchError as exc:
+            assert "HTTP 400" in str(exc)
+            assert "Invalid request format" in str(exc)
+
+    @patch("usage_dashboard.server.fetch_claude.httpx.post")
     def test_refresh_raises_fetch_error_on_malformed_response(self, mock_post):
         mock_response = MagicMock()
         mock_response.json.return_value = {"no_access_token": True}

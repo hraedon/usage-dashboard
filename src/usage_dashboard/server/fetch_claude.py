@@ -120,6 +120,17 @@ def refresh_claude_token(
         new_access = data["access_token"]
         new_refresh = data.get("refresh_token", refresh_token)
         return new_access, new_refresh
+    except httpx.HTTPStatusError as exc:
+        # Surface WHY the grant was rejected: "invalid_grant" (rotation race /
+        # revocation) and "invalid_request/Invalid request format" (missing
+        # client_id — the 2026-11-07 outage) demand different runbooks, and the
+        # old bare exception name hid both behind one log line. The error body
+        # is endpoint diagnostics, never token material; keep it bounded.
+        status = exc.response.status_code
+        detail = exc.response.text.strip()[:200] or "<empty body>"
+        raise FetchError(
+            f"Claude token refresh failed: HTTP {status}: {detail}"
+        ) from exc
     except httpx.HTTPError as exc:
         raise FetchError(
             f"Claude token refresh failed: {type(exc).__name__}"

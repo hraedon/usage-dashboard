@@ -11,6 +11,7 @@ from typing import Any
 import pytest
 
 from usage_dashboard.claude_credentials import (
+    CLAUDE_CODE_CLIENT_ID,
     REQUIRED_SCOPE,
     ClaudeCredentialError,
     parse_credentials,
@@ -47,20 +48,25 @@ class TestKnownSchema:
         assert cred.scopes_known
 
     def test_no_client_id_in_this_version(self) -> None:
-        # refresh_claude_token omits client_id when None, which is the path
-        # an imported credential takes. Inventing one here would be a guess.
+        # The FILE carries no clientId in 2.1.276 — metadata() supplies the
+        # CLI's public client id separately (the token endpoint requires one
+        # on refresh; observed 2026-11-07).
         assert parse_credentials(FIXTURE_2_1_276).client_id is None
 
     def test_a_later_version_may_add_a_client_id(self) -> None:
         raw = {"claudeAiOauth": dict(FIXTURE_2_1_276["claudeAiOauth"], clientId="abc")}
         assert parse_credentials(raw).client_id == "abc"
+        # An explicit value wins over the CLI default in metadata too.
+        assert parse_credentials(raw).metadata()["client_id"] == "abc"
 
     def test_metadata_carries_the_optional_fields(self) -> None:
         metadata = parse_credentials(FIXTURE_2_1_276).metadata()
         assert metadata["subscription_type"] == "pro"
         assert metadata["expires_at"] == 1789832809000
         assert REQUIRED_SCOPE in metadata["scopes"]
-        assert metadata["client_id"] is None
+        # The file has no clientId, so metadata falls back to the CLI's public
+        # client — not None: the refresh grant needs it.
+        assert metadata["client_id"] == CLAUDE_CODE_CLIENT_ID
 
     def test_absent_scopes_are_allowed_but_not_claimed(self) -> None:
         raw = {
