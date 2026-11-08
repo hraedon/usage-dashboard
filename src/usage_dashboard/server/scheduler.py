@@ -7,14 +7,16 @@ from datetime import datetime, timedelta, timezone
 from functools import partial
 from typing import Any, Callable
 
-from usage_dashboard.claude_credentials import CLAUDE_CODE_CLIENT_ID
+from usage_dashboard.server.claude_profile import (
+    ClaudeProfileConfig,
+    fetch_claude_profile_usage,
+)
 from usage_dashboard.server.codex_app_server import CodexAppServerClient
 from usage_dashboard.server.db import Database
 from usage_dashboard.server.fetch_antigravity import (
     AntigravityConfig,
     fetch_antigravity_usage,
 )
-from usage_dashboard.server.fetch_claude import fetch_claude_usage, refresh_claude_token
 from usage_dashboard.server.fetch_codex import fetch_codex_usage
 from usage_dashboard.server.fetch_ollama import fetch_ollama_usage
 from usage_dashboard.server.fetch_opencode import fetch_opencode_usage
@@ -25,7 +27,6 @@ from usage_dashboard.server.fetch_types import (
 )
 from usage_dashboard.server.fetch_umans import fetch_umans_wallet
 from usage_dashboard.server.fetch_zai import fetch_zai_usage
-from usage_dashboard.server.token_store import TokenStore
 from usage_dashboard.shared.models import (
     THROTTLE_BOXED,
     THROTTLE_LOW_INTERACTIVITY,
@@ -53,6 +54,10 @@ _MAX_SLEEP_SECONDS = 1800.0
 # *and* a wrong workspace id. Codex joined this set in Plan 005 — the App
 # Server owns its tokens, so the dashboard has no refresh path at all.
 _REAUTH_DETAIL: dict[Provider, str] = {
+    # Plan 009: the official Claude Code CLI owns each account's credential
+    # and its refresh, so a rejection the CLI could not fix needs a re-login.
+    Provider.CLAUDE: "login required — sign in on /login",
+    Provider.CLAUDE_WORK: "login required — sign in on /login",
     Provider.OLLAMA: "cookie expired — re-login",
     Provider.OPENCODE: "cookie expired or bad workspace — re-login",
     Provider.CODEX: "login required — run `usage-dashboard login codex`",
@@ -81,12 +86,8 @@ class FetchScheduler:
     def __init__(
         self,
         db: Database,
-        claude_token: str | None = None,
-        claude_refresh_token: str | None = None,
-        claude_client_id: str | None = None,
-        claude_work_token: str | None = None,
-        claude_work_refresh_token: str | None = None,
-        claude_work_client_id: str | None = None,
+        claude_profile: ClaudeProfileConfig | None = None,
+        claude_work_profile: ClaudeProfileConfig | None = None,
         zai_key: str | None = None,
         zai_tokens_warn: int | None = None,
         zai_tokens_crit: int | None = None,
@@ -104,17 +105,14 @@ class FetchScheduler:
         failure_cap_seconds: int = 3600,
         change_epsilon: float = 0.5,
         reset_epsilon_seconds: float = 90.0,
-        token_store: TokenStore | None = None,
         retention_days: int = 7,
     ) -> None:
         self._db = db
-        self._claude_token = claude_token
-        self._claude_refresh_token = claude_refresh_token
-        self._claude_client_id = claude_client_id
-        self._claude_work_token = claude_work_token
-        self._claude_work_refresh_token = claude_work_refresh_token
-        self._claude_work_client_id = claude_work_client_id
-        self._token_store = token_store
+        # Plan 009: the official CLI owns each Claude account's credential
+        # (login, storage, refresh) under its CLAUDE_CONFIG_DIR. The scheduler
+        # holds where that profile lives, never a token.
+        self._claude_profile = claude_profile
+        self._claude_work_profile = claude_work_profile
         self._zai_key = zai_key
         # None = use the fetcher's defaults; set only what the env overrides.
         self._zai_overrides: dict[str, int] = {
@@ -363,15 +361,22 @@ class FetchScheduler:
 
     def _get_fetch_tasks(self) -> list[tuple[Provider, Callable[[], Reading]]]:
         tasks: list[tuple[Provider, Callable[[], Reading]]] = []
-        if self._claude_token is not None:
+        if self._claude_profile is not None:
             tasks.append(
-                (Provider.CLAUDE, partial(fetch_claude_usage, self._claude_token))
+                (
+                    Provider.CLAUDE,
+                    partial(fetch_claude_profile_usage, self._claude_profile, Provider.CLAUDE),
+                )
             )
-        if self._claude_work_token is not None:
+        if self._claude_work_profile is not None:
             tasks.append(
                 (
                     Provider.CLAUDE_WORK,
-                    partial(fetch_claude_usage, self._claude_work_token, Provider.CLAUDE_WORK),
+                    partial(
+                        fetch_claude_profile_usage,
+                        self._claude_work_profile,
+                        Provider.CLAUDE_WORK,
+                    ),
                 )
             )
         if self._zai_key is not None:
@@ -416,7 +421,7 @@ class FetchScheduler:
             )
         return tasks
 
-    def update_credentials(self, **credentials: str | None) -> None:
+    def update_credentials(self, **credentials: object) -> None:
         """Swap credential attributes mid-run (Plan 006).
 
         Enrolment writes a fresh credential into the token store; the login
@@ -428,12 +433,8 @@ class FetchScheduler:
         bug and fails loudly.
         """
         allowed = {
-            "claude_token",
-            "claude_refresh_token",
-            "claude_client_id",
-            "claude_work_token",
-            "claude_work_refresh_token",
-            "claude_work_client_id",
+            "claude_profile",
+            "claude_work_profile",
             "ollama_cookie",
             "opencode_workspace_id",
             "opencode_cookie",
@@ -490,60 +491,6 @@ class FetchScheduler:
         for provider, fetch_fn in self._get_fetch_tasks():
             self._fetch_one(provider, fetch_fn)
 
-    def _do_refresh(
-        self, refresh_token: str, client_id: str | None, store_key: str
-    ) -> tuple[str, str] | None:
-        """Refresh one Claude account's tokens and persist them under
-        *store_key*. Returns the new (access, refresh) pair, or None on failure.
-
-        The token endpoint rejects a ``refresh_token`` grant that omits
-        ``client_id`` (400 "Invalid request format", observed 2026-11-07 — the
-        outage Phase C's env removal exposed: refreshes had been silently
-        relying on ``CLAUDE_CLIENT_ID``). Resolve it explicitly: configured
-        value, else the store's enrolment metadata, else the public Claude Code
-        client every credential here belongs to.
-        """
-        resolved_client_id = client_id
-        if not resolved_client_id and self._token_store is not None:
-            stored = self._token_store.get_metadata(store_key, "client_id")
-            if isinstance(stored, str) and stored:
-                resolved_client_id = stored
-        if not resolved_client_id:
-            resolved_client_id = CLAUDE_CODE_CLIENT_ID
-        try:
-            new_access, new_refresh = refresh_claude_token(
-                refresh_token, client_id=resolved_client_id
-            )
-        except FetchError as exc:
-            logger.warning("Claude token refresh failed (%s): %s", store_key, exc)
-            return None
-        if self._token_store is not None:
-            self._token_store.save(store_key, new_access, new_refresh)
-            logger.info("Claude tokens refreshed and persisted (%s)", store_key)
-        else:
-            logger.info("Claude token refreshed, not persisted (%s)", store_key)
-        return new_access, new_refresh
-
-    def _try_refresh_claude(self) -> bool:
-        if self._claude_refresh_token is None:
-            return False
-        pair = self._do_refresh(self._claude_refresh_token, self._claude_client_id, "claude")
-        if pair is None:
-            return False
-        self._claude_token, self._claude_refresh_token = pair
-        return True
-
-    def _try_refresh_claude_work(self) -> bool:
-        if self._claude_work_refresh_token is None:
-            return False
-        pair = self._do_refresh(
-            self._claude_work_refresh_token, self._claude_work_client_id, "claude_work"
-        )
-        if pair is None:
-            return False
-        self._claude_work_token, self._claude_work_refresh_token = pair
-        return True
-
     def _fetch_one(
         self,
         provider: Provider,
@@ -556,17 +503,6 @@ class FetchScheduler:
             self._db.reset_failures(provider)
             self._schedule_after_success(provider, previous, reading)
         except FetchError as exc:
-            # Refresh only on credential rejection; refreshing on transient
-            # failures (429s, timeouts) spams the OAuth endpoint and risks
-            # rotating a refresh token shared with an interactive session. Each
-            # Claude account refreshes and retries with its own tokens.
-            if isinstance(exc, FetchAuthError):
-                if provider == Provider.CLAUDE and self._try_refresh_claude():
-                    if self._retry_claude(provider, previous, self._claude_token):
-                        return
-                elif provider == Provider.CLAUDE_WORK and self._try_refresh_claude_work():
-                    if self._retry_claude(provider, previous, self._claude_work_token):
-                        return
             if provider in _REAUTH_DETAIL and isinstance(exc, FetchAuthError):
                 self._record_auth_failure(provider, exc)
                 return
@@ -576,21 +512,6 @@ class FetchScheduler:
             # payload) must be contained; if it escapes, _run_loop's thread
             # dies and every provider stops fetching for the life of the pod.
             self._record_failure(provider, exc)
-
-    def _retry_claude(
-        self, provider: Provider, previous: Reading | None, token: str | None
-    ) -> bool:
-        """Re-fetch a Claude account after a token refresh. Returns True on
-        success (reading stored, schedule advanced), False to fall through to
-        the normal failure path."""
-        try:
-            reading = fetch_claude_usage(token or "", provider)
-        except FetchError:
-            return False
-        self._db.store_reading(reading)
-        self._db.reset_failures(provider)
-        self._schedule_after_success(provider, previous, reading)
-        return True
 
     def _failure_backoff(self, provider: Provider, failures: int, exc: Exception) -> float:
         """Seconds to wait before the next attempt after *failures* in a row.

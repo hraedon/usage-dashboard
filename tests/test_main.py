@@ -2,81 +2,70 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from usage_dashboard.server.main import _resolve_claude_tokens, _resolve_cookie
+import pytest
+
+from usage_dashboard.server.claude_profile import ClaudeProfileConfig
+from usage_dashboard.server.main import _resolve_claude_profile, _resolve_cookie
 from usage_dashboard.server.token_store import TokenStore
 
 
-class TestResolveClaudeTokens:
-    """Plan 005: the token store is authoritative, the Secret is only a seed."""
+class TestResolveClaudeProfile:
+    """Plan 009: an account is configured exactly when its CLI profile holds
+    a credential; the token store no longer carries Claude OAuth tokens."""
 
-    def test_first_boot_seeds_from_env(self, tmp_path: Path) -> None:
-        store = TokenStore(tmp_path / "tokens.json")
-        access, refresh = _resolve_claude_tokens(store, "a0", "r0")
-        assert (access, refresh) == ("a0", "r0")
-        assert store.load_claude_tokens() == ("a0", "r0")
+    @staticmethod
+    def _enrol(profile: Path) -> None:
+        profile.mkdir(parents=True)
+        (profile / ".credentials.json").write_text('{"claudeAiOauth": {}}')
 
-    def test_restart_keeps_refreshed_tokens(self, tmp_path: Path) -> None:
-        # WI-001 regression: after a refresh, a restart with the same (stale)
-        # Secret must NOT clobber the refreshed tokens.
-        path = tmp_path / "tokens.json"
-        store = TokenStore(path)
-        _resolve_claude_tokens(store, "a0", "r0")  # first boot
-        store.save_claude_tokens("a1", "r1")  # scheduler refreshed
+    @staticmethod
+    def _point_at(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR_PERSONAL", str(tmp_path / "personal"))
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR_WORK", str(tmp_path / "work"))
 
-        restarted = TokenStore(path)  # new process, same PVC
-        access, refresh = _resolve_claude_tokens(restarted, "a0", "r0")
-        assert (access, refresh) == ("a1", "r1")
-
-    def test_an_enrolled_credential_outranks_a_changed_secret(
-        self, tmp_path: Path
+    def test_no_profile_means_unconfigured(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # Behaviour change from the seed-marker scheme. Credentials are now
-        # created by `usage-dashboard login claude`, which writes to the store.
-        # A Secret edited afterwards holds a pair that has already been rotated
-        # away, so letting it win would log the dashboard out.
-        path = tmp_path / "tokens.json"
-        store = TokenStore(path)
-        _resolve_claude_tokens(store, "a0", "r0")
-        store.save_claude_tokens("enrolled-access", "enrolled-refresh")
-
-        restarted = TokenStore(path)
-        access, refresh = _resolve_claude_tokens(restarted, "a2", "r2")
-        assert (access, refresh) == ("enrolled-access", "enrolled-refresh")
-        assert restarted.load_claude_tokens() == ("enrolled-access", "enrolled-refresh")
-
-    def test_seeding_happens_only_into_an_empty_entry(self, tmp_path: Path) -> None:
-        path = tmp_path / "tokens.json"
-        store = TokenStore(path)
-        # A pre-Plan-005 deployment: credentials live only in the Secret.
-        assert store.get("claude_work") == (None, None)
-        assert _resolve_claude_tokens(store, "w0", "wr0", store_key="claude_work") == (
-            "w0",
-            "wr0",
-        )
-        assert store.get("claude_work") == ("w0", "wr0")
-        # ...and never again.
-        assert _resolve_claude_tokens(store, "w9", "wr9", store_key="claude_work") == (
-            "w0",
-            "wr0",
-        )
-
-    def test_accounts_resolve_independently(self, tmp_path: Path) -> None:
+        self._point_at(monkeypatch, tmp_path)
         store = TokenStore(tmp_path / "tokens.json")
-        _resolve_claude_tokens(store, "p0", "pr0", store_key="claude")
-        _resolve_claude_tokens(store, "w0", "wr0", store_key="claude_work")
-        assert store.get("claude") == ("p0", "pr0")
-        assert store.get("claude_work") == ("w0", "wr0")
+        assert _resolve_claude_profile(store, "claude", "claude") is None
+        assert _resolve_claude_profile(store, "claude_work", "claude") is None
 
-    def test_empty_env_uses_persisted(self, tmp_path: Path) -> None:
-        path = tmp_path / "tokens.json"
-        store = TokenStore(path)
-        store.save_claude_tokens("a1", "r1")
-        access, refresh = _resolve_claude_tokens(store, None, None)
-        assert (access, refresh) == ("a1", "r1")
-
-    def test_empty_env_and_empty_store(self, tmp_path: Path) -> None:
+    def test_an_enrolled_profile_is_configured(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._point_at(monkeypatch, tmp_path)
+        self._enrol(tmp_path / "work")
         store = TokenStore(tmp_path / "tokens.json")
-        assert _resolve_claude_tokens(store, None, None) == (None, None)
+        profile = _resolve_claude_profile(store, "claude_work", "/opt/claude")
+        assert profile == ClaudeProfileConfig(
+            config_dir=str(tmp_path / "work"), binary="/opt/claude"
+        )
+        assert _resolve_claude_profile(store, "claude", "claude") is None
+
+    def test_a_legacy_store_entry_is_never_used(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A pre-Plan-009 pair with no profile must not resurrect the
+        # dashboard as a refresher; it is reported and left for migration.
+        self._point_at(monkeypatch, tmp_path)
+        store = TokenStore(tmp_path / "tokens.json")
+        store.save("claude", "old-access", "old-refresh")
+        assert _resolve_claude_profile(store, "claude", "claude") is None
+        assert store.get("claude") == ("old-access", "old-refresh")
+
+    def test_a_legacy_entry_is_pruned_once_a_profile_exists(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._point_at(monkeypatch, tmp_path)
+        self._enrol(tmp_path / "personal")
+        store = TokenStore(tmp_path / "tokens.json")
+        store.save("claude", "old-access", "old-refresh")
+        store.set_seed_marker("claude", "m")
+        store.save_credential("ollama", "cookie")
+        assert _resolve_claude_profile(store, "claude", "claude") is not None
+        assert not store.has_entry("claude")
+        assert store.get_credential("ollama") == "cookie"
 
 
 class TestResolveCookie:

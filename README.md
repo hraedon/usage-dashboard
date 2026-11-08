@@ -200,10 +200,11 @@ Two things about this provider are worth knowing before you debug it:
 
 The Claude usage endpoint requires the `user:profile` OAuth scope. A
 `claude setup-token` is scoped for inference only and returns `403` here, and
-credentials copied from an interactive Claude session can't be used because the
-dashboard would rotate the refresh token out from under that session. So the
-dashboard enrols a **dedicated** credential through the official Claude Code
-login and becomes its sole refresher — see *Provider enrolment* below.
+credentials copied from an interactive Claude session can't be used because two
+refreshers would rotate the same refresh-token family out from under each other.
+So the dashboard enrols a **dedicated** credential through the official Claude
+Code login, into a persistent profile on the PVC whose CLI is that credential's
+sole refresher (Plan 009) — see *Provider enrolment* below.
 
 > **Support boundary, stated plainly.** Codex usage comes from a supported
 > interface: the official App Server's `account/rateLimits/read`. Claude usage
@@ -211,7 +212,9 @@ login and becomes its sole refresher — see *Provider enrolment* below.
 > reads the undocumented `GET /api/oauth/usage` and parses the credential file
 > Claude Code writes. Both of those dependencies are deliberately quarantined
 > (`fetch_claude.py`, `claude_credentials.py`) and fail closed, but they can
-> break on any Claude Code release.
+> break on any Claude Code release. Token *refresh* is no longer one of them:
+> since Plan 009 the official CLI performs it (`claude_profile.py`), so a change
+> to Anthropic's OAuth dialect is absorbed by bumping the pinned CLI.
 
 ### Provider enrolment (Plan 005)
 
@@ -220,8 +223,8 @@ own official CLI. Nothing is minted by this project, no token is printed, and
 nothing is pasted into a Kubernetes Secret. The server image ships pinned
 `codex` and `claude` binaries for exactly this purpose.
 
-Enrolment has to happen in the pod because the Longhorn PVC holding the token
-store is **RWO** — only the running server can mount it. Do not mount it from a
+Enrolment has to happen in the pod because the Longhorn PVC holding the
+credentials is **RWO** — only the running server can mount it. Do not mount it from a
 second live pod.
 
 ```bash
@@ -254,35 +257,43 @@ production: `offline` → `current` with the pod at zero restarts.
 > Set `CODEX_MODE=disabled`, roll the pod, run the login, then restore
 > `app_server` and roll again.
 
-#### Claude
+#### Claude (Plan 009: the CLI owns the credential)
 
-`login claude` runs the *official* Claude Code login in a throwaway config
-directory, imports the credential it writes into the dashboard's token store,
-and then **deletes that directory**. The deletion is the point: a refresh token
-has exactly one rightful refresher, and leaving a second copy behind would have
-both rotate the same family into a lockout.
+Each account has a persistent Claude Code profile on the PVC —
+`CLAUDE_CONFIG_DIR=/data/claude-personal` and `/data/claude-work`. `login claude`
+runs the *official* Claude Code login inside a staging sibling of that profile,
+checks the credential carries `user:profile` **and** can read the usage
+endpoint, and only then swaps it into place. A failed, abandoned or cancelled
+ceremony is deleted and never displaces a working login.
+
+The profile then **stays**: it *is* the credential, and the pod's `claude` CLI
+is the family's only refresher. The dashboard reads the access token from the
+profile's `.credentials.json` on each poll and never talks to a token endpoint.
+When the token is at (or within five minutes of) expiry, or the usage endpoint
+rejects it, the fetcher runs the CLI's zero-turn `claude -p /usage` once
+(~1 s, no model turn, no cost): the CLI refreshes, rotates the refresh token and
+rewrites the file atomically, and the fetcher re-reads it. That happens a few
+times a day per account, not every poll.
 
 ```bash
 # personal account
 kubectl -n usage-dashboard exec -it "$POD" -- usage-dashboard login claude --account personal
 
-# work account (independent tokens, independent rotation)
+# work account (independent profile, independent rotation)
 kubectl -n usage-dashboard exec -it "$POD" -- usage-dashboard login claude --account work
 ```
 
 Over SSH or in a container the login shows a code to paste back into the
-terminal. Before the store is touched, the command checks the credential
-actually carries `user:profile` **and** can read the usage endpoint — so a
-credential that cannot do the dashboard's job never displaces a working one.
-
-> `claude setup-token` cannot be used here. It mints an inference token without
-> the `user:profile` scope that the subscription-usage endpoint requires.
-
-Roll the server afterwards so the scheduler picks up the new credential:
+terminal. The `/login` pane runs the same ceremony and adopts the result
+immediately. From `kubectl exec`, an account that was already showing picks up
+the new login on its next poll; a newly added account needs a restart:
 
 ```bash
 kubectl -n usage-dashboard rollout restart deploy/usage-dashboard-server
 ```
+
+> `claude setup-token` cannot be used here. It mints an inference token without
+> the `user:profile` scope that the subscription-usage endpoint requires.
 
 The work account shows as a **second, muted set of bars in the Claude tile** —
 `me` and `work` — not a separate tile. With no work credential enrolled it stays
@@ -335,11 +346,13 @@ can never reach. `CODEX_HOME` settles at ~3 MB.
 
 #### Where credentials live
 
-`/data/tokens.json` on the PVC is **authoritative** for Claude. The
-`claude-*` Secret keys now only seed an *empty* store entry, so a pre-Plan-005
-deployment keeps working across the upgrade and can roll back. Once an entry
-exists, only enrolment replaces it — a stale Secret can no longer overwrite a
-freshly enrolled credential.
+Claude credentials live in the per-account CLI profiles
+(`/data/claude-personal`, `/data/claude-work`), owned by the official CLI
+(Plan 009). `/data/tokens.json` holds only the scraped session cookies and the
+OpenCode workspace id. A pre-Plan-009 Claude entry in it is never used: once a
+profile exists the server deletes the entry at startup; without one it logs a
+warning naming `scripts/migrate_claude_store_to_profile.py` (the one-off
+upgrade path, which moves the pair into a profile without a re-login).
 
 Codex keeps its own credentials under `/data/codex`; the dashboard never reads
 or writes them. The same holds for Antigravity under `/data/antigravity`. The
@@ -357,8 +370,10 @@ kubectl -n usage-dashboard logs deploy/usage-dashboard-server | grep -i codex
 - **`Codex App Server timed out …` / `… exited (code N)`** — transport or child
   process failure, not an auth problem. The scheduler backs off and retries; the
   next poll spawns a fresh process.
-- **Claude going offline after a 401** — the dashboard refreshes and retries
-  once by itself. Persistent failure means the refresh token is dead: re-enrol.
+- **Claude "login required — sign in on /login"** — the usage endpoint rejected
+  the token (or it expired) and one run of the CLI's `/usage` trigger did not
+  produce a new one: the refresh token is dead or revoked. Re-enrol. Look for
+  `Claude CLI refreshed the … credential` in the logs to see healthy refreshes.
 
 #### Rollback
 
@@ -368,8 +383,9 @@ Both halves are reversible for one soak period:
   `CODEX_CLIENT_ID`/`CODEX_ACCOUNT_ID` injection in the deployment. **Keep the
   old Secret values** until the new image has survived a token refresh and a
   pod restart.
-- Claude needs no rollback step: the `claude-*` Secret keys are still present
-  and the old image reads them directly.
+- Claude (Plan 009): the pre-009 image reads `/data/tokens.json`, whose Claude
+  entry the new server removed. Rolling back therefore means one re-enrolment
+  through the old image's pane; the profiles can stay on the PVC untouched.
 
 Delete the deprecated Secret keys only after the soak.
 

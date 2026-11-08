@@ -19,6 +19,8 @@ Key modules:
 - `src/usage_dashboard/server/codex_app_server.py` — client for the official `codex app-server` (JSONL over stdio). **Protocol facts in its docstring were verified against a real binary, not docs** — keep it that way. **One long-lived child** (`persistent=True`) — not one per fetch. Latency would allow per-fetch (~0.7s vs a 300s poll), but each *start* leaks ~29 kB of uncheckpointed SQLite WAL plus a `.tmp/git-*` dir into `CODEX_HOME`: ~8.3 MB/day, which fills the 1 GiB PVC — and the readings DB with it — in ~4 months. Growth is per-start, not per-request. Resident cost is ~92 MB RSS in production (plugins disabled). Plugins are disabled in the default args because an authenticated App Server otherwise downloads ~50 MB of plugin catalog and Office templates this client can never reach (55.9 MB → 3.1 MB). Never bound a read with `select()` here: the child writes notifications and responses together, and `select()` cannot see lines already in Python's buffer
 - `src/usage_dashboard/server/fetch_antigravity.py` — Google Antigravity via the official `agy` CLI (Plan 007): a **per-fetch** subprocess running the documented zero-turn `agy -p /usage --output-format json`. Facts in its docstring were **verified against agy 1.4.12, not docs**. Load-bearing flags: `--log-file /dev/null` (otherwise a new ~34 kB log per run, never pruned per run: ~10 MB/day; a fixed path *appends*), `AGY_CLI_DISABLE_AUTO_UPDATE=true` (`1` is silently ignored), `--disable-slash-commands=false` plus a `num_turns == 0` check (a saved setting can turn `/usage` into a model prompt). The child gets a minimal env allowlist, never the pod's secrets. Signed out, the CLI blocks 60 s on a paste prompt, so the fetch kills it on the prompt and reports an auth failure. Untouched buckets report a sliding "now + window" reset, which is dropped so the idle ladder can widen
 - `src/usage_dashboard/claude_credentials.py` — quarantined parser for Claude Code's `.credentials.json`. Fails closed and names the installed CLI version; it is the only place that knows that (undocumented) schema
+- `src/usage_dashboard/server/claude_profile.py` — Claude on the CLI ownership model (Plan 009). Each account has a persistent `CLAUDE_CONFIG_DIR` (`/data/claude-personal`, `/data/claude-work`); the fetcher reads the access token from the CLI's file per poll and **never refreshes**. At/near expiry or on a 401 it runs the zero-turn `claude -p /usage --output-format json --no-session-persistence` once (the CLI refreshes, rotates, rewrites atomically) and re-reads. Facts in its docstring were **verified against Claude Code 2.1.276 in the pod, not docs**: `claude auth status` does NOT refresh; `--bare` disables OAuth; `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` breaks `/usage`; a signed-out CLI also "succeeds", so the trigger's verdict is the re-read file, never its output. Throwaway `HOME` per run (~6 kB cache otherwise accumulates); `num_turns == 0` enforced
+- `src/usage_dashboard/server/cli_home.py` — shared one-owner lock + staging swap for CLI state dirs (Antigravity `HOME`, Claude `CLAUDE_CONFIG_DIR`)
 - `src/usage_dashboard/client/` — HTTP fetcher with adaptive refresh, pygame touch GUI
 - `src/usage_dashboard/deploy/` — `redeploy.py`: opt-in self-redeploy of the Pi's installer-managed components (units/scripts) from the pulled checkout (`AUTO_REDEPLOY=1`); driven by `deploy/pi/update.sh` via the root `usage-dashboard-redeploy` helper. Content-addressed + atomic-write + unit-verify + GUI rollback
 - `k8s/` — Kubernetes manifests for deployment
@@ -42,15 +44,20 @@ the server pod, via each vendor's official CLI (both pinned into the image):
   Server. Codex owns the tokens under `CODEX_HOME` (`/data/codex`). Nothing here
   mints, stores or refreshes an OpenAI token. Never run two App Server processes
   against one `CODEX_HOME`.
-- `usage-dashboard login claude --account personal|work` — runs the official
-  Claude Code login in a throwaway `CLAUDE_CONFIG_DIR`, imports the credential
-  into the token store, then **deletes** that directory. The deletion is
-  load-bearing: a refresh-token family must have exactly one refresher.
+- `usage-dashboard login claude --account personal|work` — Plan 009: runs the
+  official Claude Code login in a **staging** sibling of the account's
+  persistent `CLAUDE_CONFIG_DIR`, verifies scope + a live usage read, then swaps
+  it into place (`cli_home.install_home`). The profile **stays** — it is the
+  credential, and the pod's CLI is the family's one refresher. (Plan 005 did the
+  opposite: imported into the token store and deleted the profile, making the
+  dashboard the refresher; that broke on 2026-11-07 when the token endpoint
+  began requiring `client_id`.) Never copy a desktop Claude credential in.
 
-`/data/tokens.json` is authoritative for Claude; the `claude-*` Secret keys seed
-only an *empty* entry (deprecated, deleted in Phase C). The token store takes an
-advisory file lock because enrolment mutates it from a second process, and it
-fails closed on corrupt content rather than replacing it.
+`/data/tokens.json` holds only scraped cookies and the OpenCode workspace id. A
+leftover pre-009 Claude entry is never used; startup deletes it once a profile
+exists (`scripts/migrate_claude_store_to_profile.py` was the one-off upgrade).
+The token store takes an advisory file lock because enrolment mutates it from a
+second process, and it fails closed on corrupt content rather than replacing it.
 
 ## Browser enrolment pane (Plan 006)
 
@@ -77,12 +84,14 @@ and never displaces a working login. The pane lifts the Google link into
 steer the button elsewhere) and shows a countdown. Enabled by `ANTIGRAVITY_MODE=cli`; never copy a desktop token in.
 
 Claude usage remains an **unsupported** dependency (undocumented
-`GET /api/oauth/usage` plus that credential file); Codex usage is supported.
+`GET /api/oauth/usage` plus reading that credential file); Codex usage is
+supported. Claude token *refresh* is no longer ours: the CLI owns it (Plan 009).
 
 ## Hard rules
 
 - **Spec acceptance criteria are the boundary.** Don't add features beyond the spec without a tracked breadcrumb or plan entry.
 - **Don't reintroduce an OpenAI OAuth surface.** A test asserts no runtime string in `src/` contains the Codex client id, `auth.openai.com`, `codex_cli_rs` or `backend-api/wham/usage`.
+- **Don't reintroduce a Claude token refresh.** The official CLI is the only refresher (Plan 009). A test asserts no runtime string in `src/` contains the Claude Code client id, `oauth/token`, `grant_type` or `refresh_token` (token store excepted). Nothing in `src/` writes `.credentials.json` either.
 
 ## Work items / breadcrumbs
 

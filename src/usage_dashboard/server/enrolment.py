@@ -350,8 +350,6 @@ class EnrolmentService:
             "claude",
             "--account",
             account,
-            "--token-store",
-            str(self._token_store.path),
             "--claude-bin",
             self._claude_bin,
         ]

@@ -10,7 +10,7 @@ import httpx
 import pytest
 
 from usage_dashboard.server.codex_app_server import CodexLoginRequired
-from usage_dashboard.server.fetch_claude import fetch_claude_usage, refresh_claude_token
+from usage_dashboard.server.fetch_claude import fetch_claude_usage
 from usage_dashboard.server.fetch_codex import fetch_codex_usage, parse_rate_limits
 from usage_dashboard.server.fetch_ollama import _parse_relative_reset, fetch_ollama_usage
 from usage_dashboard.server.fetch_opencode import (
@@ -405,6 +405,29 @@ class TestFetchClaude:
         assert "Bearer my-secret-token" in str(headers) or any(
             "Bearer my-secret-token" in str(v) for v in headers.values()
         )
+
+    def test_no_claude_token_refresh_surface_remains(self):
+        """Plan 009: the official CLI is the only refresher of a Claude
+        credential family. The dashboard never POSTs a token grant, so no
+        runtime string may name the token endpoint, a grant, or the CLI's
+        OAuth client (docstrings and comments are excluded, as above)."""
+        forbidden = (
+            "9d1c250a-e61b-44d9-88ed-5944d1962f5e",  # Claude Code OAuth client id
+            "oauth/token",  # the token endpoint
+            "grant_type",  # any OAuth grant payload
+            "refresh_token",  # the dashboard holds none for Claude
+        )
+        offenders = []
+        for path in sorted(pathlib.Path("src/usage_dashboard").rglob("*.py")):
+            if path.name == "token_store.py":
+                # The store's generic (access, refresh) pair keys still serve
+                # the legacy Codex entry; it holds no Claude OAuth state.
+                continue
+            for literal in _runtime_string_constants(path):
+                for marker in forbidden:
+                    if marker in literal:
+                        offenders.append(f"{path}: {marker}")
+        assert not offenders, offenders
 
 
 class TestParseCodexRateLimits:
@@ -1055,96 +1078,6 @@ class TestFetchOllama:
         assert reading.session_percent == 72.5
         assert reading.weekly_percent is None
         assert reading.models is None
-
-
-class TestRefreshClaudeToken:
-    @patch("usage_dashboard.server.fetch_claude.httpx.post")
-    def test_refresh_returns_new_tokens(self, mock_post):
-        mock_response = MagicMock()
-        mock_response.json.return_value = {
-            "access_token": "new-access",
-            "refresh_token": "new-refresh",
-        }
-        mock_response.raise_for_status = MagicMock()
-        mock_post.return_value = mock_response
-
-        access, refresh = refresh_claude_token("old-refresh")
-        assert access == "new-access"
-        assert refresh == "new-refresh"
-
-    @patch("usage_dashboard.server.fetch_claude.httpx.post")
-    def test_refresh_uses_client_id_when_provided(self, mock_post):
-        mock_response = MagicMock()
-        mock_response.json.return_value = {
-            "access_token": "new-access",
-            "refresh_token": "new-refresh",
-        }
-        mock_response.raise_for_status = MagicMock()
-        mock_post.return_value = mock_response
-
-        refresh_claude_token("old-refresh", client_id="my-client-id")
-        call_args = mock_post.call_args
-        payload = call_args[1]["json"] if "json" in call_args[1] else call_args[0][1]
-        assert payload["client_id"] == "my-client-id"
-
-    @patch("usage_dashboard.server.fetch_claude.httpx.post")
-    def test_refresh_reuses_old_refresh_when_not_returned(self, mock_post):
-        mock_response = MagicMock()
-        mock_response.json.return_value = {
-            "access_token": "new-access",
-        }
-        mock_response.raise_for_status = MagicMock()
-        mock_post.return_value = mock_response
-
-        access, refresh = refresh_claude_token("old-refresh")
-        assert access == "new-access"
-        assert refresh == "old-refresh"
-
-    @patch("usage_dashboard.server.fetch_claude.httpx.post")
-    def test_refresh_raises_fetch_error_on_http_failure(self, mock_post):
-        mock_post.side_effect = httpx.HTTPError("fail")
-        try:
-            refresh_claude_token("old-refresh")
-            assert False, "Should have raised FetchError"
-        except FetchError:
-            pass
-
-    @patch("usage_dashboard.server.fetch_claude.httpx.post")
-    def test_refresh_failure_names_the_http_reason(self, mock_post):
-        # The 2026-11-07 outage was diagnosable only via cluster forensics
-        # because the log said just "HTTPStatusError". The status + bounded
-        # body snippet separate invalid_request (missing client_id) from
-        # invalid_grant (rotation race / revocation) at a glance.
-        mock_response = MagicMock()
-        mock_response.status_code = 400
-        mock_response.text = (
-            '{"error":{"type":"invalid_request_error",'
-            '"message":"Invalid request format"}}'
-        )
-        status_error = httpx.HTTPStatusError(
-            "400 Bad Request", request=MagicMock(), response=mock_response
-        )
-        mock_response.raise_for_status = MagicMock(side_effect=status_error)
-        mock_post.return_value = mock_response
-        try:
-            refresh_claude_token("old-refresh")
-            assert False, "Should have raised FetchError"
-        except FetchError as exc:
-            assert "HTTP 400" in str(exc)
-            assert "Invalid request format" in str(exc)
-
-    @patch("usage_dashboard.server.fetch_claude.httpx.post")
-    def test_refresh_raises_fetch_error_on_malformed_response(self, mock_post):
-        mock_response = MagicMock()
-        mock_response.json.return_value = {"no_access_token": True}
-        mock_response.raise_for_status = MagicMock()
-        mock_post.return_value = mock_response
-
-        try:
-            refresh_claude_token("old-refresh")
-            assert False, "Should have raised FetchError"
-        except FetchError:
-            pass
 
 
 class TestFetchErrorClassification:

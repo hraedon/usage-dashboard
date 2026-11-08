@@ -3,8 +3,8 @@
 Provider enrolment. Since Plan 005 the dashboard implements no OAuth flow of
 its own: Codex enrols through the official App Server's device-code login (and
 Codex keeps the tokens), and Claude enrols through the official Claude Code
-login, whose credential is imported into the dashboard's token store and then
-deleted from the temporary profile. Ollama and OpenCode Go still capture a
+login into a persistent per-account profile that the CLI keeps owning,
+refresh included (Plan 009). Ollama and OpenCode Go still capture a
 browser session cookie, which is all their usage pages expose. Google
 Antigravity (Plan 007) enrols through the official ``agy`` CLI's own sign-in,
 and the CLI keeps the Google token.
@@ -27,7 +27,6 @@ import shutil
 import signal
 import subprocess
 import sys
-import tempfile
 from collections.abc import Callable, Iterable, Mapping
 from pathlib import Path
 from typing import Any
@@ -53,31 +52,32 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Claude enrolment (Plan 005)
+# Claude enrolment (Plan 009, replacing Plan 005's import)
 #
-# The dashboard no longer implements Claude's authorization-code/PKCE flow.
-# Enrolment now drives the *official* Claude Code login in a throwaway config
-# directory, imports the credential it writes into the dashboard's own token
-# store, and then deletes that directory.
+# The dashboard implements no Claude OAuth at all. Enrolment drives the
+# *official* Claude Code login inside a staging sibling of the account's
+# persistent CLAUDE_CONFIG_DIR (/data/claude-personal, /data/claude-work),
+# proves the credential can read usage, and then swaps the staging directory
+# into place under the profile lock (cli_home.install_home). The profile then
+# STAYS: it is the credential, and its CLI is the family's only refresher.
 #
-# Deleting it is the point, not tidiness: a refresh token has exactly one
-# rightful refresher. If a copy were left behind under a Claude Code profile,
-# both it and the dashboard would rotate the same family and race each other
-# into a lockout (the WI-001 failure, re-created).
+# This inverts Plan 005's rule. There the profile was deleted so that the
+# dashboard could be the one refresher; that left the dashboard speaking
+# Anthropic's undocumented OAuth dialect, and it broke when the token
+# endpoint started requiring a client_id (2026-11-07).
 #
-# Two dependencies here remain unsupported and are deliberately quarantined:
-# reading `.credentials.json` (see claude_credentials.py) and calling
+# Two dependencies remain unsupported and deliberately quarantined: reading
+# `.credentials.json` (see claude_credentials.py) and calling
 # GET /api/oauth/usage. Anthropic exposes no documented subscription-quota API,
 # and `claude setup-token` cannot help — it mints an inference token without
 # the `user:profile` scope that endpoint requires.
 # ---------------------------------------------------------------------------
 
 DEFAULT_CLAUDE_BIN = "claude"
-# CLI account selector -> token-store key. The work account resolves and
-# refreshes independently of the personal one.
+# CLI account selector -> account key (claude_profile.DEFAULT_PROFILE_DIRS).
+# The work account resolves and# refreshes independently of the personal one.
 CLAUDE_ACCOUNT_KEYS = {"personal": "claude", "work": "claude_work"}
 _CREDENTIALS_FILENAME = ".credentials.json"
-_DEFAULT_TOKEN_STORE = "/data/tokens.json"
 
 
 def _claude_cli_version(claude_bin: str) -> str | None:
@@ -155,13 +155,15 @@ def _validate_usage_access(credential: ClaudeCredential, provider: Provider) -> 
 
 def login_claude(
     account: str = "personal",
-    token_store_path: str | None = None,
+    config_dir: str | None = None,
     claude_bin: str = DEFAULT_CLAUDE_BIN,
 ) -> None:
-    """Enrol a dedicated Claude credential via the official Claude Code login.
+    """Enrol a Claude account via the official Claude Code login (Plan 009).
 
-    Writes straight into the dashboard's token store on the PVC; no token is
-    ever printed, and nothing needs pasting into a Kubernetes Secret.
+    Signs in inside a staging directory and, only once the credential is
+    proven to read usage, swaps it in as the account's persistent profile. A
+    failed, abandoned or cancelled ceremony never displaces a working login.
+    No token is ever printed.
     """
     try:
         store_key = CLAUDE_ACCOUNT_KEYS[account]
@@ -173,43 +175,52 @@ def login_claude(
         )
         sys.exit(1)
     provider = Provider.CLAUDE if store_key == "claude" else Provider.CLAUDE_WORK
-    store_path = token_store_path or os.environ.get("TOKEN_STORE_PATH") or _DEFAULT_TOKEN_STORE
-    # POSIX-quarantined backend (fcntl file locking): imported at call time so
-    # importing this module stays portable (see the module docstring).
-    from usage_dashboard.server.token_store import TokenStore, TokenStoreError
+    # POSIX-quarantined backend (fcntl-locked profile swap): imported at call
+    # time so importing this module stays portable (see the module docstring).
+    from usage_dashboard.server.claude_profile import profile_dir
+    from usage_dashboard.server.cli_home import install_home, make_staging_home
 
-    print(f"Enrolling the '{account}' Claude account (token-store key: {store_key}).")
+    target = config_dir or profile_dir(store_key)
+    print(f"Enrolling the '{account}' Claude account (profile: {target}).")
     print("A one-time official Claude Code login follows. Over SSH or in a")
-    print("container it shows a code to paste back into this terminal.\n")
+    print("container it shows a code to paste back into this terminal.\n", flush=True)
 
-    # mkdtemp is 0700 by default; the credential must not be world-readable
-    # even for the seconds it exists.
-    config_dir = tempfile.mkdtemp(prefix="usage-dashboard-claude-login-")
+    previous_handler = signal.signal(signal.SIGTERM, _raise_on_sigterm)
+    staging: str | None = None
     try:
-        _run_official_claude_login(claude_bin, config_dir)
-        credential = _read_imported_credential(config_dir, claude_bin)
+        # A 0700 sibling of the profile, so the swap is a same-filesystem
+        # rename and the credential is never world-readable.
+        staging = make_staging_home(target)
+        _run_official_claude_login(claude_bin, staging)
+        credential = _read_imported_credential(staging, claude_bin)
         _validate_usage_access(credential, provider)
-        store = TokenStore(store_path)
-        store.save(
-            store_key,
-            credential.access_token,
-            credential.refresh_token,
-            metadata=credential.metadata(),
-        )
-    except (ClaudeCredentialError, TokenStoreError) as exc:
+        # Past this point the verified login goes live. A late cancel must not
+        # turn that into a reported failure (the pane would then skip the
+        # immediate fetch), so ignore SIGTERM for the few remaining lines.
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        install_home(staging, target)
+        staging = None
+    except (ClaudeCredentialError, OSError) as exc:
         print(f"\nEnrolment failed: {exc}", file=sys.stderr)
+        print("Your existing login, if any, is unchanged.", file=sys.stderr)
         sys.exit(1)
     finally:
-        # Non-negotiable: leaving this behind would give the credential family
-        # a second refresher.
-        shutil.rmtree(config_dir, ignore_errors=True)
+        # A pane cancel arrives as SIGTERM -> SystemExit (_raise_on_sigterm),
+        # which still runs this block; subprocess.run kills the login child.
+        if staging is not None:
+            signal.signal(signal.SIGTERM, previous_handler)
+            # A ceremony that did not complete must leave no second copy of
+            # a credential family behind.
+            shutil.rmtree(staging, ignore_errors=True)
 
     plan = credential.subscription_type or "unknown"
     print(f"\nClaude '{account}' enrolled successfully (plan: {plan}).")
-    print(f"  token store: {store_path}  key: {store_key}")
-    print("  temporary Claude Code credential store removed.")
-    print("\nRoll the server so the scheduler picks it up:")
+    print(f"  profile: {target}  (the Claude Code CLI owns and refreshes it)")
+    print("\nThe /login pane adopts it immediately. From `kubectl exec`, an")
+    print("account that was already showing picks it up on its next poll; a")
+    print("newly added one needs a restart:")
     print("  kubectl -n usage-dashboard rollout restart deploy/usage-dashboard-server")
+    signal.signal(signal.SIGTERM, previous_handler)
 
 
 # ---------------------------------------------------------------------------
@@ -548,13 +559,12 @@ def login_antigravity(
     """Sign a Google account into the Antigravity CLI under *home*."""
     # POSIX-quarantined backend (fcntl-locked staging homes): imported at call
     # time so importing this module stays portable (see the module docstring).
+    from usage_dashboard.server.cli_home import install_home, make_staging_home
     from usage_dashboard.server.fetch_antigravity import (
         ARGON_LABEL,
         DEFAULT_AGY_BIN,
         DEFAULT_ANTIGRAVITY_HOME,
         cli_env,
-        install_home,
-        make_staging_home,
         parse_result_text,
         parse_usage,
         usage_command,
@@ -661,10 +671,11 @@ def main() -> None:
         help="[claude] Which Claude account to enrol (default: personal)",
     )
     login_parser.add_argument(
-        "--token-store",
+        "--config-dir",
         default=None,
-        help="[claude] Path to the token store (default: $TOKEN_STORE_PATH or "
-        "/data/tokens.json)",
+        help="[claude] CLAUDE_CONFIG_DIR to enrol into (default: "
+        "$CLAUDE_CONFIG_DIR_PERSONAL/_WORK or /data/claude-personal|-work). "
+        "Must match the server's",
     )
     login_parser.add_argument(
         "--claude-bin",
@@ -726,7 +737,7 @@ def main() -> None:
         if args.provider == "claude":
             login_claude(
                 account=args.account,
-                token_store_path=args.token_store,
+                config_dir=args.config_dir,
                 claude_bin=args.claude_bin,
             )
         elif args.provider == "ollama":

@@ -1,7 +1,8 @@
 # Plan 009 — Claude credentials owned by the CLI (the Codex pattern)
 
-Status: proposed 2026-11-08, after the refresh-client_id outage (fix: PR 57,
-`fix/claude-refresh-client-id-20261108`). Not started.
+Status: implemented 2026-11-08 (branch `feat/plan-009-claude-cli-credentials-20261108`),
+after the refresh-client_id outage (fix: PR 57). WP-1 passed with a different
+trigger than proposed; see *WP-1 result* and *Deviations* below.
 
 ## Problem
 
@@ -40,6 +41,56 @@ Move Claude to the Codex ownership model, in the narrow form:
 
 Exactly one refresher per credential family: the CLI. The dashboard never
 POSTs to the token endpoint again.
+
+## WP-1 result (2026-11-08, Claude Code 2.1.276, in the server pod)
+
+Run against copies of the live personal credential in throwaway
+`CLAUDE_CONFIG_DIR`s; hashes compared, values never printed. The one rotation
+the spike caused was written straight back to the token store, verified with a
+live usage read, and adopted by a server restart (tile stayed current).
+
+| Question | `claude auth status --json` | `claude -p /usage --output-format json` |
+|---|---|---|
+| Refreshes an expired token? | **No.** File untouched (same mtime/inode) and still reports `loggedIn: true` | **Yes.** New access *and* refresh token, `expiresAt` +8 h, adds `refreshTokenExpiresAt`/`rateLimitTier` |
+| Cost | ~0.15 s, local only | ~1 s, `num_turns: 0`, `total_cost_usd: 0`, `local_command: "usage"` |
+| Write safety | n/a | Atomic: new inode (temp + rename), so torn reads are not a real risk |
+| Signed out | n/a | Exits 0 in ~40 ms with `is_error: false` and a session-cost summary, **not** usage, so the output is never the verdict; the re-read file is |
+
+Footprint per `-p /usage` run (3-run measurements): ~4.3 MB once (bundled
+skills) into the config dir; ~3 kB/run of session transcript under `projects/`
+(removed by `--no-session-persistence`); ~6 kB/run of cache under `HOME`
+(removed by a throwaway `HOME` per run). `--bare` is unusable (it disables
+OAuth). `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` breaks `/usage`.
+
+Concurrency: the CLI keeps a `.claude.json.lock` for its own config, but the
+fetcher does not rely on it. Every fetch holds the profile's `cli_home` file
+lock across read → trigger → re-read → usage call, which also excludes an
+enrolment swap.
+
+Side finding, deliberately not acted on: `-p /usage` prints the usage too
+("Current session: 10% used · resets …"), as prose. The read stays on
+`GET /api/oauth/usage` (structured JSON, existing parser); the prose is a
+known fallback if that endpoint closes to non-CLI callers.
+
+## Deviations from the proposal
+
+- **Trigger:** `claude -p /usage --output-format json --no-session-persistence`,
+  not `auth status`. It runs when the token is within 5 min of expiry
+  (`REFRESH_SKEW_SECONDS`) or after a 401. If the CLI declines to refresh a
+  token that is still valid, the fetch proceeds with it. Expired and not
+  refreshed, or a 401 the CLI cannot fix, means a re-login reading.
+- **Migration:** no forced re-login. WP-1 showed the CLI accepts and then
+  refreshes a minimal file (pair, expiry, scopes, plan), so the one-off
+  `scripts/migrate_claude_store_to_profile.py` moves the live pair into the
+  profile right before the rollout. It is a script, not server code: `src/`
+  never writes the CLI's credential format. Startup deletes the store entry
+  once a profile exists, and only logs a warning when none does.
+- **Shared code:** Antigravity's staging/lock helpers moved to
+  `server/cli_home.py` and serve both CLIs.
+- **Guard:** a test pins that no runtime string in `src/` names the Claude
+  Code client id, `oauth/token`, `grant_type` or `refresh_token` (the token
+  store's generic pair keys excepted). `refresh_claude_token` and
+  `CLAUDE_CODE_CLIENT_ID` are deleted.
 
 ## Non-goals
 

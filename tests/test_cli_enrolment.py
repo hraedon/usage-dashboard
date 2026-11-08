@@ -1,9 +1,8 @@
-"""Enrolment flows: official Claude Code login import, Codex device code.
+"""Enrolment flows: official Claude Code login, Codex device code.
 
-These replace the custom-PKCE tests deleted in Plan 005. The dashboard no
-longer implements either OAuth flow, so what is worth testing is the
-*importer's* fail-closed behaviour and the promise that no token is ever
-printed.
+The dashboard implements neither OAuth flow (Plans 005 and 009), so what is
+worth testing is the fail-closed staging swap (a failed ceremony never
+displaces a working login) and the promise that no token is ever printed.
 """
 from __future__ import annotations
 
@@ -14,17 +13,14 @@ from unittest.mock import patch
 
 import pytest
 
-from usage_dashboard.claude_credentials import (
-    CLAUDE_CODE_CLIENT_ID,
-    ClaudeCredentialError,
-)
+from usage_dashboard.claude_credentials import ClaudeCredentialError
 from usage_dashboard.cli import CLAUDE_ACCOUNT_KEYS, login_claude, login_codex
 from usage_dashboard.server.fetch_types import FetchError
 
 try:
-    from usage_dashboard.server.token_store import TokenStore
-except ModuleNotFoundError as exc:  # fcntl on non-POSIX: these ceremonies run on Linux
-    pytest.skip(f"requires the POSIX token store backend: {exc}", allow_module_level=True)
+    import fcntl  # noqa: F401
+except ModuleNotFoundError as exc:  # these ceremonies run on Linux only
+    pytest.skip(f"requires the POSIX locking backend: {exc}", allow_module_level=True)
 
 _ACCESS = "sk-ant-oat-ACCESSTOKENVALUE"
 _REFRESH = "sk-ant-ort-REFRESHTOKENVALUE"
@@ -67,14 +63,34 @@ DEFAULT_SCOPES = ["user:inference", "user:profile", "user:sessions:claude_code"]
 
 
 class TestClaudeEnrolment:
+    """Plan 009: the official login lands in a staging sibling of the
+    account's persistent profile and is swapped in only once verified."""
+
+    @staticmethod
+    def _profile(tmp_path: Path, name: str = "claude-personal") -> Path:
+        return tmp_path / name
+
+    @staticmethod
+    def _install_old_login(profile: Path, access: str = "old-access") -> None:
+        profile.mkdir(mode=0o700)
+        (profile / ".credentials.json").write_text(
+            json.dumps(_credential_file(access=access, scopes=DEFAULT_SCOPES))
+        )
+
+    @staticmethod
+    def _profile_access(profile: Path) -> str:
+        raw = json.loads((profile / ".credentials.json").read_text())
+        return str(raw["claudeAiOauth"]["accessToken"])
+
     def _run(
         self,
         tmp_path: Path,
         content: object | None = None,
         usage_side_effect: BaseException | None = None,
         account: str = "personal",
-    ) -> tuple[TokenStore, Callable[[str, str], None]]:
-        store_path = tmp_path / "tokens.json"
+        profile: Path | None = None,
+    ) -> tuple[Path, Callable[[str, str], None]]:
+        profile = profile or self._profile(tmp_path)
         fake_login = _writes(
             content if content is not None else _credential_file(scopes=DEFAULT_SCOPES)
         )
@@ -86,13 +102,17 @@ class TestClaudeEnrolment:
                 side_effect=usage_side_effect,
             ),
         ):
-            login_claude(account=account, token_store_path=str(store_path))
-        return TokenStore(store_path), fake_login
+            login_claude(account=account, config_dir=str(profile))
+        return profile, fake_login
 
-    def test_personal_and_work_map_to_separate_keys(self, tmp_path: Path) -> None:
+    def test_account_keys(self) -> None:
         assert CLAUDE_ACCOUNT_KEYS == {"personal": "claude", "work": "claude_work"}
 
-        store_path = tmp_path / "tokens.json"
+    def test_default_profile_dirs_are_per_account(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR_PERSONAL", str(tmp_path / "p"))
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR_WORK", str(tmp_path / "w"))
         for account, access in (("personal", "access-personal"), ("work", "access-work")):
             fake = _writes(_credential_file(access=access, scopes=DEFAULT_SCOPES))
             with (
@@ -100,34 +120,35 @@ class TestClaudeEnrolment:
                 patch("usage_dashboard.cli._claude_cli_version", return_value="2.1.276"),
                 patch("usage_dashboard.cli.fetch_claude_usage"),
             ):
-                login_claude(account=account, token_store_path=str(store_path))
+                login_claude(account=account)
+        assert self._profile_access(tmp_path / "p") == "access-personal"
+        assert self._profile_access(tmp_path / "w") == "access-work"
 
-        store = TokenStore(store_path)
-        assert store.get("claude")[0] == "access-personal"
-        assert store.get("claude_work")[0] == "access-work"
+    def test_login_runs_in_a_staging_sibling(self, tmp_path: Path) -> None:
+        profile, fake = self._run(tmp_path)
+        staging = Path(fake.config_dir)  # type: ignore[attr-defined]
+        # A sibling (same-filesystem rename), never the live profile itself.
+        assert staging.parent == profile.parent
+        assert staging != profile
+        assert not staging.exists()  # renamed into place
 
-    def test_known_schema_imports(self, tmp_path: Path) -> None:
-        store, _ = self._run(tmp_path)
-        assert store.get("claude") == (_ACCESS, _REFRESH)
-        assert store.get_metadata("claude", "subscription_type") == "pro"
-        assert store.get_metadata("claude", "scopes") == DEFAULT_SCOPES
+    def test_the_verified_profile_stays(self, tmp_path: Path) -> None:
+        # Plan 009 inverts Plan 005: the profile IS the credential, and its
+        # CLI is the family's only refresher. Deleting it would sign out.
+        profile, _ = self._run(tmp_path)
+        assert self._profile_access(profile) == _ACCESS
+        assert (profile.stat().st_mode & 0o777) == 0o700
 
-    def test_public_cli_client_id_is_stored_when_the_file_has_none(
-        self, tmp_path: Path
-    ) -> None:
-        # Claude Code 2.1.276 emits no clientId, but the token endpoint
-        # requires a client_id on every refresh (400 "Invalid request format"
-        # otherwise, observed 2026-11-07) — so enrolment persists the CLI's
-        # public client id, binary-verified in claude_credentials.py.
-        store, _ = self._run(tmp_path)
-        assert store.get_metadata("claude", "client_id") == CLAUDE_CODE_CLIENT_ID
+    def test_no_token_store_is_written(self, tmp_path: Path) -> None:
+        self._run(tmp_path)
+        assert not (tmp_path / "tokens.json").exists()
 
-    def test_temporary_credential_store_is_removed(self, tmp_path: Path) -> None:
-        _, fake = self._run(tmp_path)
-        config_dir = Path(fake.config_dir)  # type: ignore[attr-defined]
-        # Leaving this behind would give the credential family a second
-        # refresher and re-create the WI-001 rotation fight.
-        assert not config_dir.exists()
+    def test_reenrolment_replaces_the_old_login(self, tmp_path: Path) -> None:
+        profile = self._profile(tmp_path)
+        self._install_old_login(profile)
+        self._run(tmp_path, profile=profile)
+        assert self._profile_access(profile) == _ACCESS
+        assert not (tmp_path / "claude-personal.prev").exists()
 
     def test_nothing_secret_is_printed(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -137,23 +158,19 @@ class TestClaudeEnrolment:
         assert _ACCESS not in output.out + output.err
         assert _REFRESH not in output.out + output.err
 
-    def test_unknown_schema_fails_closed_and_names_the_version(
-        self, tmp_path: Path
-    ) -> None:
-        store_path = tmp_path / "tokens.json"
-        TokenStore(store_path).save("claude", "existing-access", "existing-refresh")
-        fake = _writes({"someOtherShape": {"token": "x"}})
-        with (
-            patch("usage_dashboard.cli._run_official_claude_login", fake),
-            patch("usage_dashboard.cli._claude_cli_version", return_value="2.1.276"),
-            patch("usage_dashboard.cli.fetch_claude_usage"),
-            pytest.raises(SystemExit) as exc,
-        ):
-            login_claude(account="personal", token_store_path=str(store_path))
+    def _assert_failure_keeps_old_login(self, tmp_path: Path, **run: Any) -> None:
+        profile = self._profile(tmp_path)
+        self._install_old_login(profile)
+        with pytest.raises(SystemExit) as exc:
+            self._run(tmp_path, profile=profile, **run)
         assert exc.value.code == 1
-        assert TokenStore(store_path).get("claude") == (
-            "existing-access",
-            "existing-refresh",
+        assert self._profile_access(profile) == "old-access"
+        leftovers = [p.name for p in tmp_path.iterdir() if ".enrol-" in p.name]
+        assert leftovers == [], "a failed ceremony left a second credential copy"
+
+    def test_unknown_schema_fails_closed(self, tmp_path: Path) -> None:
+        self._assert_failure_keeps_old_login(
+            tmp_path, content={"someOtherShape": {"token": "x"}}
         )
 
     def test_error_text_names_the_cli_version(self) -> None:
@@ -170,25 +187,15 @@ class TestClaudeEnrolment:
             {"claudeAiOauth": {"accessToken": _ACCESS}},  # no refresh token
         ],
     )
-    def test_missing_token_leaves_the_existing_entry(
+    def test_missing_token_keeps_the_old_login(
         self, tmp_path: Path, content: dict[str, Any]
     ) -> None:
-        store_path = tmp_path / "tokens.json"
-        TokenStore(store_path).save("claude", "old-access", "old-refresh")
-        fake = _writes(content)
-        with (
-            patch("usage_dashboard.cli._run_official_claude_login", fake),
-            patch("usage_dashboard.cli._claude_cli_version", return_value="2.1.276"),
-            patch("usage_dashboard.cli.fetch_claude_usage"),
-            pytest.raises(SystemExit),
-        ):
-            login_claude(account="personal", token_store_path=str(store_path))
-        assert TokenStore(store_path).get("claude") == ("old-access", "old-refresh")
+        self._assert_failure_keeps_old_login(tmp_path, content=content)
 
     def test_missing_profile_scope_is_rejected(self, tmp_path: Path) -> None:
-        store_path = tmp_path / "tokens.json"
-        TokenStore(store_path).save("claude", "old-access", "old-refresh")
         # What `claude setup-token` produces: inference, but no user:profile.
+        profile = self._profile(tmp_path)
+        self._install_old_login(profile)
         fake = _writes(_credential_file(scopes=["user:inference"]))
         with (
             patch("usage_dashboard.cli._run_official_claude_login", fake),
@@ -196,45 +203,32 @@ class TestClaudeEnrolment:
             patch("usage_dashboard.cli.fetch_claude_usage") as usage,
             pytest.raises(SystemExit),
         ):
-            login_claude(account="personal", token_store_path=str(store_path))
+            login_claude(account="personal", config_dir=str(profile))
         usage.assert_not_called()
-        assert TokenStore(store_path).get("claude") == ("old-access", "old-refresh")
+        assert self._profile_access(profile) == "old-access"
 
     def test_absent_scope_metadata_still_validates_live(self, tmp_path: Path) -> None:
         # No scopes in the file: the live call is the only thing that can tell
         # whether this credential can read usage.
-        store_path = tmp_path / "tokens.json"
+        profile = self._profile(tmp_path)
         fake = _writes(_credential_file(scopes=None))
         with (
             patch("usage_dashboard.cli._run_official_claude_login", fake),
             patch("usage_dashboard.cli._claude_cli_version", return_value="2.1.276"),
             patch("usage_dashboard.cli.fetch_claude_usage") as usage,
         ):
-            login_claude(account="personal", token_store_path=str(store_path))
+            login_claude(account="personal", config_dir=str(profile))
         usage.assert_called_once()
-        assert TokenStore(store_path).get("claude") == (_ACCESS, _REFRESH)
+        assert self._profile_access(profile) == _ACCESS
 
-    def test_403_during_validation_leaves_the_existing_entry(
-        self, tmp_path: Path
-    ) -> None:
-        store_path = tmp_path / "tokens.json"
-        TokenStore(store_path).save("claude", "old-access", "old-refresh")
-        fake = _writes(_credential_file(scopes=DEFAULT_SCOPES))
-        with (
-            patch("usage_dashboard.cli._run_official_claude_login", fake),
-            patch("usage_dashboard.cli._claude_cli_version", return_value="2.1.276"),
-            patch(
-                "usage_dashboard.cli.fetch_claude_usage",
-                side_effect=FetchError("Claude usage forbidden: HTTP 403"),
-            ),
-            pytest.raises(SystemExit),
-        ):
-            login_claude(account="personal", token_store_path=str(store_path))
-        assert TokenStore(store_path).get("claude") == ("old-access", "old-refresh")
+    def test_403_during_validation_keeps_the_old_login(self, tmp_path: Path) -> None:
+        self._assert_failure_keeps_old_login(
+            tmp_path, usage_side_effect=FetchError("Claude usage forbidden: HTTP 403")
+        )
 
-    def test_a_failed_login_leaves_the_existing_entry(self, tmp_path: Path) -> None:
-        store_path = tmp_path / "tokens.json"
-        TokenStore(store_path).save("claude", "old-access", "old-refresh")
+    def test_a_failed_login_keeps_the_old_login(self, tmp_path: Path) -> None:
+        profile = self._profile(tmp_path)
+        self._install_old_login(profile)
 
         def fails(claude_bin: str, config_dir: str) -> None:
             raise ClaudeCredentialError("Claude Code login exited with status 1")
@@ -244,33 +238,63 @@ class TestClaudeEnrolment:
             patch("usage_dashboard.cli.fetch_claude_usage"),
             pytest.raises(SystemExit),
         ):
-            login_claude(account="personal", token_store_path=str(store_path))
-        assert TokenStore(store_path).get("claude") == ("old-access", "old-refresh")
+            login_claude(account="personal", config_dir=str(profile))
+        assert self._profile_access(profile) == "old-access"
+        assert [p.name for p in tmp_path.iterdir() if ".enrol-" in p.name] == []
+
+    def test_a_cancel_mid_ceremony_keeps_the_old_login(self, tmp_path: Path) -> None:
+        # The pane cancels with SIGTERM, which _raise_on_sigterm turns into
+        # SystemExit; the staging copy must still be removed.
+        profile = self._profile(tmp_path)
+        self._install_old_login(profile)
+
+        def cancelled(claude_bin: str, config_dir: str) -> None:
+            Path(config_dir, ".credentials.json").write_text(
+                json.dumps(_credential_file(scopes=DEFAULT_SCOPES))
+            )
+            raise SystemExit(143)
+
+        with (
+            patch("usage_dashboard.cli._run_official_claude_login", cancelled),
+            patch("usage_dashboard.cli.fetch_claude_usage"),
+            pytest.raises(SystemExit),
+        ):
+            login_claude(account="personal", config_dir=str(profile))
+        assert self._profile_access(profile) == "old-access"
+        assert [p.name for p in tmp_path.iterdir() if ".enrol-" in p.name] == []
 
     def test_enrolling_one_account_leaves_the_other_untouched(
         self, tmp_path: Path
     ) -> None:
-        store_path = tmp_path / "tokens.json"
-        store = TokenStore(store_path)
-        store.save("claude", "personal-access", "personal-refresh")
-        store.save("claude_work", "work-access", "work-refresh")
-
-        fake = _writes(_credential_file(access="new-work", scopes=DEFAULT_SCOPES))
-        with (
-            patch("usage_dashboard.cli._run_official_claude_login", fake),
-            patch("usage_dashboard.cli._claude_cli_version", return_value="2.1.276"),
-            patch("usage_dashboard.cli.fetch_claude_usage"),
-        ):
-            login_claude(account="work", token_store_path=str(store_path))
-
-        reloaded = TokenStore(store_path)
-        assert reloaded.get("claude") == ("personal-access", "personal-refresh")
-        assert reloaded.get("claude_work")[0] == "new-work"
+        personal = self._profile(tmp_path, "claude-personal")
+        work = self._profile(tmp_path, "claude-work")
+        self._install_old_login(personal, access="personal-access")
+        self._install_old_login(work, access="work-access")
+        self._run(
+            tmp_path,
+            content=_credential_file(access="new-work", scopes=DEFAULT_SCOPES),
+            account="work",
+            profile=work,
+        )
+        assert self._profile_access(personal) == "personal-access"
+        assert self._profile_access(work) == "new-work"
 
     def test_unknown_account_selector_exits(self, tmp_path: Path) -> None:
         with pytest.raises(SystemExit) as exc:
-            login_claude(account="nope", token_store_path=str(tmp_path / "t.json"))
+            login_claude(account="nope", config_dir=str(tmp_path / "x"))
         assert exc.value.code == 1
+
+    def test_sigterm_handler_is_restored(self, tmp_path: Path) -> None:
+        # The swap ignores SIGTERM briefly; a leaked SIG_IGN would be
+        # inherited by every child this process later spawns.
+        import signal
+
+        before = signal.getsignal(signal.SIGTERM)
+        self._run(tmp_path)
+        assert signal.getsignal(signal.SIGTERM) is before
+        with pytest.raises(SystemExit):
+            self._run(tmp_path, content={"someOtherShape": {}})
+        assert signal.getsignal(signal.SIGTERM) is before
 
 
 class _FakeCodexClient:

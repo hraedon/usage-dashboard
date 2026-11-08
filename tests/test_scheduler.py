@@ -5,12 +5,11 @@ from datetime import datetime, timedelta, timezone
 from functools import partial
 from unittest.mock import MagicMock
 
-from usage_dashboard.claude_credentials import CLAUDE_CODE_CLIENT_ID
+from usage_dashboard.server.claude_profile import ClaudeProfileConfig
 from usage_dashboard.server.db import Database
 from usage_dashboard.server.fetch_antigravity import AntigravityConfig
 from usage_dashboard.server.fetch_types import FetchAuthError, FetchError
 from usage_dashboard.server.scheduler import FetchScheduler
-from usage_dashboard.server.token_store import TokenStore
 from usage_dashboard.shared.models import (
     ALERT_WARN,
     THROTTLE_BOXED,
@@ -23,6 +22,11 @@ from usage_dashboard.shared.models import (
     ReadingStatus,
     ScopedLimit,
 )
+
+# Plan 009: a Claude account is configured by its CLI profile. These paths are
+# never touched — the fetch functions are mocked or patched in every test.
+_CLAUDE = ClaudeProfileConfig(config_dir="/nonexistent/claude-personal")
+_CLAUDE_WORK = ClaudeProfileConfig(config_dir="/nonexistent/claude-work")
 
 
 def _make_reading(**overrides: object) -> Reading:
@@ -46,7 +50,7 @@ class TestFetchSchedulerSuccessful:
         db.initialize()
         reading = _make_reading(provider=Provider.CLAUDE)
         fetch_fn = MagicMock(return_value=reading)
-        scheduler = FetchScheduler(db, claude_token="token")
+        scheduler = FetchScheduler(db, claude_profile=_CLAUDE)
         scheduler._fetch_one(Provider.CLAUDE, fetch_fn)
         result = db.get_latest_readings()
         assert Provider.CLAUDE in result
@@ -59,7 +63,7 @@ class TestFetchSchedulerSuccessful:
         db.increment_failures(Provider.CLAUDE)
         reading = _make_reading(provider=Provider.CLAUDE)
         fetch_fn = MagicMock(return_value=reading)
-        scheduler = FetchScheduler(db, claude_token="token")
+        scheduler = FetchScheduler(db, claude_profile=_CLAUDE)
         scheduler._fetch_one(Provider.CLAUDE, fetch_fn)
         assert db.get_consecutive_failures(Provider.CLAUDE) == 0
 
@@ -69,7 +73,7 @@ class TestFetchSchedulerSuccessful:
         db.increment_failures(Provider.CLAUDE)
         reading = _make_reading(provider=Provider.CLAUDE)
         fetch_fn = MagicMock(return_value=reading)
-        scheduler = FetchScheduler(db, claude_token="token")
+        scheduler = FetchScheduler(db, claude_profile=_CLAUDE)
         scheduler._fetch_one(Provider.CLAUDE, fetch_fn)
         assert db.get_consecutive_failures(Provider.CLAUDE) == 0
 
@@ -79,7 +83,7 @@ class TestFetchSchedulerFailed:
         db = Database(str(tmp_path / "sched.db"))
         db.initialize()
         fetch_fn = MagicMock(side_effect=FetchError("fail"))
-        scheduler = FetchScheduler(db, claude_token="token")
+        scheduler = FetchScheduler(db, claude_profile=_CLAUDE)
         scheduler._fetch_one(Provider.CLAUDE, fetch_fn)
         assert db.get_consecutive_failures(Provider.CLAUDE) == 1
 
@@ -91,7 +95,7 @@ class TestFetchSchedulerFailed:
         )
         db.store_reading(original)
         fetch_fn = MagicMock(side_effect=FetchError("fail"))
-        scheduler = FetchScheduler(db, claude_token="token")
+        scheduler = FetchScheduler(db, claude_profile=_CLAUDE)
         scheduler._fetch_one(Provider.CLAUDE, fetch_fn)
         result = db.get_latest_readings()
         assert result[Provider.CLAUDE].stale is True
@@ -101,7 +105,7 @@ class TestFetchSchedulerFailed:
         db = Database(str(tmp_path / "sched.db"))
         db.initialize()
         fetch_fn = MagicMock(side_effect=FetchError("fail"))
-        scheduler = FetchScheduler(db, claude_token="token")
+        scheduler = FetchScheduler(db, claude_profile=_CLAUDE)
         scheduler._fetch_one(Provider.CLAUDE, fetch_fn)
         result = db.get_latest_readings()
         assert result[Provider.CLAUDE].stale is True
@@ -112,7 +116,7 @@ class TestFetchSchedulerFailed:
         original = _make_reading(provider=Provider.CLAUDE)
         db.store_reading(original)
         fetch_fn = MagicMock(side_effect=FetchError("fail"))
-        scheduler = FetchScheduler(db, claude_token="token", offline_threshold=24)
+        scheduler = FetchScheduler(db, claude_profile=_CLAUDE, offline_threshold=24)
         for _ in range(24):
             scheduler._fetch_one(Provider.CLAUDE, fetch_fn)
         result = db.get_latest_readings()
@@ -125,7 +129,7 @@ class TestFetchSchedulerFailed:
         original = _make_reading(provider=Provider.CLAUDE)
         db.store_reading(original)
         fetch_fn = MagicMock(side_effect=FetchError("fail"))
-        scheduler = FetchScheduler(db, claude_token="token", offline_threshold=24)
+        scheduler = FetchScheduler(db, claude_profile=_CLAUDE, offline_threshold=24)
         for _ in range(23):
             scheduler._fetch_one(Provider.CLAUDE, fetch_fn)
         result = db.get_latest_readings()
@@ -137,7 +141,7 @@ class TestFetchSchedulerFailed:
         original = _make_reading(provider=Provider.CLAUDE)
         db.store_reading(original)
         fetch_fn = MagicMock(side_effect=FetchError("fail"))
-        scheduler = FetchScheduler(db, claude_token="token", offline_threshold=3)
+        scheduler = FetchScheduler(db, claude_profile=_CLAUDE, offline_threshold=3)
         for _ in range(3):
             scheduler._fetch_one(Provider.CLAUDE, fetch_fn)
         result = db.get_latest_readings()
@@ -169,7 +173,7 @@ class TestFetchSchedulerNoProviders:
     def test_only_claude_configured(self, tmp_path):
         db = Database(str(tmp_path / "sched.db"))
         db.initialize()
-        scheduler = FetchScheduler(db, claude_token="token")
+        scheduler = FetchScheduler(db, claude_profile=_CLAUDE)
         tasks = scheduler._get_fetch_tasks()
         assert len(tasks) == 1
         assert tasks[0][0] is Provider.CLAUDE
@@ -225,7 +229,7 @@ class TestFetchNow:
     def test_fetch_now_fetches_all_configured_providers(self, tmp_path):
         db = Database(str(tmp_path / "sched.db"))
         db.initialize()
-        scheduler = FetchScheduler(db, claude_token="c", zai_key="z")
+        scheduler = FetchScheduler(db, claude_profile=_CLAUDE, zai_key="z")
         scheduler._fetch_one = MagicMock()  # type: ignore[method-assign]
         scheduler.fetch_now()
         assert scheduler._fetch_one.call_count == 2
@@ -249,7 +253,7 @@ class TestFetchNow:
         db = Database(str(tmp_path / "sched.db"))
         db.initialize()
         scheduler = FetchScheduler(
-            db, claude_token="token", interval_seconds=300, failure_cap_seconds=3600
+            db, claude_profile=_CLAUDE, interval_seconds=300, failure_cap_seconds=3600
         )
         scheduler._fetch_one(  # put claude in a failure backoff
             Provider.CLAUDE, MagicMock(side_effect=FetchError("boom"))
@@ -258,7 +262,7 @@ class TestFetchNow:
         assert scheduler._is_blocked(Provider.CLAUDE, now)
         reading = _make_reading(provider=Provider.CLAUDE, session_percent=50.0)
         with patch(
-            "usage_dashboard.server.scheduler.fetch_claude_usage", return_value=reading,
+            "usage_dashboard.server.scheduler.fetch_claude_profile_usage", return_value=reading,
         ):
             scheduler.fetch_now()
         stored = db.get_latest_readings()[Provider.CLAUDE]
@@ -269,46 +273,12 @@ class TestFetchNow:
         assert not scheduler._is_blocked(Provider.CLAUDE, now + timedelta(seconds=310))
 
 
-class TestClaudeRefreshGating:
-    def test_no_refresh_attempt_on_transient_failure(self, tmp_path):
-        db = Database(str(tmp_path / "sched.db"))
-        db.initialize()
-        scheduler = FetchScheduler(
-            db, claude_token="token", claude_refresh_token="refresh"
-        )
-        scheduler._try_refresh_claude = MagicMock(return_value=True)  # type: ignore[method-assign]
-        fetch_fn = MagicMock(side_effect=FetchError("HTTP 429"))
-        scheduler._fetch_one(Provider.CLAUDE, fetch_fn)
-        scheduler._try_refresh_claude.assert_not_called()
-
-    def test_refresh_attempted_on_auth_failure(self, tmp_path):
-        from unittest.mock import patch
-
-        from usage_dashboard.server.fetch_types import FetchAuthError
-
-        db = Database(str(tmp_path / "sched.db"))
-        db.initialize()
-        scheduler = FetchScheduler(
-            db, claude_token="token", claude_refresh_token="refresh"
-        )
-        scheduler._try_refresh_claude = MagicMock(return_value=True)  # type: ignore[method-assign]
-        fetch_fn = MagicMock(side_effect=FetchAuthError("HTTP 401"))
-        retry_reading = _make_reading(provider=Provider.CLAUDE)
-        with patch(
-            "usage_dashboard.server.scheduler.fetch_claude_usage",
-            return_value=retry_reading,
-        ):
-            scheduler._fetch_one(Provider.CLAUDE, fetch_fn)
-        scheduler._try_refresh_claude.assert_called_once()
-        assert db.get_latest_readings()[Provider.CLAUDE].status is ReadingStatus.CURRENT
-
-
 class TestClaudeWorkAccount:
     def test_work_account_is_a_separate_fetch_task(self, tmp_path):
         db = Database(str(tmp_path / "sched.db"))
         db.initialize()
         scheduler = FetchScheduler(
-            db, claude_token="personal", claude_work_token="work"
+            db, claude_profile=_CLAUDE, claude_work_profile=_CLAUDE_WORK
         )
         assert scheduler.configured_providers() == [
             Provider.CLAUDE, Provider.CLAUDE_WORK
@@ -317,13 +287,13 @@ class TestClaudeWorkAccount:
     def test_no_work_account_when_unconfigured(self, tmp_path):
         db = Database(str(tmp_path / "sched.db"))
         db.initialize()
-        scheduler = FetchScheduler(db, claude_token="personal")
+        scheduler = FetchScheduler(db, claude_profile=_CLAUDE)
         assert Provider.CLAUDE_WORK not in scheduler.configured_providers()
 
     def test_work_fetch_stores_under_its_own_provider(self, tmp_path):
         db = Database(str(tmp_path / "sched.db"))
         db.initialize()
-        scheduler = FetchScheduler(db, claude_work_token="work")
+        scheduler = FetchScheduler(db, claude_work_profile=_CLAUDE_WORK)
         reading = _make_reading(provider=Provider.CLAUDE_WORK, session_percent=12.0)
         scheduler._fetch_one(Provider.CLAUDE_WORK, MagicMock(return_value=reading))
         stored = db.get_latest_readings()
@@ -334,141 +304,67 @@ class TestClaudeWorkAccount:
     def test_work_fetch_task_passes_claude_work_provider(self, tmp_path):
         db = Database(str(tmp_path / "sched.db"))
         db.initialize()
-        scheduler = FetchScheduler(db, claude_work_token="work")
+        scheduler = FetchScheduler(db, claude_work_profile=_CLAUDE_WORK)
         tasks = scheduler._get_fetch_tasks()
         assert len(tasks) == 1
         provider, fetch_fn = tasks[0]
         assert provider is Provider.CLAUDE_WORK
-        # The partial should bind Provider.CLAUDE_WORK as the provider arg
-        # (second positional after the token).
-        assert fetch_fn.args == ("work", Provider.CLAUDE_WORK)
+        # The partial binds the work profile and Provider.CLAUDE_WORK.
+        assert fetch_fn.args == (_CLAUDE_WORK, Provider.CLAUDE_WORK)
 
-    def test_work_refresh_persists_under_claude_work_key(self, tmp_path):
-        from unittest.mock import patch
+class TestClaudeCliOwnedCredentials:
+    """Plan 009: the CLI owns refresh, so the scheduler has nothing to
+    refresh or retry; a rejection the CLI could not fix is a re-login."""
 
+    def test_auth_failure_is_a_reauth_reading_without_retry(self, tmp_path):
         db = Database(str(tmp_path / "sched.db"))
         db.initialize()
-        token_store = TokenStore(str(tmp_path / "tokens.json"))
-        scheduler = FetchScheduler(
-            db,
-            claude_token="p-access",
-            claude_refresh_token="p-refresh",
-            claude_work_token="w-access",
-            claude_work_refresh_token="w-refresh",
-            token_store=token_store,
-        )
-        with patch(
-            "usage_dashboard.server.scheduler.refresh_claude_token",
-            return_value=("new-w-access", "new-w-refresh"),
-        ):
-            assert scheduler._try_refresh_claude_work() is True
-        # Work tokens persisted to their own namespace; personal untouched.
-        assert token_store.get("claude_work") == ("new-w-access", "new-w-refresh")
-        assert token_store.get("claude") == (None, None)
-        assert scheduler._claude_work_token == "new-w-access"
-        assert scheduler._claude_token == "p-access"
-
-    def test_auth_failure_refreshes_the_work_account(self, tmp_path):
-        from unittest.mock import patch
-
-        from usage_dashboard.server.fetch_types import FetchAuthError
-
-        db = Database(str(tmp_path / "sched.db"))
-        db.initialize()
-        scheduler = FetchScheduler(db, claude_work_token="work")
-        scheduler._try_refresh_claude_work = MagicMock(return_value=True)  # type: ignore[method-assign]
-        scheduler._try_refresh_claude = MagicMock(return_value=True)  # type: ignore[method-assign]
+        scheduler = FetchScheduler(db, claude_profile=_CLAUDE)
         fetch_fn = MagicMock(side_effect=FetchAuthError("HTTP 401"))
-        retry_reading = _make_reading(provider=Provider.CLAUDE_WORK)
-        with patch(
-            "usage_dashboard.server.scheduler.fetch_claude_usage",
-            return_value=retry_reading,
-        ):
-            scheduler._fetch_one(Provider.CLAUDE_WORK, fetch_fn)
-        scheduler._try_refresh_claude_work.assert_called_once()
-        scheduler._try_refresh_claude.assert_not_called()  # only the work account
-        assert db.get_latest_readings()[Provider.CLAUDE_WORK].status is ReadingStatus.CURRENT
+        scheduler._fetch_one(Provider.CLAUDE, fetch_fn)
+        fetch_fn.assert_called_once()
+        reading = db.get_latest_readings()[Provider.CLAUDE]
+        assert reading.status is ReadingStatus.OFFLINE
+        assert reading.detail == "login required — sign in on /login"
 
-
-class TestRefreshClientIdResolution:
-    """The refresh grant's client_id: explicit config > store metadata > the
-    public Claude Code client. The token endpoint answers a client-id-less
-    refresh with 400 "Invalid request format" (observed 2026-11-07), which is
-    the outage Plan 005 Phase C's env removal exposed — refreshes had been
-    silently relying on the CLAUDE_CLIENT_ID env ever since."""
-
-    def _refresh_call_client_id(self, scheduler):
-        """Run one personal refresh and return the client_id it sent."""
-        from unittest.mock import patch
-
-        with patch(
-            "usage_dashboard.server.scheduler.refresh_claude_token",
-            return_value=("new-access", "new-refresh"),
-        ) as mock_refresh:
-            assert scheduler._try_refresh_claude() is True
-        _, kwargs = mock_refresh.call_args
-        return kwargs.get("client_id")
-
-    def test_store_metadata_supplies_the_client_id(self, tmp_path):
-        db = Database(str(tmp_path / "sched.db"))
-        db.initialize()
-        token_store = TokenStore(str(tmp_path / "tokens.json"))
-        # Enrolment-shaped entry: metadata carries the client id, the
-        # constructor arg (old CLAUDE_CLIENT_ID env) is gone — post-Phase C.
-        token_store.save(
-            "claude", "access", "refresh", metadata={"client_id": "stored-client"}
-        )
-        scheduler = FetchScheduler(
-            db,
-            claude_token="access",
-            claude_refresh_token="refresh",
-            token_store=token_store,
-        )
-        assert self._refresh_call_client_id(scheduler) == "stored-client"
-
-    def test_falls_back_to_the_public_cli_client_id(self, tmp_path):
-        db = Database(str(tmp_path / "sched.db"))
-        db.initialize()
-        # The live store at fix time: enrolled before metadata carried a
-        # client id, and the env wiring is gone. The public client is correct
-        # for every credential this system holds.
-        token_store = TokenStore(str(tmp_path / "tokens.json"))
-        token_store.save("claude", "access", "refresh")
-        scheduler = FetchScheduler(
-            db,
-            claude_token="access",
-            claude_refresh_token="refresh",
-            token_store=token_store,
-        )
-        assert (
-            self._refresh_call_client_id(scheduler) == CLAUDE_CODE_CLIENT_ID
-        )
-
-    def test_falls_back_with_no_token_store_at_all(self, tmp_path):
+    def test_work_auth_failure_is_its_own_reauth(self, tmp_path):
         db = Database(str(tmp_path / "sched.db"))
         db.initialize()
         scheduler = FetchScheduler(
-            db, claude_token="access", claude_refresh_token="refresh"
+            db, claude_profile=_CLAUDE, claude_work_profile=_CLAUDE_WORK
         )
-        assert (
-            self._refresh_call_client_id(scheduler) == CLAUDE_CODE_CLIENT_ID
+        scheduler._fetch_one(
+            Provider.CLAUDE_WORK, MagicMock(side_effect=FetchAuthError("HTTP 401"))
         )
+        latest = db.get_latest_readings()
+        assert latest[Provider.CLAUDE_WORK].detail == "login required — sign in on /login"
+        assert Provider.CLAUDE not in latest
 
-    def test_explicit_client_id_wins_over_store_metadata(self, tmp_path):
+    def test_transient_failure_is_an_ordinary_backoff(self, tmp_path):
         db = Database(str(tmp_path / "sched.db"))
         db.initialize()
-        token_store = TokenStore(str(tmp_path / "tokens.json"))
-        token_store.save(
-            "claude", "access", "refresh", metadata={"client_id": "stored-client"}
-        )
-        scheduler = FetchScheduler(
-            db,
-            claude_token="access",
-            claude_refresh_token="refresh",
-            claude_client_id="configured-client",
-            token_store=token_store,
-        )
-        assert self._refresh_call_client_id(scheduler) == "configured-client"
+        scheduler = FetchScheduler(db, claude_profile=_CLAUDE)
+        scheduler._fetch_one(Provider.CLAUDE, MagicMock(side_effect=FetchError("HTTP 500")))
+        assert scheduler.schedule_snapshot()[Provider.CLAUDE]["failures"] == 1
+
+    def test_enrolment_adopts_a_new_profile_without_a_restart(self, tmp_path):
+        db = Database(str(tmp_path / "sched.db"))
+        db.initialize()
+        scheduler = FetchScheduler(db)
+        assert Provider.CLAUDE_WORK not in scheduler.configured_providers()
+        scheduler.update_credentials(claude_work_profile=_CLAUDE_WORK)
+        assert scheduler.configured_providers() == [Provider.CLAUDE_WORK]
+        scheduler.update_credentials(claude_work_profile=None)
+        assert scheduler.configured_providers() == []
+
+    def test_token_attributes_are_no_longer_credentials(self, tmp_path):
+        import pytest
+
+        db = Database(str(tmp_path / "sched.db"))
+        db.initialize()
+        scheduler = FetchScheduler(db)
+        with pytest.raises(ValueError):
+            scheduler.update_credentials(claude_token="x")
 
 
 class TestRateLimitBackoff:
@@ -477,7 +373,7 @@ class TestRateLimitBackoff:
 
         db = Database(str(tmp_path / "sched.db"))
         db.initialize()
-        scheduler = FetchScheduler(db, claude_token="token")
+        scheduler = FetchScheduler(db, claude_profile=_CLAUDE)
         fetch_fn = MagicMock(
             side_effect=FetchRateLimitError("HTTP 429", retry_after_seconds=1691.0)
         )
@@ -499,7 +395,7 @@ class TestRateLimitBackoff:
         # A 429 with no Retry-After backs off by max(exponential, default).
         # With the default above the exponential base it dominates.
         scheduler = FetchScheduler(
-            db, claude_token="token", rate_limit_default_seconds=1200
+            db, claude_profile=_CLAUDE, rate_limit_default_seconds=1200
         )
         fetch_fn = MagicMock(side_effect=FetchRateLimitError("HTTP 429"))
         scheduler._fetch_one(Provider.CLAUDE, fetch_fn)
@@ -514,7 +410,7 @@ class TestRateLimitBackoff:
         db = Database(str(tmp_path / "sched.db"))
         db.initialize()
         db.store_reading(_make_reading(provider=Provider.CLAUDE))
-        scheduler = FetchScheduler(db, claude_token="token")
+        scheduler = FetchScheduler(db, claude_profile=_CLAUDE)
         fetch_fn = MagicMock(side_effect=FetchRateLimitError("HTTP 429"))
         scheduler._fetch_one(Provider.CLAUDE, fetch_fn)
         assert db.get_latest_readings()[Provider.CLAUDE].stale is True
@@ -524,88 +420,11 @@ class TestRateLimitBackoff:
 
         db = Database(str(tmp_path / "sched.db"))
         db.initialize()
-        scheduler = FetchScheduler(db, claude_token="token", zai_key="key")
+        scheduler = FetchScheduler(db, claude_profile=_CLAUDE, zai_key="key")
         fetch_fn = MagicMock(side_effect=FetchRateLimitError("HTTP 429"))
         scheduler._fetch_one(Provider.CLAUDE, fetch_fn)
         now = datetime.now(timezone.utc).replace(tzinfo=None)
         assert not scheduler._is_blocked(Provider.ZAI, now)
-
-
-class TestClaudeTokenPersistence:
-    def test_refresh_persists_to_token_store(self, tmp_path):
-        from unittest.mock import patch
-
-        db = Database(str(tmp_path / "sched.db"))
-        db.initialize()
-        token_store = TokenStore(str(tmp_path / "tokens.json"))
-        scheduler = FetchScheduler(
-            db,
-            claude_token="old-access",
-            claude_refresh_token="old-refresh",
-            token_store=token_store,
-        )
-        with patch(
-            "usage_dashboard.server.scheduler.refresh_claude_token",
-            return_value=("new-access", "new-refresh"),
-        ):
-            result = scheduler._try_refresh_claude()
-        assert result is True
-        assert token_store.load_claude_tokens() == ("new-access", "new-refresh")
-        assert scheduler._claude_token == "new-access"
-        assert scheduler._claude_refresh_token == "new-refresh"
-
-    def test_refresh_without_store_only_updates_memory(self, tmp_path):
-        from unittest.mock import patch
-
-        db = Database(str(tmp_path / "sched.db"))
-        db.initialize()
-        scheduler = FetchScheduler(
-            db,
-            claude_token="old-access",
-            claude_refresh_token="old-refresh",
-        )
-        with patch(
-            "usage_dashboard.server.scheduler.refresh_claude_token",
-            return_value=("new-access", "new-refresh"),
-        ):
-            result = scheduler._try_refresh_claude()
-        assert result is True
-        assert scheduler._claude_token == "new-access"
-        assert scheduler._claude_refresh_token == "new-refresh"
-
-    def test_no_refresh_token_returns_false(self, tmp_path):
-        db = Database(str(tmp_path / "sched.db"))
-        db.initialize()
-        token_store = TokenStore(str(tmp_path / "tokens.json"))
-        scheduler = FetchScheduler(
-            db, claude_token="access", token_store=token_store,
-        )
-        assert scheduler._try_refresh_claude() is False
-
-    def test_refresh_failure_does_not_persist(self, tmp_path):
-        from unittest.mock import patch
-
-        from usage_dashboard.server.fetch_types import FetchAuthError
-
-        db = Database(str(tmp_path / "sched.db"))
-        db.initialize()
-        token_store = TokenStore(str(tmp_path / "tokens.json"))
-        token_store.save_claude_tokens("saved-access", "saved-refresh")
-        scheduler = FetchScheduler(
-            db,
-            claude_token="old-access",
-            claude_refresh_token="old-refresh",
-            token_store=token_store,
-        )
-        scheduler._try_refresh_claude = MagicMock(return_value=False)  # type: ignore[method-assign]
-        fetch_fn = MagicMock(side_effect=FetchAuthError("HTTP 401"))
-        with patch(
-            "usage_dashboard.server.scheduler.fetch_claude_usage",
-            side_effect=FetchError("still broken"),
-        ):
-            scheduler._fetch_one(Provider.CLAUDE, fetch_fn)
-        # Store should still have the original saved tokens.
-        assert token_store.load_claude_tokens() == ("saved-access", "saved-refresh")
 
 
 def _interval(scheduler: FetchScheduler, provider: Provider) -> float:
@@ -618,7 +437,7 @@ class TestIdleLadder:
         db.initialize()
         reading = _make_reading(provider=Provider.CLAUDE)
         fetch_fn = MagicMock(return_value=reading)
-        scheduler = FetchScheduler(db, claude_token="token", interval_seconds=300)
+        scheduler = FetchScheduler(db, claude_profile=_CLAUDE, interval_seconds=300)
 
         scheduler._fetch_one(Provider.CLAUDE, fetch_fn)
         assert _interval(scheduler, Provider.CLAUDE) == 300  # floor on first read
@@ -629,7 +448,7 @@ class TestIdleLadder:
     def test_changed_reading_resets_to_floor(self, tmp_path):
         db = Database(str(tmp_path / "sched.db"))
         db.initialize()
-        scheduler = FetchScheduler(db, claude_token="token", interval_seconds=300)
+        scheduler = FetchScheduler(db, claude_profile=_CLAUDE, interval_seconds=300)
         steady = _make_reading(provider=Provider.CLAUDE, session_percent=50.0)
         scheduler._fetch_one(Provider.CLAUDE, MagicMock(return_value=steady))
         scheduler._fetch_one(Provider.CLAUDE, MagicMock(return_value=steady))
@@ -643,7 +462,7 @@ class TestIdleLadder:
         db = Database(str(tmp_path / "sched.db"))
         db.initialize()
         scheduler = FetchScheduler(
-            db, claude_token="token", interval_seconds=300, change_epsilon=0.5
+            db, claude_profile=_CLAUDE, interval_seconds=300, change_epsilon=0.5
         )
         base = _make_reading(provider=Provider.CLAUDE, session_percent=50.0)
         scheduler._fetch_one(Provider.CLAUDE, MagicMock(return_value=base))
@@ -768,7 +587,7 @@ class TestExponentialFailureBackoff:
         db = Database(str(tmp_path / "sched.db"))
         db.initialize()
         scheduler = FetchScheduler(
-            db, claude_token="token", interval_seconds=300, failure_cap_seconds=3600
+            db, claude_profile=_CLAUDE, interval_seconds=300, failure_cap_seconds=3600
         )
         fetch_fn = MagicMock(side_effect=FetchError("boom"))  # no explicit 429
         for expected in (300, 600, 1200, 2400):
@@ -779,7 +598,7 @@ class TestExponentialFailureBackoff:
         db = Database(str(tmp_path / "sched.db"))
         db.initialize()
         scheduler = FetchScheduler(
-            db, claude_token="token", interval_seconds=300, failure_cap_seconds=1000
+            db, claude_profile=_CLAUDE, interval_seconds=300, failure_cap_seconds=1000
         )
         fetch_fn = MagicMock(side_effect=FetchError("boom"))
         for _ in range(8):
@@ -789,7 +608,7 @@ class TestExponentialFailureBackoff:
     def test_recovery_resets_interval_and_failures(self, tmp_path):
         db = Database(str(tmp_path / "sched.db"))
         db.initialize()
-        scheduler = FetchScheduler(db, claude_token="token", interval_seconds=300)
+        scheduler = FetchScheduler(db, claude_profile=_CLAUDE, interval_seconds=300)
         fail_fn = MagicMock(side_effect=FetchError("boom"))
         scheduler._fetch_one(Provider.CLAUDE, fail_fn)
         scheduler._fetch_one(Provider.CLAUDE, fail_fn)
@@ -808,7 +627,7 @@ class TestPerProviderScheduling:
         db = Database(str(tmp_path / "sched.db"))
         db.initialize()
         scheduler = FetchScheduler(
-            db, claude_token="token", zai_key="key", interval_seconds=300
+            db, claude_profile=_CLAUDE, zai_key="key", interval_seconds=300
         )
         steady = _make_reading(provider=Provider.CLAUDE)
         scheduler._fetch_one(Provider.CLAUDE, MagicMock(return_value=steady))
@@ -830,7 +649,7 @@ class TestConfiguredProviders:
         db = Database(str(tmp_path / "sched.db"))
         db.initialize()
         scheduler = FetchScheduler(
-            db, claude_token="token", ollama_cookie="cookie"
+            db, claude_profile=_CLAUDE, ollama_cookie="cookie"
         )
         assert scheduler.configured_providers() == [
             Provider.CLAUDE,
@@ -848,8 +667,8 @@ class TestConfiguredProviders:
         db.initialize()
         scheduler = FetchScheduler(
             db,
-            claude_token="c",
-            claude_work_token="cw",
+            claude_profile=_CLAUDE,
+            claude_work_profile=_CLAUDE_WORK,
             zai_key="z",
             ollama_cookie="o",
             codex_client=MagicMock(),
