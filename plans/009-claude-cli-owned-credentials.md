@@ -1,6 +1,6 @@
 # Plan 009 — Claude credentials owned by the CLI (the Codex pattern)
 
-Status: proposed 2026-11-08, after the refresh-client_id outage (fix PR:
+Status: proposed 2026-11-08, after the refresh-client_id outage (fix: PR 57,
 `fix/claude-refresh-client-id-20261108`). Not started.
 
 ## Problem
@@ -126,6 +126,11 @@ with zero re-login.
 - `.credentials.json` remains undocumented; a CLI bump can change its shape.
   The parser already fails closed and names the version; CLI bumps become a
   deliberate, tested image change instead of an ambient hazard.
+- Torn reads: WP-3 reads `.credentials.json` while the CLI may be rewriting
+  it (refresh trigger, or an enrolment). WP-1 should note whether the CLI
+  writes atomically (temp + rename); either way the reader retries a parse
+  failure once before reporting an auth failure, so a mid-write read does not
+  enter the auth-failure backoff ladder.
 - Two writers to the file (CLI refresh during a concurrent enrolment) —
   mitigated by the enrolment pause/resume bracket the pane already has for
   Codex, extended to the claude trigger.
