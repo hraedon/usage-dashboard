@@ -18,3 +18,4 @@ the same way. The ledger is small enough to read before numbering, and
 | 006 | [Browser enrolment pane](006-browser-enrolment-pane.md) | shipped (PR 41) |
 | 007 | [Antigravity Argon quota](007-antigravity-argon-quota.md) | shipped (PR 51) — the agent capacity API was originally numbered 007 and renumbered to 008 |
 | 008 | [Agent capacity API](008-agent-capacity-api.md) | shipped 2026-11-07 (PR 37, deployed same day) |
+| 009 | [Claude credentials owned by the CLI](009-claude-cli-owned-credentials.md) | proposed 2026-11-08, after the refresh client_id outage |
