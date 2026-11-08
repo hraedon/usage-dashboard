@@ -368,7 +368,6 @@ class TestClaudeWorkAccount:
         assert scheduler._claude_work_token == "new-w-access"
         assert scheduler._claude_token == "p-access"
 
-
     def test_auth_failure_refreshes_the_work_account(self, tmp_path):
         from unittest.mock import patch
 
@@ -398,7 +397,7 @@ class TestRefreshClientIdResolution:
     the outage Plan 005 Phase C's env removal exposed — refreshes had been
     silently relying on the CLAUDE_CLIENT_ID env ever since."""
 
-    def _refresh_call_client_id(self, scheduler, tmp_path):
+    def _refresh_call_client_id(self, scheduler):
         """Run one personal refresh and return the client_id it sent."""
         from unittest.mock import patch
 
@@ -425,7 +424,7 @@ class TestRefreshClientIdResolution:
             claude_refresh_token="refresh",
             token_store=token_store,
         )
-        assert self._refresh_call_client_id(scheduler, tmp_path) == "stored-client"
+        assert self._refresh_call_client_id(scheduler) == "stored-client"
 
     def test_falls_back_to_the_public_cli_client_id(self, tmp_path):
         db = Database(str(tmp_path / "sched.db"))
@@ -442,7 +441,7 @@ class TestRefreshClientIdResolution:
             token_store=token_store,
         )
         assert (
-            self._refresh_call_client_id(scheduler, tmp_path) == CLAUDE_CODE_CLIENT_ID
+            self._refresh_call_client_id(scheduler) == CLAUDE_CODE_CLIENT_ID
         )
 
     def test_falls_back_with_no_token_store_at_all(self, tmp_path):
@@ -452,7 +451,7 @@ class TestRefreshClientIdResolution:
             db, claude_token="access", claude_refresh_token="refresh"
         )
         assert (
-            self._refresh_call_client_id(scheduler, tmp_path) == CLAUDE_CODE_CLIENT_ID
+            self._refresh_call_client_id(scheduler) == CLAUDE_CODE_CLIENT_ID
         )
 
     def test_explicit_client_id_wins_over_store_metadata(self, tmp_path):
@@ -469,7 +468,7 @@ class TestRefreshClientIdResolution:
             claude_client_id="configured-client",
             token_store=token_store,
         )
-        assert self._refresh_call_client_id(scheduler, tmp_path) == "configured-client"
+        assert self._refresh_call_client_id(scheduler) == "configured-client"
 
 
 class TestRateLimitBackoff:
