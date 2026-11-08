@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -14,9 +15,11 @@ class TestResolveClaudeProfile:
     a credential; the token store no longer carries Claude OAuth tokens."""
 
     @staticmethod
-    def _enrol(profile: Path) -> None:
+    def _enrol(profile: Path, refresh: str = "cli-refresh") -> None:
         profile.mkdir(parents=True)
-        (profile / ".credentials.json").write_text('{"claudeAiOauth": {}}')
+        (profile / ".credentials.json").write_text(
+            json.dumps({"claudeAiOauth": {"accessToken": "a", "refreshToken": refresh}})
+        )
 
     @staticmethod
     def _point_at(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -43,22 +46,36 @@ class TestResolveClaudeProfile:
         )
         assert _resolve_claude_profile(store, "claude", "claude") is None
 
-    def test_a_legacy_store_entry_is_never_used(
+    def test_an_unmigrated_account_stays_configured(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # A pre-Plan-009 pair with no profile must not resurrect the
-        # dashboard as a refresher; it is reported and left for migration.
+        # A pre-Plan-009 pair with no profile is never used (that would make
+        # the dashboard a refresher again), but the account must not vanish
+        # either: it stays configured, so its tile reads "login required".
         self._point_at(monkeypatch, tmp_path)
         store = TokenStore(tmp_path / "tokens.json")
         store.save("claude", "old-access", "old-refresh")
-        assert _resolve_claude_profile(store, "claude", "claude") is None
+        profile = _resolve_claude_profile(store, "claude", "claude")
+        assert profile == ClaudeProfileConfig(config_dir=str(tmp_path / "personal"))
         assert store.get("claude") == ("old-access", "old-refresh")
 
-    def test_a_legacy_entry_is_pruned_once_a_profile_exists(
+    def test_the_legacy_entry_survives_until_the_cli_rotates(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Freshly migrated: the profile still holds the store's refresh
+        # token, so the store copy is the only fallback. Keep it.
+        self._point_at(monkeypatch, tmp_path)
+        self._enrol(tmp_path / "personal", refresh="old-refresh")
+        store = TokenStore(tmp_path / "tokens.json")
+        store.save("claude", "old-access", "old-refresh")
+        assert _resolve_claude_profile(store, "claude", "claude") is not None
+        assert store.get("claude") == ("old-access", "old-refresh")
+
+    def test_the_legacy_entry_is_pruned_once_the_cli_has_rotated(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         self._point_at(monkeypatch, tmp_path)
-        self._enrol(tmp_path / "personal")
+        self._enrol(tmp_path / "personal", refresh="rotated-by-cli")
         store = TokenStore(tmp_path / "tokens.json")
         store.save("claude", "old-access", "old-refresh")
         store.set_seed_marker("claude", "m")
@@ -66,6 +83,29 @@ class TestResolveClaudeProfile:
         assert _resolve_claude_profile(store, "claude", "claude") is not None
         assert not store.has_entry("claude")
         assert store.get_credential("ollama") == "cookie"
+
+    def test_an_unreadable_profile_keeps_the_legacy_entry(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._point_at(monkeypatch, tmp_path)
+        (tmp_path / "personal").mkdir()
+        (tmp_path / "personal" / ".credentials.json").write_text("{broken")
+        store = TokenStore(tmp_path / "tokens.json")
+        store.save("claude", "old-access", "old-refresh")
+        _resolve_claude_profile(store, "claude", "claude")
+        assert store.has_entry("claude")
+
+    def test_an_interrupted_swap_is_settled_at_startup(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Enrolment died between its two renames, then the pod restarted:
+        # without recovery the profile looks absent and the account drops.
+        self._point_at(monkeypatch, tmp_path)
+        self._enrol(tmp_path / "personal.prev")
+        (tmp_path / "personal.swapping").write_text("")
+        store = TokenStore(tmp_path / "tokens.json")
+        assert _resolve_claude_profile(store, "claude", "claude") is not None
+        assert (tmp_path / "personal" / ".credentials.json").exists()
 
 
 class TestResolveCookie:

@@ -13,7 +13,9 @@ from usage_dashboard.server.claude_profile import (
     ClaudeProfileConfig,
     is_enrolled,
     profile_dir,
+    read_credential,
 )
+from usage_dashboard.server.cli_home import home_lock, recover_interrupted_swap
 from usage_dashboard.server.codex_app_server import (
     DEFAULT_CODEX_BIN,
     DEFAULT_CODEX_HOME,
@@ -27,6 +29,7 @@ from usage_dashboard.server.fetch_antigravity import (
     DEFAULT_ANTIGRAVITY_HOME,
     AntigravityConfig,
 )
+from usage_dashboard.server.fetch_types import FetchError
 from usage_dashboard.server.schedule_config import ScheduleConfig
 from usage_dashboard.server.scheduler import FetchScheduler
 from usage_dashboard.server.token_store import TokenStore
@@ -44,14 +47,27 @@ def _resolve_claude_profile(
     holds a credential file. Re-run after enrolment, so a new sign-in is
     adopted without a rollout.
 
-    The token store no longer holds Claude OAuth tokens. A pre-Plan-009 entry
-    is removed once a profile exists (the profile's CLI is then the family's
-    only refresher), and is reported, never used, while one does not.
+    The token store no longer holds Claude OAuth tokens, and a pre-Plan-009
+    entry is never *used*. It does still matter in two ways:
+
+    * With no profile yet, it marks an account that was configured before the
+      upgrade. That account stays configured (its tile reads "login required")
+      rather than silently vanishing, until it is migrated or re-enrolled.
+    * With a profile, the entry is kept until the profile's refresh token
+      differs from it, which proves the CLI has refreshed the migrated
+      credential at least once. Until then it is the only fallback copy of a
+      working pair, so pruning it on sight could destroy the last good login.
     """
     config_dir = profile_dir(store_key)
-    legacy_access, _ = token_store.get(store_key)
-    if not is_enrolled(config_dir):
-        if legacy_access:
+    config = ClaudeProfileConfig(config_dir=config_dir, binary=claude_bin)
+    with home_lock(config_dir):
+        # A swap that died between its renames must be settled before the
+        # profile is judged absent, or a restart would drop the account.
+        recover_interrupted_swap(config_dir)
+        enrolled = is_enrolled(config_dir)
+    _, legacy_refresh = token_store.get(store_key)
+    if not enrolled:
+        if legacy_refresh:
             logger.warning(
                 "A pre-Plan-009 %s credential is in the token store but there is "
                 "no Claude CLI profile at %s; it is not used. Migrate it with "
@@ -59,16 +75,39 @@ def _resolve_claude_profile(
                 store_key,
                 config_dir,
             )
+            return config
         return None
     if token_store.has_entry(store_key):
-        token_store.remove(store_key)
-        logger.info(
-            "Removed the pre-Plan-009 %s entry from the token store; the CLI "
-            "profile at %s owns the credential",
-            store_key,
-            config_dir,
-        )
-    return ClaudeProfileConfig(config_dir=config_dir, binary=claude_bin)
+        _prune_legacy_claude_entry(token_store, store_key, config_dir, legacy_refresh)
+    return config
+
+
+def _prune_legacy_claude_entry(
+    token_store: TokenStore,
+    store_key: str,
+    config_dir: str,
+    legacy_refresh: str | None,
+) -> None:
+    """Drop a pre-Plan-009 store entry once the CLI has demonstrably taken over."""
+    if legacy_refresh:
+        try:
+            current = read_credential(config_dir)
+        except FetchError:
+            return  # unreadable profile: keep the fallback copy
+        if current.refresh_token == legacy_refresh:
+            logger.info(
+                "Keeping the pre-Plan-009 %s store entry until the CLI first "
+                "refreshes the migrated credential",
+                store_key,
+            )
+            return
+    token_store.remove(store_key)
+    logger.info(
+        "Removed the pre-Plan-009 %s entry from the token store; the CLI "
+        "profile at %s owns the credential",
+        store_key,
+        config_dir,
+    )
 
 
 def _resolve_opencode_workspace(

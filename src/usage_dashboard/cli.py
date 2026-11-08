@@ -91,6 +91,24 @@ def _claude_cli_version(claude_bin: str) -> str | None:
     return result.stdout.strip() or None
 
 
+# What the interactive login needs beyond the fetcher's allowlist: the
+# terminal the operator answers on.
+_CLAUDE_LOGIN_TERMINAL_ENV = ("TERM", "COLUMNS", "LINES")
+
+
+def _claude_login_env(config_dir: str) -> dict[str, str]:
+    """The login child's environment: the same allowlist the fetcher's refresh
+    trigger uses (never the pod's API key or provider secrets; a stray
+    ANTHROPIC_API_KEY would switch the CLI's auth mode), plus the terminal."""
+    from usage_dashboard.server.claude_profile import cli_env
+
+    env = cli_env(config_dir, os.environ.get("HOME") or "/root")
+    for name in _CLAUDE_LOGIN_TERMINAL_ENV:
+        if name in os.environ:
+            env[name] = os.environ[name]
+    return env
+
+
 def _run_official_claude_login(claude_bin: str, config_dir: str) -> None:
     """Run the official login ceremony against an isolated config directory.
 
@@ -98,10 +116,10 @@ def _run_official_claude_login(claude_bin: str, config_dir: str) -> None:
     SSH and in containers by displaying a code the operator pastes back. The
     caller's TTY is inherited deliberately so that interaction reaches them.
     """
-    env = dict(os.environ)
-    env["CLAUDE_CONFIG_DIR"] = config_dir
     try:
-        result = subprocess.run([claude_bin, "auth", "login", "--claudeai"], env=env)
+        result = subprocess.run(
+            [claude_bin, "auth", "login", "--claudeai"], env=_claude_login_env(config_dir)
+        )
     except OSError as exc:
         raise ClaudeCredentialError(
             f"Could not run {claude_bin!r}: {exc}. Is the Claude Code CLI installed?"

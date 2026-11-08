@@ -370,3 +370,168 @@ class TestOneOwner:
         released.set()
         holder.join(5)
         assert done.wait(10), "fetch never ran after the lock was released"
+
+
+def _raw_stub(tmp_path: Path, body: str) -> str:
+    path = tmp_path / "claude"
+    path.write_text(f"#!{sys.executable}\n{body}", encoding="utf-8")
+    path.chmod(path.stat().st_mode | stat.S_IXUSR)
+    return str(path)
+
+
+class TestFailureClasses:
+    """Review findings 4/5: an auth failure parks the tile behind "login
+    required" at the backoff cap, so transient trigger trouble must not be one,
+    and a token that has not expired yet must still be used."""
+
+    def test_cli_reported_auth_error_is_an_auth_failure(self, tmp_path: Path) -> None:
+        cfg = _config(
+            tmp_path,
+            _stub(
+                tmp_path,
+                refresh_to=None,
+                result=dict(
+                    _RESULT, is_error=True, result="OAuth token expired. Please run /login"
+                ),
+            ),
+        )
+        _write_credential(Path(cfg.config_dir), "stale-access", _now_ms() - 60_000)
+        with pytest.raises(FetchAuthError):
+            fetch_claude_profile_usage(cfg)
+
+    def test_cli_reported_other_error_is_transient(self, tmp_path: Path) -> None:
+        cfg = _config(
+            tmp_path,
+            _stub(
+                tmp_path,
+                refresh_to=None,
+                result=dict(_RESULT, is_error=True, result="API Error: 529 Overloaded"),
+            ),
+        )
+        _write_credential(Path(cfg.config_dir), "stale-access", _now_ms() - 60_000)
+        with pytest.raises(FetchError) as exc:
+            fetch_claude_profile_usage(cfg)
+        assert not isinstance(exc.value, FetchAuthError)
+
+    def test_failed_trigger_with_expired_token_is_transient(self, tmp_path: Path) -> None:
+        cfg = _config(tmp_path, _stub(tmp_path, stdout="garbage"))
+        _write_credential(Path(cfg.config_dir), "stale-access", _now_ms() - 60_000)
+        with pytest.raises(FetchError) as exc:
+            fetch_claude_profile_usage(cfg)
+        assert not isinstance(exc.value, FetchAuthError)
+
+    def test_failed_trigger_keeps_a_still_valid_token(self, tmp_path: Path) -> None:
+        cfg = _config(tmp_path, _stub(tmp_path, stdout="garbage"))
+        soon = _now_ms() + (REFRESH_SKEW_SECONDS - 30) * 1000
+        _write_credential(Path(cfg.config_dir), "soon-access", soon)
+        with patch(_USAGE, return_value=_reading()) as usage:
+            fetch_claude_profile_usage(cfg)
+        usage.assert_called_once_with("soon-access", Provider.CLAUDE)
+
+    def test_a_401_with_a_failed_trigger_is_transient(self, tmp_path: Path) -> None:
+        cfg = _config(tmp_path, _stub(tmp_path, stdout="garbage"))
+        _write_credential(Path(cfg.config_dir), "live-access", _now_ms() + 3600_000)
+        with (
+            patch(_USAGE, side_effect=FetchAuthError("HTTP 401")),
+            pytest.raises(FetchError) as exc,
+        ):
+            fetch_claude_profile_usage(cfg)
+        assert not isinstance(exc.value, FetchAuthError)
+
+
+class TestStoppingAWedgedCli:
+    def test_sigterm_comes_first_so_the_cli_can_finish_its_write(
+        self, tmp_path: Path
+    ) -> None:
+        marker = tmp_path / "got-sigterm"
+        binary = _raw_stub(
+            tmp_path,
+            f"""
+import signal, sys, time
+def on_term(signum, frame):
+    open({str(marker)!r}, "w").write("term")
+    sys.exit(0)
+signal.signal(signal.SIGTERM, on_term)
+time.sleep(60)
+""",
+        )
+        cfg = _config(tmp_path, binary, timeout=0.5)
+        _write_credential(Path(cfg.config_dir), "stale-access", _now_ms() - 60_000)
+        with pytest.raises(FetchError, match="timed out"):
+            fetch_claude_profile_usage(cfg)
+        assert marker.read_text() == "term"
+
+    def test_the_whole_process_group_is_stopped(self, tmp_path: Path) -> None:
+        pidfile = tmp_path / "grandchild.pid"
+        binary = _raw_stub(
+            tmp_path,
+            f"""
+import signal, subprocess, sys, time
+child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+open({str(pidfile)!r}, "w").write(str(child.pid))
+signal.signal(signal.SIGTERM, signal.SIG_IGN)  # a leader that ignores TERM
+time.sleep(60)
+""",
+        )
+        cfg = _config(tmp_path, binary, timeout=0.5)
+        _write_credential(Path(cfg.config_dir), "stale-access", _now_ms() - 60_000)
+        with pytest.raises(FetchError, match="timed out"):
+            fetch_claude_profile_usage(cfg)
+        pid = int(pidfile.read_text())
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return
+            # Reaped by init or still a zombie: a zombie reads as alive here.
+            try:
+                with open(f"/proc/{pid}/status") as status:
+                    if "State:\tZ" in status.read():
+                        return
+            except FileNotFoundError:
+                return
+            time.sleep(0.05)
+        raise AssertionError("grandchild survived the timeout")
+
+
+class TestOneOwnerAcrossProcesses:
+    def test_enrolment_swap_in_another_process_excludes_a_fetch(
+        self, tmp_path: Path
+    ) -> None:
+        # `kubectl exec usage-dashboard login claude` is a second process:
+        # the swap must take the same lock the fetcher holds.
+        import subprocess
+
+        cfg = _config(tmp_path, _stub(tmp_path))
+        _write_credential(Path(cfg.config_dir), "old-access", _now_ms() + 3600_000)
+        staging = Path(cli_home.make_staging_home(cfg.config_dir))
+        _write_credential(staging, "new-access", _now_ms() + 3600_000)
+        ready = tmp_path / "holding"
+        holder = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                "import pathlib, sys, time\n"
+                "from usage_dashboard.server import cli_home\n"
+                "with cli_home.home_lock(sys.argv[1]):\n"
+                "    pathlib.Path(sys.argv[3]).write_text('x')\n"
+                "    time.sleep(1.0)\n"
+                "cli_home.install_home(sys.argv[2], sys.argv[1])\n",
+                cfg.config_dir,
+                str(staging),
+                str(ready),
+            ]
+        )
+        deadline = time.monotonic() + 10
+        while not ready.exists():
+            assert time.monotonic() < deadline, "holder never took the lock"
+            time.sleep(0.02)
+        started = time.monotonic()
+        with patch(_USAGE, return_value=_reading()) as usage:
+            fetch_claude_profile_usage(cfg)
+        assert time.monotonic() - started >= 0.5, "fetch did not wait for the lock"
+        holder.wait(10)
+        # Whichever ran first, the fetch saw a whole profile, never a half swap.
+        assert usage.call_args.args[0] in ("old-access", "new-access")
+        assert _access(Path(cfg.config_dir)) == "new-access"

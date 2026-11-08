@@ -284,6 +284,20 @@ class TestClaudeEnrolment:
             login_claude(account="nope", config_dir=str(tmp_path / "x"))
         assert exc.value.code == 1
 
+    def test_the_login_child_gets_an_allowlisted_environment(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from usage_dashboard.cli import _claude_login_env
+
+        monkeypatch.setenv("API_KEY", "dashboard-secret")
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "would-switch-auth-mode")
+        monkeypatch.setenv("TERM", "xterm-256color")
+        env = _claude_login_env(str(tmp_path / "staging"))
+        assert "API_KEY" not in env
+        assert "ANTHROPIC_API_KEY" not in env
+        assert env["TERM"] == "xterm-256color"
+        assert env["CLAUDE_CONFIG_DIR"] == str(tmp_path / "staging")
+
     def test_sigterm_handler_is_restored(self, tmp_path: Path) -> None:
         # The swap ignores SIGTERM briefly; a leaked SIG_IGN would be
         # inherited by every child this process later spawns.

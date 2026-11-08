@@ -188,21 +188,38 @@ def _expired(credential: ClaudeCredential, now: float | None = None) -> bool:
     return credential.expires_at <= now_ms
 
 
-def _kill_group(proc: subprocess.Popen[bytes]) -> None:
-    try:
-        os.killpg(proc.pid, signal.SIGKILL)
-    except (ProcessLookupError, PermissionError):
-        proc.kill()
-    proc.wait()
+# On a timeout the child gets SIGTERM and this long to exit before SIGKILL. A
+# CLI killed outright between rotating the token server-side and renaming the
+# new file into place would strand the profile on a dead refresh token.
+_KILL_GRACE_SECONDS = 5.0
+
+# Words in an ``is_error`` result that mean the CLI's own auth is broken (a
+# re-login fixes it), as opposed to a transient failure (a retry fixes it).
+_AUTH_HINTS = ("login", "log in", "auth", "expired", "invalid_grant", "401", "403")
+
+
+def _stop_group(proc: subprocess.Popen[bytes]) -> None:
+    for sig, grace in ((signal.SIGTERM, _KILL_GRACE_SECONDS), (signal.SIGKILL, None)):
+        try:
+            os.killpg(proc.pid, sig)
+        except (ProcessLookupError, PermissionError):
+            if sig == signal.SIGKILL:
+                proc.kill()
+        try:
+            proc.wait(timeout=grace)
+            return
+        except subprocess.TimeoutExpired:
+            continue
 
 
 def run_refresh_trigger(config: ClaudeProfileConfig) -> dict[str, Any]:
     """Run the zero-turn ``/usage`` command so the CLI refreshes if it must.
 
-    The caller holds the profile lock. Returns the CLI's JSON result, which is
-    checked only for being a zero-turn run: whether a refresh happened is
-    judged by re-reading the credential file, never from this output (a
-    signed-out CLI also "succeeds"). The child's stderr is never logged.
+    The caller holds the profile lock. Whether a refresh happened is judged by
+    re-reading the credential file, never from this output (a signed-out CLI
+    also "succeeds"). Raises FetchAuthError only when the CLI itself reports an
+    auth problem, and plain FetchError for anything transient or malformed.
+    Neither the child's stderr nor its result text is ever logged.
     """
     with tempfile.TemporaryDirectory(prefix="claude-cli-home-") as home:
         try:
@@ -223,7 +240,7 @@ def run_refresh_trigger(config: ClaudeProfileConfig) -> dict[str, Any]:
         try:
             out, _ = proc.communicate(timeout=config.timeout)
         except subprocess.TimeoutExpired as exc:
-            _kill_group(proc)
+            _stop_group(proc)
             raise FetchError(
                 f"Claude CLI refresh trigger timed out after {config.timeout:.0f}s"
             ) from exc
@@ -242,6 +259,11 @@ def run_refresh_trigger(config: ClaudeProfileConfig) -> dict[str, Any]:
             "Claude CLI refresh trigger ran a model turn instead of the local "
             "/usage command; check the profile's settings"
         )
+    if payload.get("is_error"):
+        text = str(payload.get("result", "")).lower()
+        if any(hint in text for hint in _AUTH_HINTS):
+            raise FetchAuthError("Claude CLI reports its login is no longer valid")
+        raise FetchError("Claude CLI refresh trigger reported an error")
     return payload
 
 
@@ -253,27 +275,56 @@ def fetch_claude_profile_usage(
     Holds the profile lock throughout, so neither an enrolment swap nor a
     concurrent fetch (``POST /refresh`` vs the poll loop) can interleave with
     a refresh.
+
+    Failure classes matter here, because an auth failure backs the tile off to
+    the cap behind a "login required" prompt: only a *clean* trigger run that
+    leaves the token expired, or the CLI itself reporting an auth problem, is
+    an auth failure. A trigger that times out or misbehaves is transient, and
+    a token that has not actually expired yet is still used.
     """
     with home_lock(config.config_dir):
         recover_interrupted_swap(config.config_dir)
         credential = read_credential(config.config_dir)
         if _near_expiry(credential):
-            run_refresh_trigger(config)
-            refreshed = read_credential(config.config_dir)
-            if refreshed.access_token != credential.access_token:
-                logger.info("Claude CLI refreshed the %s credential", provider.value)
-            elif _expired(refreshed):
-                raise FetchAuthError(
-                    "Claude access token expired and the CLI did not refresh "
-                    "it; re-enrol from the /login pane"
+            try:
+                run_refresh_trigger(config)
+            except FetchAuthError:
+                raise
+            except FetchError as exc:
+                if _expired(credential):
+                    raise
+                logger.warning(
+                    "Claude CLI refresh trigger failed for %s (%s); the access "
+                    "token has not expired yet, so it is still used",
+                    provider.value,
+                    exc,
                 )
-            credential = refreshed
+            else:
+                refreshed = read_credential(config.config_dir)
+                if refreshed.access_token != credential.access_token:
+                    logger.info("Claude CLI refreshed the %s credential", provider.value)
+                elif _expired(refreshed):
+                    raise FetchAuthError(
+                        "Claude access token expired and the CLI did not refresh "
+                        "it; re-enrol from the /login pane"
+                    )
+                credential = refreshed
         try:
             return fetch_claude_usage(credential.access_token, provider)
-        except FetchAuthError:
+        except FetchAuthError as rejected:
             # Rejected before its recorded expiry (clock skew, early
             # revocation). Give the CLI one chance; it owns the refresh.
-            run_refresh_trigger(config)
+            try:
+                run_refresh_trigger(config)
+            except FetchAuthError:
+                raise
+            except FetchError as exc:
+                # Unknown whether a re-login is needed: back off as transient
+                # rather than parking the tile behind "login required".
+                raise FetchError(
+                    f"Claude rejected the access token and the CLI refresh "
+                    f"trigger failed: {exc}"
+                ) from rejected
             retried = read_credential(config.config_dir)
             if retried.access_token == credential.access_token:
                 raise

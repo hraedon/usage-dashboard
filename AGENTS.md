@@ -54,8 +54,11 @@ the server pod, via each vendor's official CLI (both pinned into the image):
   began requiring `client_id`.) Never copy a desktop Claude credential in.
 
 `/data/tokens.json` holds only scraped cookies and the OpenCode workspace id. A
-leftover pre-009 Claude entry is never used; startup deletes it once a profile
-exists (`scripts/migrate_claude_store_to_profile.py` was the one-off upgrade).
+leftover pre-009 Claude entry is never used. Without a profile it keeps the
+account configured ("login required"). With one, startup deletes it only after
+the CLI has rotated the refresh token, never before, since until then it is the
+last good copy (`scripts/migrate_claude_store_to_profile.py` was the one-off
+upgrade, run after the rollout).
 The token store takes an advisory file lock because enrolment mutates it from a
 second process, and it fails closed on corrupt content rather than replacing it.
 

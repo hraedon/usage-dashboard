@@ -349,10 +349,12 @@ can never reach. `CODEX_HOME` settles at ~3 MB.
 Claude credentials live in the per-account CLI profiles
 (`/data/claude-personal`, `/data/claude-work`), owned by the official CLI
 (Plan 009). `/data/tokens.json` holds only the scraped session cookies and the
-OpenCode workspace id. A pre-Plan-009 Claude entry in it is never used: once a
-profile exists the server deletes the entry at startup; without one it logs a
-warning naming `scripts/migrate_claude_store_to_profile.py` (the one-off
-upgrade path, which moves the pair into a profile without a re-login).
+OpenCode workspace id. A pre-Plan-009 Claude entry in it is never used. Without
+a profile, the account stays configured (its tile reads "login required"), and
+the log names `scripts/migrate_claude_store_to_profile.py`. That is the one-off
+upgrade path, run in the new pod after the rollout, which moves the pair into a
+profile without a re-login. With a profile, the server deletes the entry at
+startup once the CLI has refreshed (rotated) the migrated credential.
 
 Codex keeps its own credentials under `/data/codex`; the dashboard never reads
 or writes them. The same holds for Antigravity under `/data/antigravity`. The

@@ -82,9 +82,20 @@ known fallback if that endpoint closes to non-CLI callers.
 - **Migration:** no forced re-login. WP-1 showed the CLI accepts and then
   refreshes a minimal file (pair, expiry, scopes, plan), so the one-off
   `scripts/migrate_claude_store_to_profile.py` moves the live pair into the
-  profile right before the rollout. It is a script, not server code: `src/`
-  never writes the CLI's credential format. Startup deletes the store entry
-  once a profile exists, and only logs a warning when none does.
+  profile right *after* the rollout. It needs the new image's modules, and
+  with the `Recreate` strategy no old server remains to refresh the same
+  family. It is a script, not server code: `src/` never writes the CLI's
+  credential format. An unmigrated account stays configured, reading "login
+  required" rather than vanishing. The store entry is pruned only once the
+  profile's refresh token differs from it, which proves the CLI has refreshed,
+  so the last good copy is never thrown away early.
+- **Review hardening (pre-merge):** a trigger that times out or misbehaves is
+  transient, not a re-login. Only a clean run that leaves the token expired,
+  or the CLI reporting an auth error, is one. A failed trigger never discards
+  a token that has not expired yet. A wedged CLI gets SIGTERM and 5 s of
+  grace before SIGKILL, so it can finish a rotation's file write. Startup
+  settles an interrupted enrolment swap before judging a profile absent. The
+  login child gets the same env allowlist as the trigger.
 - **Shared code:** Antigravity's staging/lock helpers moved to
   `server/cli_home.py` and serve both CLIs.
 - **Guard:** a test pins that no runtime string in `src/` names the Claude
