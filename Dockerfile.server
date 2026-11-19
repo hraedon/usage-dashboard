@@ -1,4 +1,4 @@
-FROM python:3.12-slim AS builder
+FROM python:3.12-slim@sha256:5e2bdb1b0d542d5039cffb8181c65930093949194a65c365dfb1b0fe13a4fa5b AS builder
 
 WORKDIR /build
 
@@ -43,7 +43,7 @@ RUN pip install --no-cache-dir --prefix=/install --no-deps .
 #   https://antigravity-cli-auto-updater-974169037036.us-central1.run.app/manifests/linux_amd64.json
 #     (version, versioned GCS url, sha512; the build id is part of the url)
 # ---------------------------------------------------------------------------
-FROM python:3.12-slim AS clis
+FROM python:3.12-slim@sha256:5e2bdb1b0d542d5039cffb8181c65930093949194a65c365dfb1b0fe13a4fa5b AS clis
 
 ARG TARGETARCH=amd64
 
@@ -93,7 +93,7 @@ RUN /usr/local/bin/codex --version && /usr/local/bin/claude --version \
     && /usr/local/bin/agy --version
 
 
-FROM python:3.12-slim
+FROM python:3.12-slim@sha256:5e2bdb1b0d542d5039cffb8181c65930093949194a65c365dfb1b0fe13a4fa5b
 
 # tini as PID 1 (Plan 007). The server spawns CLI children (`agy` per fetch,
 # `codex app-server`, the enrolment ceremonies) and kills them on timeouts.
