@@ -154,6 +154,45 @@ class TestReadingsEndpoint:
 
         asyncio.run(_test())
 
+    def test_runtime_provider_source_updates_readings_and_dashboard(self, tmp_path):
+        # Plan 006 enrolment updates the scheduler's credentials without
+        # recreating the FastAPI app. Provider membership must follow that
+        # runtime state while preserving WI-003's absent-vs-offline rule.
+        configured: list[Provider] = []
+        db = Database(str(tmp_path / "runtime_providers.db"))
+        db.initialize()
+        app = create_app(
+            API_KEY,
+            db,
+            configured_providers=lambda: configured,
+        )
+        db.store_reading(_make_reading(provider=Provider.OLLAMA))
+
+        async def _test():
+            async with _client(app) as client:
+                async def readings() -> list[dict[str, object]]:
+                    response = await client.get(
+                        "/readings",
+                        headers={"Authorization": f"Bearer {API_KEY}"},
+                    )
+                    assert response.status_code == 200
+                    return response.json()
+
+                assert await readings() == []
+                assert 'data-provider="ollama"' not in (await client.get("/dashboard")).text
+
+                configured.extend([Provider.OLLAMA, Provider.CLAUDE])
+                by_provider = {item["provider"]: item for item in await readings()}
+                assert by_provider["ollama"]["status"] == "current"
+                assert by_provider["claude"]["status"] == "offline"
+                assert 'data-provider="ollama"' in (await client.get("/dashboard")).text
+
+                configured.clear()
+                assert await readings() == []
+                assert 'data-provider="ollama"' not in (await client.get("/dashboard")).text
+
+        asyncio.run(_test())
+
     def test_readings_response_has_expected_fields(self, tmp_path):
         app, db = _create_app_with_db(tmp_path)
         reading = _make_reading()
