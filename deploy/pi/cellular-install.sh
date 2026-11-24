@@ -119,17 +119,19 @@ sudo mv -f "$HELPER.new" "$HELPER"
 # Both verified before either can replace a working unit.
 echo "==> systemd units"
 sed -e "s|@WORKER_USER@|$WORKER_USER|g" -e "s|@VENV@|$VENV|g" \
-    "$HERE/usage-dashboard-cellular.service" > "$_TMPDIR/unit"
-cp "$HERE/usage-dashboard-cellular-firewall.service" "$_TMPDIR/firewall-unit"
-for candidate in "$_TMPDIR/unit" "$_TMPDIR/firewall-unit"; do
+    "$HERE/usage-dashboard-cellular.service" > "$_TMPDIR/$UNIT_NAME"
+cp "$HERE/usage-dashboard-cellular-firewall.service" "$_TMPDIR/$FIREWALL_UNIT_NAME"
+# Each candidate carries its real unit name: systemd-analyze refuses to verify
+# a file whose name has no unit suffix ("Failed to prepare filename").
+for candidate in "$_TMPDIR/$UNIT_NAME" "$_TMPDIR/$FIREWALL_UNIT_NAME"; do
     if ! systemd-analyze verify "$candidate" >/dev/null 2>"$_TMPDIR/verify.err"; then
         echo "ERROR: $(basename "$candidate") did not pass systemd-analyze verify; not installed:" >&2
         sed 's/^/       /' "$_TMPDIR/verify.err" >&2
         exit 1
     fi
 done
-sudo install -m 0644 "$_TMPDIR/unit" "$UNIT_DIR/$UNIT_NAME"
-sudo install -m 0644 "$_TMPDIR/firewall-unit" "$UNIT_DIR/$FIREWALL_UNIT_NAME"
+sudo install -m 0644 "$_TMPDIR/$UNIT_NAME" "$UNIT_DIR/$UNIT_NAME"
+sudo install -m 0644 "$_TMPDIR/$FIREWALL_UNIT_NAME" "$UNIT_DIR/$FIREWALL_UNIT_NAME"
 
 # --- 7. what the worker may ask root to do --------------------------------------
 # One rule, four argument-free commands: three that manage the link, and one
