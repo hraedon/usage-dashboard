@@ -368,6 +368,9 @@ def main() -> None:
         scheduler=scheduler,
         enrolment=enrolment,
         agent_api_key=os.environ.get("AGENT_API_KEY") or None,
+        # Plan 010: optional read-only credential scoped to the readings route,
+        # for the Pi cellular worker crossing the metered link.
+        display_api_key=os.environ.get("DISPLAY_API_KEY") or None,
     )
 
     scheduler.start()

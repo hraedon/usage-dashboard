@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from datetime import datetime, timezone
 from typing import Any
 
 import httpx
@@ -36,6 +37,11 @@ class ClientFetcher:
         self._lock = threading.Lock()
         self._readings: list[Reading] = []
         self._schedule_spec: str | None = None
+        # When the readings in memory were last read successfully from the
+        # server (naive UTC), or None before the first success. The GUI uses it
+        # to decide between its own readings and the cellular worker's cache
+        # (Plan 010), and to say how old the panel's numbers are.
+        self._last_success_at: datetime | None = None
         self._stop_event = threading.Event()
         self._wake_event = threading.Event()  # a refresh poke cuts the poll wait short
         self._thread: threading.Thread | None = None
@@ -70,6 +76,13 @@ class ClientFetcher:
         fetched yet, server has none, or the server was unreachable)."""
         with self._lock:
             return self._schedule_spec
+
+    @property
+    def last_success_at(self) -> datetime | None:
+        """When the readings in memory were last read successfully from the
+        server, as naive UTC; None until the first success."""
+        with self._lock:
+            return self._last_success_at
 
     def _poll_loop(self) -> None:
         self._fetch_once()
@@ -146,6 +159,7 @@ class ClientFetcher:
             self._update_interval(new_readings)
             with self._lock:
                 self._readings = new_readings
+                self._last_success_at = datetime.now(timezone.utc).replace(tzinfo=None)
         except (httpx.HTTPError, ValueError, KeyError, TypeError) as exc:
             logger.warning("Failed to fetch readings: %s", exc)
         if self._fetch_schedule:

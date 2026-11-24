@@ -369,6 +369,8 @@ def build_main_layout(
     refresh_interval: int | None = None,
     tile_overhead: int | None = None,
     refresh_pending: bool = False,
+    age_seconds: float | None = None,
+    source_label: str = "",
 ) -> MainLayout:
     """Lay out provider tiles in a grid plus a bottom status bar.
 
@@ -377,6 +379,11 @@ def build_main_layout(
     knows the real font height), row heights are distributed so that every
     tile's bars get the same row height regardless of bar count.  When None,
     an estimate from the screen size is used.
+
+    *age_seconds* is how long ago the readings were last read successfully
+    from the server, and *source_label* names a route other than the normal
+    one that carried them (Plan 010). Both decorate the status line; see
+    :func:`_status_text`.
 
     """
     width, height = size
@@ -564,7 +571,9 @@ def build_main_layout(
     return MainLayout(
         size=size,
         tiles=tiles,
-        status_text=_status_text(readings, len(tiles), now, refresh_interval),
+        status_text=_status_text(
+            readings, len(tiles), now, refresh_interval, age_seconds, source_label,
+        ),
         status_rect=status_rect,
         refresh_rect=refresh_button_rect(status_rect),
         refresh_pending=refresh_pending,
@@ -589,22 +598,42 @@ def refresh_button_rect(status_rect: Rect) -> Rect:
     return Rect(x, y, side, side)
 
 
+# A reading's age is stated once it is older than the cadence printed beside
+# it can account for (twice the refresh interval), and never for anything
+# younger than this — so a healthy panel does not flicker "4m ago" on and off.
+_MIN_AGE_TO_SHOW_SECONDS = 600
+
+
+def age_worth_mentioning(refresh_interval: int | None) -> int:
+    """The age, in seconds, at which the status line starts stating it."""
+    if refresh_interval is None or refresh_interval <= 0:
+        return _MIN_AGE_TO_SHOW_SECONDS
+    return max(_MIN_AGE_TO_SHOW_SECONDS, 2 * refresh_interval)
+
+
 def _status_text(
     readings: list[Reading],
     provider_count: int,
     now: datetime | None,
     refresh_interval: int | None = None,
+    age_seconds: float | None = None,
+    source_label: str = "",
 ) -> str:
     if not readings:
         return "Waiting for data…"
     latest = max(r.fetched_at for r in readings)
     local = fmt.to_local(latest)
-    text = f"Updated {local.strftime('%H:%M:%S')}"
+    parts = [f"Updated {local.strftime('%H:%M:%S')}"]
+    # Which route carried these readings, when it was not the normal one.
+    if source_label:
+        parts.append(source_label)
+    if age_seconds is not None and age_seconds >= age_worth_mentioning(refresh_interval):
+        parts.append(fmt.format_age(age_seconds))
     if refresh_interval is not None:
-        text += f" · refresh {fmt.format_interval(refresh_interval)}"
+        parts.append(f"refresh {fmt.format_interval(refresh_interval)}")
     provider_word = "provider" if provider_count == 1 else "providers"
-    text += f" · {provider_count} {provider_word}"
-    return text
+    parts.append(f"{provider_count} {provider_word}")
+    return " · ".join(parts)
 
 
 def rotate_touch_norm(nx: float, ny: float, degrees: int) -> tuple[float, float]:

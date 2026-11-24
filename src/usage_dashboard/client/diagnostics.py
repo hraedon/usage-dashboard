@@ -25,11 +25,18 @@ import os
 import socket
 import subprocess
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from usage_dashboard.client import readings_cache as cache
+
 logger = logging.getLogger(__name__)
+
+# A worker that has not published a status since its own promised next poll
+# (plus this grace) is not running — crashed, or never started after an edit.
+_WORKER_OVERDUE = timedelta(minutes=5)
+_MB = 1_000_000
 
 _RESULT_LABELS = {
     "up-to-date": "ok",
@@ -86,6 +93,9 @@ class Diagnostics:
     running_commit: str
     check: UpdateCheck | None
     change: UpdateChange | None
+    # The cellular readings worker's last published status (Plan 010), or None
+    # where the worker is not installed.
+    cellular: "cache.WorkerStatus | None" = None
 
 
 @dataclass(frozen=True)
@@ -202,6 +212,78 @@ def diagnostic_lines(diag: Diagnostics, now: datetime) -> list[DiagLine]:
 
     if diag.change is not None and diag.change.when is not None:
         lines.append(DiagLine("Changed", format_ago(diag.change.when, now)))
+    lines.extend(cellular_lines(diag.cellular, now))
+    return lines
+
+
+_CELLULAR_STATE_LABELS = {
+    cache.STATE_IDLE: "normal route",
+    cache.STATE_FALLBACK: "cellular",
+    cache.STATE_BUDGET: "budget used",
+    cache.STATE_CLOCK: "clock not set",
+}
+
+
+def cellular_lines(status: "cache.WorkerStatus | None", now: datetime) -> list[DiagLine]:
+    """The overlay's cellular rows (Plan 010).
+
+    Nothing is shown while everything is ordinary — the normal route is in use
+    and little of the budget is spent — because the overlay has room for only
+    a handful of rows and "Cellular: normal route" is not worth one. Once the
+    unit is on cellular, over its budget, carrying an error, or has used most
+    of a month's data, the two rows that explain it appear.
+
+    ``now`` may be naive or aware UTC; status timestamps are naive UTC.
+    """
+    if status is None:
+        return []
+    reference = now.replace(tzinfo=None) if now.tzinfo is not None else now
+    budget_mb = status.budget_bytes / _MB
+    used_mb = status.bytes_used / _MB
+    # The worker states when it will next poll, and withdraws that when it
+    # stops. No next poll means it is not running: it stopped cleanly, or has
+    # not completed a first cycle.
+    stopped = status.next_poll_at is None
+    ordinary = (
+        not stopped
+        and status.state == cache.STATE_IDLE
+        and not status.cellular_error
+        and not status.normal_error
+        and used_mb < 0.9 * budget_mb
+    )
+    if ordinary:
+        return []
+
+    overdue = (
+        status.next_poll_at is not None
+        and reference > status.next_poll_at + _WORKER_OVERDUE
+    )
+    if stopped:
+        text = "worker stopped"
+    else:
+        text = _CELLULAR_STATE_LABELS.get(status.state, status.state)
+    if status.state == cache.STATE_FALLBACK:
+        if status.last_source == cache.SOURCE_CELLULAR and status.last_ok_at is not None:
+            text += f" · {format_ago(status.last_ok_at, reference)}"
+        elif status.last_ok_at is None:
+            # Nothing has ever been read on this unit: there is no preserved
+            # payload to fall back on, which is worth saying outright.
+            text += " · no reading yet"
+    problem = status.cellular_error or status.normal_error
+    if problem:
+        text += f" ({problem})"
+    if overdue:
+        text += " · worker stalled"
+    warn = (
+        stopped
+        or overdue
+        or status.state in (cache.STATE_BUDGET, cache.STATE_CLOCK)
+        or bool(problem)
+    )
+    lines = [DiagLine("Cellular", text, warn=warn)]
+    if status.bytes_used > 0:
+        near_limit = used_mb >= 0.9 * budget_mb
+        lines.append(DiagLine("Data", f"{used_mb:.1f} of {budget_mb:.0f} MB", warn=near_limit))
     return lines
 
 
@@ -265,11 +347,18 @@ def _git_commit() -> str:
     return ""
 
 
-def gather(state_dir: Path | None, server_url: str = "") -> Diagnostics:
+def gather(
+    state_dir: Path | None,
+    server_url: str = "",
+    cellular_dir: Path | None = None,
+) -> Diagnostics:
     """Snapshot the unit's diagnostics. Cheap enough to call when the overlay
     opens; every piece degrades to a blank/`—` rather than raising. Time-relative
     formatting (e.g. 'updated 4m ago') is applied later by :func:`diagnostic_lines`
-    against the draw-time clock, so the snapshot itself carries raw timestamps."""
+    against the draw-time clock, so the snapshot itself carries raw timestamps.
+
+    *cellular_dir* is the readings worker's state dir; pass it only where the
+    unit has the worker, so the overlay gains the cellular rows."""
     check = parse_check(state_dir / "update-last-check") if state_dir else None
     change = parse_change(state_dir / "update-last-change") if state_dir else None
     running = check.commit if (check and check.commit) else _git_commit()
@@ -280,4 +369,5 @@ def gather(state_dir: Path | None, server_url: str = "") -> Diagnostics:
         running_commit=running,
         check=check,
         change=change,
+        cellular=cache.read_status(cellular_dir) if cellular_dir else None,
     )

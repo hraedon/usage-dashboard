@@ -116,3 +116,20 @@ def format_interval(seconds: int) -> str:
     if seconds >= 60:
         return f"{seconds // 60}m"
     return f"{seconds}s"
+
+
+def format_age(seconds: float) -> str:
+    """How old a reading is, for the status line: ``3h ago``, ``12m ago``.
+
+    Hours keep their minutes until a day old, so ``23h 5m ago`` still reads as
+    under a day at a glance; from a day on, whole days and hours.
+    """
+    total = max(0, int(seconds))
+    days, rest = divmod(total, 86400)
+    hours, rest = divmod(rest, 3600)
+    minutes = rest // 60
+    if days:
+        return f"{days}d {hours}h ago"
+    if hours:
+        return f"{hours}h {minutes}m ago"
+    return f"{minutes}m ago"
