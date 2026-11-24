@@ -64,7 +64,7 @@ DEAD = cw.FetchOutcome(cw.TRANSPORT, reason="timeout")
 def _base_cfg(tmp_path: Path) -> cw.WorkerConfig:
     return cw.WorkerConfig(
         host=HOST, port=443, path=cw.READINGS_PATH, display_key="display-test",
-        destinations=(PIN,), interface="cell0",
+        destinations=(PIN,), dest_port=443, interface="cell0",
         helper="/usr/local/bin/usage-dashboard-cellular-link",
         state_dir=tmp_path, request_dir=tmp_path / "request",
         probe_interval=120.0, retry_delay=20.0, poll_interval=600.0, min_interval=60.0,
@@ -260,6 +260,18 @@ class TestConfig:
     def test_destinations_are_literals_and_canonical(self) -> None:
         env = _env() | {"CELLULAR_DEST": f"{PIN}, 2001:DB8::0001,{PIN}"}
         assert cw.WorkerConfig.from_env(env).destinations == (PIN, "2001:db8::1")
+
+    def test_dest_port_defaults_to_443_and_accepts_a_relay_port(self) -> None:
+        assert cw.WorkerConfig.from_env(_env()).dest_port == 443
+        cfg = cw.WorkerConfig.from_env(_env() | {"CELLULAR_DEST_PORT": "8443"})
+        # The relay's port is for the pinned address only: SERVER_URL stays 443.
+        assert cfg.dest_port == 8443 and cfg.port == 443
+
+    @pytest.mark.parametrize("port", ["0", "65536", "-1", "443.5", "https"])
+    def test_dest_port_must_be_a_tcp_port(self, port: str) -> None:
+        env = _env() | {"CELLULAR_DEST_PORT": port}
+        with pytest.raises(cw.ConfigError, match="CELLULAR_DEST_PORT"):
+            cw.WorkerConfig.from_env(env)
 
     @pytest.mark.parametrize("dest", ["dash.example", "192.0.2.10/32", " ", "10.0.0.256"])
     def test_a_name_or_malformed_address_is_refused(self, dest: str) -> None:
@@ -941,6 +953,25 @@ class TestHttpFetcher:
         fetcher.read(PIN, cellular=True)
         assert pools[0] == [NORMAL_IP, NORMAL_IP]   # reused on its own route
         assert pools[1] == [PIN]                     # never the Wi-Fi pool
+
+
+    def test_only_cellular_reads_use_the_relay_port(self, tmp_path: Path) -> None:
+        seen: list[tuple[bool, str, int]] = []
+
+        def factory() -> httpx.Client:
+            def handler(request: httpx.Request) -> httpx.Response:
+                port = request.url.port or 443   # httpx drops the scheme's default
+                seen.append((port == 8443, request.headers["host"], port))
+                return httpx.Response(200, json=_payload(), request=request)
+
+            return httpx.Client(transport=httpx.MockTransport(handler))
+
+        cfg = replace(_cfg(tmp_path), dest_port=8443)
+        fetcher = cw.HttpFetcher(cfg, client_factory=factory,
+                                 resolve=lambda host, port: [NORMAL_IP])
+        fetcher.read(NORMAL_IP, cellular=False)
+        fetcher.read(PIN, cellular=True)
+        assert seen == [(False, HOST, 443), (True, HOST, 8443)]
 
 
 # -- bounded name resolution ---------------------------------------------------

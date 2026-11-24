@@ -616,6 +616,27 @@ class TestRehearsal:
         _helper(lab, dest_v4=(PIN, PIN_LOW)).unroute()
         assert f"dev {IFACE}" not in _route_get("-4", PIN_LOW, WORKER_UID)
 
+    def test_a_relay_port_replaces_443(
+        self, lab: dict[str, Any], carrier_servers: None
+    ) -> None:
+        # CELLULAR_DEST_PORT: the pinned address is a stable TCP relay on its
+        # own port. The worker reaches that port and nothing else — 443 on
+        # the same address included — and nobody else reaches either.
+        helper = _helper(lab, dest_port=8443)
+        try:
+            helper.route()   # reloads the policy; raises if its own check fails
+            listed = _run("nft", "list", "table", "inet", cl.TABLE_NAME).stdout
+            assert f"ip daddr {PIN} tcp dport 8443 accept" in listed
+            assert "dport 443 " not in listed
+            assert _connect(WORKER_UID, PIN, port=8443) == "connected"
+            assert _connect(WORKER_UID, PIN, port=443) == DROPPED
+            assert _connect(0, PIN, port=8443, device=IFACE) == DROPPED
+        finally:
+            helper.unroute()
+        # The later tests expect the 443 policy back.
+        lab["helper"].route()
+        assert _connect(WORKER_UID, PIN) == "connected"
+
     def test_ipv6_when_it_is_enabled(self, lab: dict[str, Any], carrier_servers: None) -> None:
         _run("ip", "-6", "address", "add", V6_MODEM, "dev", IFACE, "nodad", check=True)
         helper = _helper(lab, dest_v4=(PIN,), dest_v6=(V6_PIN,), ipv6=True)

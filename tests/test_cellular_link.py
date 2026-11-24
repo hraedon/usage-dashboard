@@ -432,6 +432,14 @@ class TestSettings:
         assert (s.worker_uid, s.table, s.rule_pref) == (UID, cl.DEFAULT_TABLE, cl.DEFAULT_RULE_PREF)
         assert s.link_setup == frozenset({cl.DHCP}) and s.ipv6 is False
 
+    def test_dest_port_defaults_to_443_and_takes_a_relay_port(self, tmp_path: Path) -> None:
+        base = f"CELLULAR_CONNECTION=cellular\nCELLULAR_IFACE={IFACE}\nCELLULAR_DEST={PIN}\n"
+        assert self._load(tmp_path, base).dest_port == 443
+        assert self._load(tmp_path, base + "CELLULAR_DEST_PORT=8443\n").dest_port == 8443
+        for bad in ("0", "65536", "https"):
+            with pytest.raises(cl.ConfigError, match="CELLULAR_DEST_PORT"):
+                self._load(tmp_path, base + f"CELLULAR_DEST_PORT={bad}\n")
+
     def test_the_file_is_read_not_sourced(self, tmp_path: Path) -> None:
         # It carries a credential next to these settings, so it is parsed as
         # data: no expansion, no commands, whatever the line looks like.
@@ -556,6 +564,13 @@ class TestRenderPolicy:
     def test_several_addresses_form_a_set(self) -> None:
         policy = cl.render_policy(IFACE, UID, [PIN2, PIN], [])
         assert f"meta skuid {UID} ip daddr {{ {PIN}, {PIN2} }} tcp dport 443 accept" in policy
+
+    def test_a_relay_port_replaces_443_and_nothing_else(self) -> None:
+        policy = cl.render_policy(IFACE, UID, [PIN], [], dest_port=8443)
+        assert f"meta skuid {UID} ip daddr {PIN} tcp dport 8443 accept" in policy
+        assert "443 accept" not in policy.replace("8443 accept", "")
+        with pytest.raises(ValueError):
+            cl.render_policy(IFACE, UID, [PIN], [], dest_port=0)
 
     def test_ipv6_and_dhcpv6(self) -> None:
         policy = cl.render_policy(IFACE, UID, [PIN], [PIN6], link_setup={"dhcp", "dhcpv6"})
@@ -1265,6 +1280,15 @@ class TestFirewallIsRechecked:
         world["helper"].route()
         assert world["sys"].names()[:2] == ["check-firewall", "load-firewall"]
         assert "\tchain output {" in world["sys"].listed
+
+    def test_a_relay_port_is_loaded_and_verified(self, world: dict[str, Any]) -> None:
+        helper = _reloaded(world, dest_port=8443)
+        helper.route()
+        assert f"ip daddr {PIN} tcp dport 8443 accept" in world["sys"].listed
+        # A policy still carrying 443 is not the one this configuration wants.
+        world["sys"].listed = world["sys"].listed.replace("dport 8443 ", "dport 443 ")
+        with pytest.raises(cl.LinkError, match="tcp dport 8443"):
+            helper._verify_policy()
 
     def test_a_flushed_table_is_reloaded(self, world: dict[str, Any]) -> None:
         world["helper"].route()

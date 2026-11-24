@@ -449,13 +449,14 @@ sudo cp deploy/pi/usage-dashboard-cellular.env.example /etc/usage-dashboard-cell
 sudo nano /etc/usage-dashboard-cellular.env && sudo chmod 600 /etc/usage-dashboard-cellular.env
 ```
 
-The file is documented key by key. The five that matter:
+The file is documented key by key. The six that matter:
 
 | Key | What it must be |
 |-----|-----------------|
 | `SERVER_URL` | The dashboard, `https://`, port 443 — as in the GUI's env file |
 | `CELLULAR_DISPLAY_KEY` | The server's `display-api-key` (see the secrets table in the root README). **Not** the GUI's `API_KEY` |
-| `CELLULAR_DEST` | The dashboard's **public** address as an IP literal — the one the *public* ingress has. The name is split-horizon: on the home network it resolves to a LAN address, which the metered link cannot reach. The hostname still goes out as SNI and `Host`, so the certificate is verified against the name. If that address can change, this has to be updated on the unit when it does |
+| `CELLULAR_DEST` | A **fixed public** address as an IP literal. The home WAN address behind `usage.hraedon.com` changes (DDNS), so the units pin the stable relay on beacon instead: `40.160.144.139` with `CELLULAR_DEST_PORT=8443` (homelab `vps/usage-relay`). The relay passes TLS through untouched to whatever the name resolves to, and forwards only a ClientHello for `usage.hraedon.com`. The hostname still goes out as SNI and `Host`, so the certificate is verified against the name end to end. (Pinning the ingress itself, port 443, works only where its public address is stable. The name is split-horizon, so never pin the address the home network resolves.) |
+| `CELLULAR_DEST_PORT` | The TCP port on `CELLULAR_DEST`: `8443` for the beacon relay, `443` (the default) for a directly pinned ingress. The firewall permits exactly this port; `SERVER_URL` stays on 443 |
 | `CELLULAR_IFACE` | `cell0` as renamed above |
 | `CELLULAR_BUDGET_MB` | A monthly cap in decimal MB, required. Counted from the modem interface's own packet counters, so it includes the TLS handshake — about 20 KB a read, so the default cadence (one read per 10 minutes, only while the panel is lit) is on the order of 20 MB a month. Over the cap, the link stays off until next month. The count survives a restart and a wrong clock at boot |
 

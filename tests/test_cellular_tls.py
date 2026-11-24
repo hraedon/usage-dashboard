@@ -17,6 +17,7 @@ Skipped where ``openssl`` is not installed (it cuts the throwaway certificates).
 """
 from __future__ import annotations
 
+import dataclasses
 import http.server
 import json
 import shutil
@@ -124,7 +125,7 @@ def make_server(tmp_path: Path):
 def _config(port: int, tmp_path: Path) -> cw.WorkerConfig:
     return cw.WorkerConfig(
         host=HOST, port=port, path=cw.READINGS_PATH, display_key="display-test",
-        destinations=("192.0.2.10",), interface="cell0", helper="/helper",
+        destinations=("192.0.2.10",), dest_port=port, interface="cell0", helper="/helper",
         state_dir=tmp_path, request_dir=tmp_path / "request",
         probe_interval=120.0, retry_delay=20.0, poll_interval=600.0, min_interval=60.0,
         backoff_max=3600.0, awake_timeout=150.0, connect_timeout=5.0, read_timeout=5.0,
@@ -206,6 +207,27 @@ class TestOverARealHandshake:
         assert fetcher.read(_address(server), cellular=True).ok
         assert server.sni == [HOST, HOST]
         assert [request["host"] for request in server.requests] == [HOST, HOST]
+        fetcher.close()
+
+    def test_a_relay_port_is_used_for_cellular_reads_only(
+        self, tmp_path: Path, make_server: Any
+    ) -> None:
+        # CELLULAR_DEST_PORT: the pinned address is a TCP relay on its own
+        # port in front of the dashboard. The cellular read goes to that port
+        # and still verifies the dashboard's name; the normal route keeps
+        # SERVER_URL's port (here a closed one, so it must fail).
+        server = make_server(HOST, f"DNS:{HOST}")
+        certificate = Path(server.cert)  # type: ignore[attr-defined]
+        cfg = dataclasses.replace(_config(1, tmp_path), dest_port=server.server_address[1])
+        fetcher = cw.HttpFetcher(
+            cfg,
+            resolve=lambda host, port: [_address(server)],
+            client_factory=lambda: _client_trusting(certificate),
+        )
+        assert fetcher.read(_address(server), cellular=True).ok
+        assert not fetcher.read(_address(server), cellular=False).reachable
+        assert server.sni == [HOST]
+        assert [request["host"] for request in server.requests] == [HOST]
         fetcher.close()
 
     def test_an_error_status_comes_back_as_itself(self, tmp_path: Path, make_server: Any) -> None:

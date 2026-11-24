@@ -230,6 +230,10 @@ class LinkSettings:
     rule_pref: int
     link_setup: frozenset[str]
     ipv6: bool
+    # The TCP port on CELLULAR_DEST. 443 when the dashboard's own ingress is
+    # pinned; another port when the pinned address is a stable relay in front
+    # of it (the home WAN address changes; see deploy/pi/README.md §8).
+    dest_port: int = 443
     env_file: Path = ENV_FILE
     resolv_conf: Path = RESOLV_CONF
     resolved_conf: Path = RESOLVED_CONF
@@ -271,6 +275,7 @@ class LinkSettings:
         if table in _RESERVED_TABLES:
             raise ConfigError(f"CELLULAR_TABLE {table} is a reserved routing table")
         pref = _number(values, "CELLULAR_RULE_PREF", DEFAULT_RULE_PREF, 1, 2**32 - 1)
+        dest_port = _number(values, "CELLULAR_DEST_PORT", 443, 1, 65535)
 
         ipv6 = _flag(values, "CELLULAR_IPV6")
         if dest_v6 and not ipv6:
@@ -303,6 +308,7 @@ class LinkSettings:
             rule_pref=pref,
             link_setup=setup,
             ipv6=ipv6,
+            dest_port=dest_port,
             env_file=env_file,
             resolv_conf=resolv_conf,
             resolved_conf=resolved_conf,
@@ -380,6 +386,7 @@ def render_policy(
     dest_v6: Iterable[str],
     *,
     link_setup: Iterable[str] = (DHCP,),
+    dest_port: int = 443,
 ) -> str:
     """The nftables ruleset for the modem interface, as one atomic reload.
 
@@ -392,7 +399,8 @@ def render_policy(
     What it says, per chain:
 
     * ``output`` — on the modem interface, nothing leaves except what the
-      worker user sends to a pinned address on TCP 443, plus the link-setup
+      worker user sends to a pinned address on its TCP port (443 unless
+      ``CELLULAR_DEST_PORT`` names a relay's), plus the link-setup
       packets the qualified modem mode needs. ``meta skuid`` is what makes it
       "this one user": another process sending to the very same address is
       dropped. Everything else is counted and dropped.
@@ -410,6 +418,8 @@ def render_policy(
         raise ValueError(f"not a usable interface name: {interface!r}")
     if worker_uid < 1:
         raise ValueError("the worker uid must be a positive integer")
+    if not 1 <= dest_port <= 65535:
+        raise ValueError(f"not a TCP port: {dest_port!r}")
     setup = set(link_setup) - {NONE}
     unknown = setup - set(_LINK_SETUP_CHOICES)
     if unknown:
@@ -428,12 +438,12 @@ def render_policy(
     if v4:
         output.append(
             f"meta skuid {worker_uid} ip daddr {_address_match(v4)} "
-            "tcp dport 443 accept"
+            f"tcp dport {dest_port} accept"
         )
     if v6:
         output.append(
             f"meta skuid {worker_uid} ip6 daddr {_address_match(v6)} "
-            "tcp dport 443 accept"
+            f"tcp dport {dest_port} accept"
         )
     if DHCPV6 in setup:
         # The DHCPv6 client listens on 546 and talks to the relay on 547.
@@ -643,7 +653,7 @@ class LinkHelper:
     def _policy_text(self) -> str:
         return render_policy(
             self.s.interface, self.s.worker_uid, self.s.dest_v4, self.s.dest_v6,
-            link_setup=self.s.link_setup,
+            link_setup=self.s.link_setup, dest_port=self.s.dest_port,
         )
 
     def _policy_stamp(self) -> Path:
@@ -710,7 +720,7 @@ class LinkHelper:
             f'oifname "{s.interface}"',
             f'iifname "{s.interface}"',
             f"meta skuid {s.worker_uid}",
-            "tcp dport 443",
+            f"tcp dport {s.dest_port} ",
             "hook forward",
         ]
         if s.dest_v4:
@@ -1230,7 +1240,7 @@ class LinkHelper:
         print(f"profile:    {s.connection}")
         print(f"interface:  {s.interface} (present: {self._interface_exists()})")
         print(f"worker:     {s.worker_user} (uid {s.worker_uid})")
-        print(f"destinations: {', '.join(s.destinations)} on tcp/443")
+        print(f"destinations: {', '.join(s.destinations)} on tcp/{s.dest_port}")
         print(f"table:      {s.table}, rule preference {s.rule_pref}")
         print(f"policy:     {'loaded and current' if self._policy_is_current() else 'NOT loaded'}")
         active = self._connection_active()

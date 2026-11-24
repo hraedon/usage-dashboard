@@ -222,6 +222,10 @@ class WorkerConfig:
     path: str
     display_key: str
     destinations: tuple[str, ...]
+    # The TCP port on the pinned destinations. 443 for the dashboard's own
+    # ingress; another port for a stable relay in front of it. Only the
+    # cellular reads use it: the normal route always goes to SERVER_URL.
+    dest_port: int
     interface: str
     helper: str
     state_dir: Path
@@ -253,6 +257,9 @@ class WorkerConfig:
                 "(the setting file cannot carry anything else safely)"
             )
         destinations = _destinations(_require(env, "CELLULAR_DEST"))
+        dest_port = _number(env, "CELLULAR_DEST_PORT", 443.0, 1.0, integer=True)
+        if not 1 <= dest_port <= 65535:
+            raise ConfigError(f"CELLULAR_DEST_PORT must be a TCP port, got {dest_port:g}")
         interface = _require(env, "CELLULAR_IFACE")
         if not _INTERFACE_NAME.match(interface):
             raise ConfigError(
@@ -284,6 +291,7 @@ class WorkerConfig:
             path=path,
             display_key=display_key,
             destinations=destinations,
+            dest_port=int(dest_port),
             interface=interface,
             helper=env.get("CELLULAR_HELPER") or "/usr/local/bin/usage-dashboard-cellular-link",
             state_dir=state_dir,
@@ -323,7 +331,9 @@ def _server_url(url: str) -> tuple[str, int, str]:
     if not host:
         raise ConfigError("SERVER_URL has no hostname")
     if port not in (None, 443):
-        raise ConfigError("SERVER_URL must use port 443: that is the only port the link permits")
+        raise ConfigError(
+            "SERVER_URL must use port 443 (a relay's port goes in CELLULAR_DEST_PORT)"
+        )
     if parts.username or parts.password or parts.query or parts.fragment:
         raise ConfigError("SERVER_URL may not carry credentials, a query or a fragment")
     base = parts.path.rstrip("/")
@@ -873,7 +883,9 @@ def _sni_hostname(host: str) -> bytes:
         return host.encode("idna")
 
 
-def _request(client: httpx.Client, cfg: WorkerConfig, ip: str) -> FetchOutcome:
+def _request(
+    client: httpx.Client, cfg: WorkerConfig, ip: str, port: int | None = None
+) -> FetchOutcome:
     """One GET against the literal *ip*, addressed to ``cfg.host``.
 
     Three settings here are the whole reason this function exists rather than
@@ -890,7 +902,7 @@ def _request(client: httpx.Client, cfg: WorkerConfig, ip: str) -> FetchOutcome:
       destination is not the dashboard; chasing it would spend data on an
       address the firewall has not approved — and be dropped anyway.
     """
-    url = f"https://{_url_host(ip)}:{cfg.port}{cfg.path}"
+    url = f"https://{_url_host(ip)}:{port or cfg.port}{cfg.path}"
     try:
         response = client.get(
             url,
@@ -1032,7 +1044,9 @@ class HttpFetcher:
         return list(found) if found else []
 
     def read(self, ip: str, *, cellular: bool) -> FetchOutcome:
-        return _request(self._cellular if cellular else self._normal, self._cfg, ip)
+        if cellular:
+            return _request(self._cellular, self._cfg, ip, self._cfg.dest_port)
+        return _request(self._normal, self._cfg, ip)
 
     def close(self) -> None:
         self._normal.close()

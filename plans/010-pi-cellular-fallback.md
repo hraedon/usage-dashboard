@@ -220,8 +220,17 @@ code before being acted on:
 2. Create the isolated NetworkManager profile and remove the one NetworkManager
    generated for the modem; confirm `usage-dashboard-cellular-link check`
    passes on the unit.
-3. Confirm that the public ingress address is stable enough to pin, and use it
-   for `CELLULAR_DEST`.
+3. ~~Confirm that the public ingress address is stable enough to pin.~~ It is
+   not: the home WAN address behind `usage.hraedon.com` changes (Porkbun
+   DDNS). Resolved 2026-11-24 with a stable relay rather than a resolver on
+   the metered path: HAProxy on beacon (`40.160.144.139:8443`, homelab
+   `vps/usage-relay`) passes the TLS stream through to the DDNS name, checked
+   by SNI, re-resolved every minute. The units pin `CELLULAR_DEST=40.160.144.139`,
+   `CELLULAR_DEST_PORT=8443` (new setting, both the worker and the helper; the
+   firewall permits exactly that port). TLS is still verified end to end
+   against the dashboard's name, so the relay never sees the display key.
+   Verified through the relay: a valid certificate and 401 without a key; a
+   ClientHello for another name is dropped.
 4. A `display-api-key` in the server Secret and a rollout restart (the drift
    guard reports both until then).
 5. The bench items above, with local rollback access.
