@@ -703,10 +703,11 @@ class TestFutureDatedCache:
         selection = view.select(self._own(), _ago(600))
         assert selection.readings == self._own()
         assert selection.cellular is False
-        # Small clock noise is not a step, and is still preferred.
+        # Small clock noise (30 s; _ago takes minutes) is not a step, and is
+        # still preferred.
         cache.publish(
             cache.CacheEntry(
-                _ago(-30), cache.SOURCE_CELLULAR, 600, _payload(_reading(percent=77.0))
+                _ago(-0.5), cache.SOURCE_CELLULAR, 600, _payload(_reading(percent=77.0))
             ),
             tmp_path,
         )

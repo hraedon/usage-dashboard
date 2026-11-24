@@ -18,6 +18,7 @@ from __future__ import annotations
 import os
 import re
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -329,8 +330,11 @@ class TestSettingsTemplate:
 def test_the_console_script_exits_with_the_config_code_when_unconfigured() -> None:
     env = {k: v for k, v in os.environ.items() if not k.startswith("CELLULAR_")}
     env.pop("SERVER_URL", None)
+    # The entry point beside this interpreter: CI runs the venv's pytest
+    # without putting the venv's bin directory on PATH.
+    script = Path(sys.executable).parent / "usage-dashboard-cellular"
     proc = subprocess.run(
-        ["usage-dashboard-cellular"], capture_output=True, text=True, check=False,
+        [str(script)], capture_output=True, text=True, check=False,
         timeout=60, env=env,
     )
     assert proc.returncode == cw.EXIT_CONFIG
