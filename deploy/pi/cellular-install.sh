@@ -82,8 +82,9 @@ echo "    gui user=$RUNUSER  venv=$VENV"
 # --- 2. packages -------------------------------------------------------------
 echo "==> apt packages"
 sudo apt-get update -qq
-# nftables enforces the link; iproute2 selects the route for the worker.
-sudo apt-get install -y nftables iproute2
+# nftables enforces the link; iproute2 selects the route for the worker; acl
+# lets the worker reach the venv through a private home directory (step 3b).
+sudo apt-get install -y nftables iproute2 acl
 if [ "$INSTALL_MODEM_MANAGER" = "1" ]; then
     sudo apt-get install -y modemmanager usb-modeswitch
 fi
@@ -98,6 +99,27 @@ else
     echo "==> system user $WORKER_USER"
     sudo useradd --system --user-group --no-create-home \
         --shell /usr/sbin/nologin "$WORKER_USER"
+fi
+
+# --- 3b. the worker can reach the venv, and nothing more ----------------------
+# The worker runs the venv's entry point, which lives in the run user's
+# checkout. Debian 13 creates home directories 0700, so a system user cannot
+# reach it (systemd reports 203/EXEC "Permission denied"; found on the first
+# unit). Grant the worker traverse-only (--x) on each ancestor it cannot
+# enter: it can open paths it already knows, never list the home directory,
+# and nobody else gains anything. Undo: setfacl -x u:<worker> <dir>.
+echo "==> worker access to $VENV"
+_dir=""
+for _part in $(printf '%s' "$(dirname "$VENV")" | tr '/' ' '); do
+    _dir="$_dir/$_part"
+    if ! sudo -u "$WORKER_USER" test -x "$_dir"; then
+        sudo setfacl -m "u:$WORKER_USER:--x" "$_dir"
+        echo "    traverse-only ACL for $WORKER_USER on $_dir"
+    fi
+done
+if ! sudo -u "$WORKER_USER" test -x "$VENV/bin/python"; then
+    echo "ERROR: $WORKER_USER still cannot reach $VENV/bin/python" >&2
+    exit 1
 fi
 
 # --- 4. state and signal directories -----------------------------------------

@@ -228,6 +228,15 @@ class TestInstaller:
         assert "-m 0440" in text
         assert "/etc/sudoers.d/usage-dashboard-cellular" in text
 
+    def test_the_worker_gets_traverse_only_access_to_the_venv(self) -> None:
+        # Debian 13 homes are 0700; without this the worker fails 203/EXEC.
+        text = INSTALLER.read_text()
+        assert 'setfacl -m "u:$WORKER_USER:--x"' in text
+        assert "setfacl -R" not in text and ":r-x" not in text and ":rwx" not in text
+        # Granted after the user exists, checked before any unit is installed.
+        assert text.index("useradd --system") < text.index("setfacl -m")
+        assert text.index('test -x "$VENV/bin/python"') < text.index('"$UNIT_DIR/$UNIT_NAME"')
+
     def test_the_unit_is_verified_before_it_is_installed(self) -> None:
         text = INSTALLER.read_text()
         assert text.index("systemd-analyze verify") < text.index('"$UNIT_DIR/$UNIT_NAME"')
