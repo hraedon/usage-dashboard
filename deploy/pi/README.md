@@ -484,6 +484,7 @@ sudo systemctl disable usage-dashboard-cellular-firewall.service
 sudo /usr/local/bin/usage-dashboard-cellular-link down
 sudo rm /etc/usage-dashboard-cellular.env     # both units can no longer start
 sudo systemctl restart usage-dashboard-gui.service   # after removing CELLULAR_CACHE
+sudo setfacl -x u:usage-dashboard-cellular "$HOME"   # the installer's traverse-only ACL, if it added one
 ```
 
 The worker also takes the link down whenever it stops, so there is no link
