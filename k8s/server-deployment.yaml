@@ -33,6 +33,15 @@ spec:
                   name: server-secrets
                   key: agent-api-key
                   optional: true
+            # Plan 010: optional read-only credential scoped to the readings
+            # route, carried by a Pi's cellular readings worker across the
+            # metered link. Absent = no display credential is accepted.
+            - name: DISPLAY_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: server-secrets
+                  key: display-api-key
+                  optional: true
             - name: DB_PATH
               value: "/data/readings.db"
             # Plan 005 Phase C (2026-11-07) removed the CLAUDE_* seed env.

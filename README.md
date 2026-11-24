@@ -42,6 +42,13 @@ authentication, query parameters, response semantics and a Python example.
 The [`usage-dashboard capacity` CLI](docs/agent-cli.md) calls the same endpoint
 and emits JSON for agents with shell access.
 
+**Panels:** `GET /readings` also accepts an optional, separate **display
+credential** (`DISPLAY_API_KEY`, Secret key `display-api-key`). It is the token
+a Pi's cellular readings worker carries across a metered link (see *Cellular
+fallback* below), and it reaches this one route and nothing else — not
+`/refresh`, not `/history`, not `/schedule`. A test walks every authenticated
+route in the OpenAPI schema to keep that true.
+
 | Endpoint | Auth | Description |
 |----------|------|-------------|
 | `GET /readings` | Bearer token | Returns latest reading per provider as JSON |
@@ -158,6 +165,7 @@ env, the live deployment silently lacked it) is the failure class it exists for.
 |-----|----------|-------------|
 | `api-key` | Yes | Shared Bearer token for server-client auth |
 | `agent-api-key` | No | Distinct read-only token for `/api/v1/agent/capacity` (Plan 008); must differ from `api-key` |
+| `display-api-key` | No | Distinct read-only token for the readings route only (Plan 010, the Pi cellular worker); must differ from `api-key` and `agent-api-key` |
 | `zai-api-key` | No | z.ai API key |
 | `ollama-cookie` | No | ollama.com browser session cookie (`name=value`; see below) |
 | `opencode-workspace-id` | No | OpenCode Go workspace id (`wrk_…`; see below) |
@@ -510,6 +518,11 @@ without an SSH session:
   `import failed`) and how long ago; a failure is shown in red. **No record** (red)
   means the updater hasn't written a status yet.
 - **Changed** — when the code last actually moved.
+- **Cellular** and **Data** — only on a unit with the cellular fallback, and
+  only when there is something to say: it is on cellular (with the age of the
+  last cellular read), over its data budget, carrying an error, the worker has
+  stopped reporting, or most of the month's data is used. An ordinary healthy
+  unit shows neither, and the overlay looks exactly as before.
 
   Update health comes from two tiny files the updater writes under the state dir
   (`update-last-check`, `update-last-change`); no daemon, no config. Hostname/IPs
@@ -533,6 +546,49 @@ to 0 — blanking is what sleep is for:
   unwritable path degrades to "remembered within the session only".
 - **No-op without a controllable backlight** (dev/windowed mode): the `−`/`+`
   show `—` and do nothing — but the overlay still opens for the diagnostics.
+
+## Cellular fallback (Plan 010)
+
+A unit whose only link is a phone hotspot goes dark whenever the hotspot is
+missing or has no internet. An opted-in Pi with a cellular HAT can keep showing
+readings over the metered link instead — **readings, and nothing else**. Wi-Fi
+or Ethernet always stays the preferred path.
+
+- **The server polls the providers; the Pi fetches the stored snapshot.** Over
+  cellular that is one request, `GET /api/v1/readings`, made by a small
+  *cellular readings worker* that runs as its own system user — separate from
+  the GUI and the updater, which never use the metered link.
+- **The kernel enforces it.** An nftables policy on the modem interface lets
+  that one user reach the dashboard's address on TCP 443 and drops everything
+  else, other users sending to the same address included; a policy route selects
+  the modem for that user only; nothing is forwarded through it. The carrier's
+  default route and DNS are kept out of the system's own tables.
+- **Least privilege end to end.** The worker holds a read-only display
+  credential that reaches the readings route alone, connects to a pinned
+  address (the hostname still goes out as SNI and `Host`, so TLS is verified
+  against the name), follows no redirects and inherits no proxy.
+- **The normal route decides.** The worker falls back only after the normal
+  route stops answering; any HTTP answer, even an error, counts as reachable.
+  The first success on the normal route ends the fallback.
+- **Bounded by a budget you set.** One read per 10 minutes, only while the
+  panel is lit, counted from the modem interface's own packet counters against
+  a required monthly cap. Over the cap, the link stays off until next month.
+  A refresh tap can bring a read forward, never past a wait that follows a
+  failed or refused one.
+- **Nothing is lost when both routes fail.** The last successful payload and
+  its timestamp are preserved, shown with their age on the panel.
+
+The deny policy is loaded at every boot before NetworkManager starts. It is
+opt-in per unit; its systemd units, wrapper and sudoers rule are installed by
+hand and never auto-redeployed. The full procedure — the HAT as it really
+presents itself, stopping NetworkManager from adopting the modem, provisioning,
+the settings, verification and rollback — is in
+[`deploy/pi/README.md` §8](deploy/pi/README.md#8-cellular-fallback-opt-in--plan-010).
+The firewall and routing are rehearsed against a real kernel by
+`tests/test_cellular_link_kernel.py`, and the helper's reading of NetworkManager
+was checked against the real one. Provisioning the modem and anything needing a
+live SIM are bench items still to be done on hardware (see
+[Plan 010](plans/010-pi-cellular-fallback.md)).
 
 ## Development
 

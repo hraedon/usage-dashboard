@@ -36,6 +36,10 @@ build-backend = "hatchling.build"
 [project.scripts]
 usage-dashboard = "usage_dashboard.cli:main"
 usage-dashboard-gui = "usage_dashboard.client.gui:main"
+# Cellular readings worker (Plan 010); run by usage-dashboard-cellular.service
+# on an opted-in Pi. The privileged link helper is not an entry point on
+# purpose: it is reached only through its root-owned sudoers-bound wrapper.
+usage-dashboard-cellular = "usage_dashboard.client.cellular_worker:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/usage_dashboard"]

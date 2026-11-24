@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# Root-owned entry point for the cellular link helper (Plan 010).
+#
+# deploy/pi/cellular-install.sh copies this to
+# /usr/local/bin/usage-dashboard-cellular-link (root:root, 0755) and grants the
+# cellular readings worker a sudoers rule for exactly four command lines:
+#
+#   usage-dashboard-cellular-link firewall   (load the deny policy; nothing else)
+#   usage-dashboard-cellular-link route
+#   usage-dashboard-cellular-link unroute
+#   usage-dashboard-cellular-link down
+#
+# The worker (usage-dashboard-cellular.service) calls those through `sudo -n`;
+# usage-dashboard-cellular-firewall.service calls `firewall` at boot, before
+# NetworkManager.
+# Like usage-dashboard-redeploy, this wrapper recovers the venv from the
+# already-installed updater rather than taking it as an argument — which is
+# what lets the sudoers rule stay argument-free, so the worker cannot point the
+# helper at an interpreter of its own — and hands off to the Python module,
+# where the logic is unit-tested without root.
+#
+# Exactly one word is accepted, and only from the fixed list. Anything else is
+# a usage error: sudo would refuse it anyway, and this way the refusal is the
+# same whether or not sudo is in front.
+set -euo pipefail
+
+UPDATER="/usr/local/bin/usage-dashboard-update"
+
+log() { echo "usage-dashboard-cellular-link: $*" >&2; }
+
+VENV="$(sed -n 's/^VENV="\(.*\)"$/\1/p' "$UPDATER" 2>/dev/null | head -1)"
+if [ -z "$VENV" ] || [ ! -x "$VENV/bin/python" ]; then
+    log "could not recover the venv from $UPDATER (run deploy/pi/install.sh once)"
+    exit 2
+fi
+
+case "${1:-}" in
+    firewall|route|unroute|down|status|check|inspect)
+        if [ "$#" -ne 1 ]; then
+            log "takes exactly one word: firewall | route | unroute | down | status | check | inspect"
+            exit 2
+        fi
+        # -I: no PYTHON* variables, no user site-packages, no import from the
+        # caller's directory — the interpreter runs only what the venv holds.
+        exec "$VENV/bin/python" -I -m usage_dashboard.deploy.cellular_link "$1"
+        ;;
+    *)
+        log "usage: usage-dashboard-cellular-link firewall | route | unroute | down | status | check | inspect"
+        exit 2
+        ;;
+esac

@@ -1,0 +1,31 @@
+[Unit]
+Description=AI Usage Dashboard cellular deny policy (Plan 010)
+# The firewall around the modem must exist before anything can bring the
+# modem's interface up — including a profile NetworkManager invents for it on
+# its own, which is what it does with any Ethernet device that has none. On the
+# first unit with the HAT fitted that made the metered link the Pi's preferred
+# route, unfiltered, from boot.
+#
+# network-pre.target is the hook systemd provides for exactly this: everything
+# that configures networking orders itself after it, so ordering before it puts
+# the policy in place first. This unit only loads and verifies the policy; it
+# never touches the link, so there is nothing it can get wrong. The readings
+# worker loads the same policy again when it starts, in case this unit could
+# not.
+DefaultDependencies=no
+Wants=network-pre.target
+Before=network-pre.target shutdown.target
+After=local-fs.target
+Conflicts=shutdown.target
+# Inert until the unit is provisioned, like the worker's own unit.
+ConditionPathExists=/etc/usage-dashboard-cellular.env
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/usage-dashboard-cellular-link firewall
+# Never hold the network's start waiting on it.
+TimeoutStartSec=30
+
+[Install]
+WantedBy=multi-user.target

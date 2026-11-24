@@ -261,6 +261,279 @@ journalctl -u usage-dashboard-update -n 20
 sudo systemctl mask systemd-backlight@.service
 ```
 
+## 8. Cellular fallback (opt-in — Plan 010)
+
+A unit whose only link is a phone hotspot goes dark whenever the hotspot is
+missing or has no internet. An opted-in Pi with a cellular HAT can instead
+keep showing readings over the metered link — and nothing else. Wi-Fi or
+Ethernet always stays the preferred path.
+
+The split is deliberate, and everything below follows from it:
+
+- **The server polls the providers.** The Pi only ever fetches the stored
+  snapshot (`GET /api/v1/readings`). The panel renders it locally.
+- **One unprivileged process may use the modem.** The *cellular readings
+  worker* (`usage-dashboard-cellular.service`) runs as its own system user,
+  separate from the GUI and the updater, and holds a read-only *display
+  credential* that reaches the readings route and nothing else.
+- **The kernel enforces it, not the code's good intentions.** An nftables
+  policy on the modem interface permits that one UID to the dashboard's
+  address on TCP 443, plus the link-setup packets the modem needs, and drops
+  everything else — other users sending to the *same* address included. A
+  policy route selects the modem for the worker's UID only. Nothing is
+  forwarded through the modem. The policy is loaded at every boot, before
+  NetworkManager starts, and again whenever the worker starts.
+- **The normal route decides.** The worker asks for the readings over the
+  normal route with bounded timeouts. Only when that gets no HTTP answer at
+  all (twice) does it fall back; a server that *answers* — even with 401 or
+  429 — is reachable. The first success on the normal route ends the fallback.
+- **A refusal leaves nothing behind.** If the privileged helper refuses at any
+  point, the routing rule it may have installed is withdrawn and the link is
+  taken down before it reports the failure; the worker then asks for `down`
+  again regardless, and systemd takes the link down whenever the worker stops.
+
+What it never does over cellular: updates, package downloads, DNS, NTP, SSH,
+the GUI's own traffic, the updater's, or any other host app. The backlight
+schedule falls back to the local one. The refresh button re-reads the stored
+snapshot instead of asking the server to poll the providers — but only within
+limits: never more than once per minimum gap (a minute), and never while a
+wait is running that follows a read which failed or was refused. A tap outside
+those limits is declined, and the panel says "refresh deferred".
+
+### The HAT this was built against
+
+Waveshare's *Cat-1/GNSS HAT for Raspberry Pi* (SIM7670G). Every row was read
+off the first unit on 2026-11-23 with status queries only; none of it is
+assumed. `sudo usage-dashboard-cellular-link inspect` prints the same record
+for any other HAT.
+
+| | |
+|---|---|
+| Module | SIMCom `SIM7670G-MNGV`, firmware V1.9.05 |
+| USB identity | `05c6:9330` ("QualComm Compo") — a Qualcomm composite ID, *not* SIMCom's `1e0e` |
+| Network interface | `usb0`, driver `rndis_host` (the module's default, `usbnetmode=0`) |
+| Serial ports | `/dev/ttyACM0` AT · `ACM1` diagnostic log — a continuous binary stream, don't open it · `ACM2` AT/modem · `ACM3` NMEA |
+| What its DHCP hands the Pi | `192.168.0.100/24`, gateway `192.168.0.1`, and two DNS servers that answer nothing |
+| Auto-dial | **off** by default (`AT+DIALMODE?` → `1`): with nothing configured the modem accepts DHCP and leads nowhere |
+| ModemManager | not involved — leave `INSTALL_MODEM_MANAGER` off for this HAT |
+| The Pi | Debian 13, kernel 6.18, NetworkManager 1.52.1; `nftables` already installed; no real-time clock |
+
+### First: stop NetworkManager adopting the modem
+
+NetworkManager gives every Ethernet device it has no profile for a "Wired
+connection N": auto-connect, DHCP, a default route, DNS. An Ethernet-style
+modem *is* such a device. With the HAT plugged in and nothing configured, that
+is exactly what happened on the first unit — the modem became the Pi's
+*preferred* default route (its metric beats Ethernet's), the two dead DNS
+servers it advertises went to the top of the resolver list (about 8 seconds per
+lookup), and NTP stopped syncing.
+
+Do this before anything else, and before the interface is renamed (both names,
+in case the rename is done first):
+
+```bash
+nmcli -f NAME,TYPE,DEVICE con show            # find the profile on usb0
+sudo nmcli connection delete "Wired connection 2"
+printf '[main]\nno-auto-default=usb0,cell0\n' \
+  | sudo tee /etc/NetworkManager/conf.d/90-cellular-no-auto-default.conf
+sudo systemctl reload NetworkManager
+```
+
+The helper refuses to use the link while such a profile exists — `check` names
+it — because no firewall around the worker can cover traffic another profile
+invited. Until it is removed, the boot-time policy blocks that traffic (so no
+data leaks), but the Pi's default route still points into the modem: it is
+offline, not leaking.
+
+### Rename the interface, then install
+
+The firewall and the profile are both written against the interface's name, and
+`usb0`/`usb1` depends on enumeration order. Give it a stable one:
+
+```bash
+# /etc/udev/rules.d/70-usage-cellular.rules
+SUBSYSTEM=="net", ACTION=="add", ATTRS{idVendor}=="05c6", ATTRS{idProduct}=="9330", NAME="cell0"
+```
+
+Replug the HAT (or `sudo udevadm control --reload && sudo udevadm trigger`), then
+on a unit `install.sh` has already set up, as the normal login user:
+
+```bash
+./deploy/pi/cellular-install.sh
+```
+
+It installs `nftables`, creates the `usage-dashboard-cellular` system user, the
+worker's unit, a unit that loads the firewall at boot
+(`usage-dashboard-cellular-firewall.service`), a root-owned link helper
+(`/usr/local/bin/usage-dashboard-cellular-link`), a sudoers rule letting the
+worker ask that helper for exactly four argument-free verbs (`firewall`,
+`route`, `unroute`, `down`), and adds `CELLULAR_CACHE` to the GUI's env file.
+It is idempotent. It **does not** provision the modem or the NetworkManager
+profile (those hold the APN and SIM PIN) or write the settings file (that holds
+the credential), and it never starts the worker: until the settings file exists
+both units are inert, not failed.
+
+The worker's unit, the wrapper and the sudoers rule are **not** part of
+auto-update or auto-redeploy (§6): a bad link configuration must not be able to
+reach a unit on its own, so they change only when this script is re-run by
+hand. The helper's *logic* is Python in the package, and updates with
+everything else in the checkout — as does the GUI's.
+
+### Provision the modem (once, over AT)
+
+The Pi's profile is plain Ethernet with DHCP, so the module has to dial by
+itself. That is three settings, on the AT port (the `dialout` group may open
+it; `picocom -b 115200 /dev/ttyACM0`, or `atinout`):
+
+```
+AT+CGDCONT=1,"IP","<APN>"       # the carrier's APN
+AT+DIALMODE=0                   # the module connects by itself (default 1: it does not)
+AT$MYCONFIG="usbnetmode",0      # RNDIS — the mode the record above was taken in; the module restarts
+```
+
+These are SIMCom's documented commands for this family (its *A76XX Series Linux
+USB Application Note*, and Waveshare's page for this HAT). They have **not been
+run on the unit** — it was only queried. Check each with its `?` form
+afterwards, and `AT+COPS?`, `AT+CEREG?` and `AT+CSQ` once it should be on the
+air (`AT+CSQ` read `99,99` on the first unit: no signal detectable, which
+usually means the antennas are not fitted).
+
+`AT$MYCONFIG` restarts the module and can change what `lsusb` shows; if the USB
+identity changes, the udev rule above needs the new one — run `inspect` again.
+
+If the network the Pi sits on uses `192.168.0.0/24` (the modem's default —
+confirm with `AT+USBNETIP?`, which answered `0,192.168.0.100` on the first
+unit), move the modem's own LAN first with `AT+USBNETIP=…`, because while the
+link is up its subnet would shadow anything the Pi reaches there. The helper
+refuses to use the link in that case and says which address collides.
+
+### Provision the NetworkManager profile
+
+The helper never creates or edits the profile, and it **refuses to bring one
+up unless it is already isolated**: no default route, no carrier routes or
+DNS, no static routes or resolver entries, no autoconnect, metered, and bound
+to the modem's interface. Those properties are what keep the carrier's network
+out of the system's own routing and resolver tables; the firewall is the second
+line behind them.
+
+For this HAT:
+
+```bash
+sudo nmcli connection add type ethernet con-name cellular-dashboard ifname cell0 \
+  ipv4.method auto \
+  ipv4.never-default yes ipv4.ignore-auto-routes yes ipv4.ignore-auto-dns yes \
+  ipv6.method disabled \
+  ipv6.never-default yes ipv6.ignore-auto-routes yes ipv6.ignore-auto-dns yes \
+  connection.autoconnect no connection.metered yes
+```
+
+Then confirm the profile passes:
+
+```bash
+sudo /usr/local/bin/usage-dashboard-cellular-link check
+```
+
+Every line must read `ok`. The same checks run again, from the helper, before
+it ever brings the link up.
+
+A HAT with a different module may be one ModemManager manages instead (QMI or
+MBIM: a `wwan0` interface, and `mmcli -L` lists it). That shape was not
+available to qualify; for it, install with `INSTALL_MODEM_MANAGER=1` and add the
+profile as `type gsm` with `gsm.apn` (and `gsm.pin` if the SIM needs one) plus
+the same `ipv4.*`/`ipv6.*`/`connection.*` isolation properties above.
+
+### Settings
+
+```bash
+sudo cp deploy/pi/usage-dashboard-cellular.env.example /etc/usage-dashboard-cellular.env
+sudo nano /etc/usage-dashboard-cellular.env && sudo chmod 600 /etc/usage-dashboard-cellular.env
+```
+
+The file is documented key by key. The five that matter:
+
+| Key | What it must be |
+|-----|-----------------|
+| `SERVER_URL` | The dashboard, `https://`, port 443 — as in the GUI's env file |
+| `CELLULAR_DISPLAY_KEY` | The server's `display-api-key` (see the secrets table in the root README). **Not** the GUI's `API_KEY` |
+| `CELLULAR_DEST` | The dashboard's **public** address as an IP literal — the one the *public* ingress has. The name is split-horizon: on the home network it resolves to a LAN address, which the metered link cannot reach. The hostname still goes out as SNI and `Host`, so the certificate is verified against the name. If that address can change, this has to be updated on the unit when it does |
+| `CELLULAR_IFACE` | `cell0` as renamed above |
+| `CELLULAR_BUDGET_MB` | A monthly cap in decimal MB, required. Counted from the modem interface's own packet counters, so it includes the TLS handshake — about 20 KB a read, so the default cadence (one read per 10 minutes, only while the panel is lit) is on the order of 20 MB a month. Over the cap, the link stays off until next month. The count survives a restart and a wrong clock at boot |
+
+### Start, watch, stop
+
+```bash
+sudo systemctl restart usage-dashboard-gui.service   # picks up CELLULAR_CACHE
+sudo systemctl start usage-dashboard-cellular.service
+journalctl -u usage-dashboard-cellular -f            # the worker
+sudo /usr/local/bin/usage-dashboard-cellular-link status   # link, firewall, counters, routes
+```
+
+On the panel, the status line names the route while on cellular
+(`… · cellular · refresh 10m …`) and states the readings' age once they are
+older than the cadence explains. Tapping that line opens the diagnostics
+overlay, which gains a **Cellular** row — and a **Data** row — whenever the
+unit is on cellular, over budget, carrying an error, the worker has stopped,
+or most of the month's data is used.
+
+To take the feature off a unit:
+
+```bash
+sudo systemctl disable --now usage-dashboard-cellular.service
+sudo systemctl disable usage-dashboard-cellular-firewall.service
+sudo /usr/local/bin/usage-dashboard-cellular-link down
+sudo rm /etc/usage-dashboard-cellular.env     # both units can no longer start
+sudo systemctl restart usage-dashboard-gui.service   # after removing CELLULAR_CACHE
+```
+
+The worker also takes the link down whenever it stops, so there is no link
+left up that nobody is supervising. The firewall itself stays until the next
+reboot; `sudo nft delete table inet usage_dashboard_cellular` removes it
+sooner.
+
+### What has and has not been proven
+
+- **The firewall and the routing, on a real kernel.**
+  `tests/test_cellular_link_kernel.py` loads the helper's real ruleset and
+  routing rule into the kernel (as root, with a veth "modem" and the carrier in
+  its own namespace) and sends real packets: only the worker's UID reaches the
+  dashboard on 443 — not on another port, not another address, not by ICMP, not
+  with two addresses pinned, not over IPv6; another user forcing the interface
+  gets nothing; nothing comes in or is forwarded; a refused `route` leaves no
+  rule, no route and no link; a trimmed table is reloaded. Run it on the Pi
+  itself:
+  `sudo UD_CELLULAR_KERNEL_TEST=1 .venv/bin/pytest tests/test_cellular_link_kernel.py`
+  Only `nmcli` is faked there.
+- **NetworkManager's output, against the real one.** The helper's parsing was
+  checked command by command against NetworkManager 1.52.1 on the unit. It
+  found four places where the real tool prints other than its documentation
+  suggests, each of which would have made the helper refuse every link; they
+  are corrected and pinned by tests.
+- **"Pin the address, verify TLS against the hostname", over a real handshake**
+  (`tests/test_cellular_tls.py`).
+- **Observed on the unit, read-only:** everything in the table above;
+  NetworkManager adopting `usb0` as described; and the clock a week behind at
+  boot (no real-time clock; it starts from its last NTP synchronisation) with
+  HTTPS to the dashboard still validating — the certificate there has a
+  90-day life, so a unit that was off across a renewal would fail TLS until it
+  synchronises, which needs the normal route.
+- **The worker's decisions** — when to fall back, when to stop spending, what a
+  refresh tap may do, what to do on a 401 — are unit-tested against fakes.
+- **Not yet done on hardware:** the modem provisioning above (the module was
+  only queried); the module dialling by itself; anything needing a live SIM —
+  APN, registration, signal, data counters against the carrier's meter; the
+  boot-time unit's ordering on a real boot; the udev rename; the ModemManager
+  path. Those are the bench items in
+  [Plan 010](../../plans/010-pi-cellular-fallback.md), and the first work-site
+  test should be one you can reach locally to roll back.
+
+> **Trust note:** the sudoers rule lets the worker user run one root-owned
+> wrapper, which runs the venv's Python and `usage_dashboard.deploy.cellular_link`
+> from the run user's checkout — the same arrangement as the auto-redeploy
+> helper in §6, with the same consequence: the run user effectively holds root
+> through it. That is fine when the run user is the trusted sudoer who ran
+> `install.sh`; do not enable this for a run user you would not already hand
+> `sudo`. The worker user itself gains nothing beyond the four verbs.
+
 ## Dev / windowed mode (off the Pi)
 
 Run in a window instead of fullscreen (no rotation, mouse acts as touch):

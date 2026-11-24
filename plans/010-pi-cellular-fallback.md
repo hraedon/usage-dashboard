@@ -81,6 +81,151 @@ Implementation needs the exact modem mode, carrier setup, and the work Pi's
 effective NetworkManager version, network policy, clock behavior, and public
 ingress addressing. This plan records the proposed behavior and test matrix.
 
+## Implementation record (2026-11-23)
+
+The behavior above is built. The hardware facts named in the last paragraph
+of the plan were then read off the first unit with the HAT fitted (status
+queries only), the helper's reading of NetworkManager was checked against the
+real one, and an independent adversarial review of the code was run. Each
+changed the implementation; this record supersedes the plan's assumptions
+where they differ.
+
+### What was built
+
+| Piece | Where | Runs as |
+| --- | --- | --- |
+| Display credential, readings route only | `server/api.py`, `DISPLAY_API_KEY` / Secret `display-api-key` | server |
+| Readings worker: failover decisions, pinned-address HTTPS, budget | `client/cellular_worker.py` | `usage-dashboard-cellular` |
+| Link helper: firewall first, profile checks, route selection, verification, unwinding | `deploy/cellular_link.py` behind `/usr/local/bin/usage-dashboard-cellular-link` | root, via sudo |
+| Boot-time deny policy | `deploy/pi/usage-dashboard-cellular-firewall.service` | root, before NetworkManager |
+| Cache and signals between worker and GUI | `client/readings_cache.py`, `client/cache_view.py` | both |
+| Panel: route and age on the status line, refresh on cellular, overlay rows | `client/gui.py`, `layout.py`, `diagnostics.py` | GUI user |
+| Installer (opt-in, by hand) | `deploy/pi/cellular-install.sh` | operator |
+
+### Qualification record — the first unit, 2026-11-23
+
+Read-only, over SSH as the owner's `itadmin`, nothing changed on it.
+
+| Fact | Value |
+| --- | --- |
+| HAT | Waveshare Cat-1/GNSS HAT, SIMCom `SIM7670G-MNGV`, firmware V1.9.05 |
+| USB identity | `05c6:9330` ("QualComm Compo") — a Qualcomm composite ID, not SIMCom's `1e0e`; behind the HAT's own two hubs |
+| Data interface | `usb0`, driver `rndis_host` (`AT$MYCONFIG?` → `usbnetmode`,0 = RNDIS) |
+| Serial ports | `/dev/ttyACM0` AT, `ACM1` diagnostic stream, `ACM2` AT/modem, `ACM3` NMEA |
+| DHCP from the module | `192.168.0.100/24`, gateway `192.168.0.1`, two DNS servers that answer nothing |
+| Auto-dial | off (`AT+DIALMODE?` → 1); no APN; not registered; signal `99,99`; SIM ready |
+| System | Debian 13, kernel 6.18, NetworkManager 1.52.1, `nftables` installed and unused, no ModemManager, no real-time clock |
+| Public ingress | split-horizon: LAN resolvers return a private address, public resolvers the WAN address; the WAN address served the right certificate from inside the LAN (not evidence about outside) |
+
+Three things observed on that unit changed the design:
+
+- **NetworkManager adopted the modem.** It generated `Wired connection 2` for
+  `usb0` (auto-connect, DHCP), which became the Pi's preferred default route
+  into a modem with no service, and put the modem's two dead DNS servers first
+  in the resolver list (about 8 s per lookup; NTP stopped syncing). The helper
+  now refuses to use the link while such a profile exists, and the deny policy
+  is loaded at boot.
+- **NetworkManager prints other than documented.** Four differences, each of
+  which would have made the helper refuse every link, are corrected and pinned.
+- **The clock was seven days behind at boot** (no RTC; it starts from the last
+  NTP synchronisation) and HTTPS to the dashboard still validated. The "clock
+  not set" guard therefore tolerates an hour, not zero — and the ledger no
+  longer resets when the clock is behind.
+
+### Decisions made while implementing
+
+- **The cellular route is selected only around a cellular read.** `route`
+  brings the link up behind the firewall and adds the worker's rule, the read
+  happens, `unroute` removes the rule; the link itself stays up between reads.
+  Held for the whole fallback, the rule would also catch the worker's own
+  "has the normal route recovered?" probe — to the same address — and answer
+  it over cellular. A test pins the order `normal probe → route → read →
+  unroute → normal probe`.
+- **A refusal leaves nothing behind.** The helper installs the rule and route
+  and then verifies them; a verification that fails unwinds both and takes the
+  link down, on a link it had just brought up or one already up between reads.
+  The worker follows every failed `route` with `down`, systemd takes the link
+  down whenever the worker stops (`ExecStopPost`), and the helper keeps a
+  deadline below the worker's so it unwinds rather than being killed
+  half-installed. (The independent review found the original left the rule
+  installed and the worker polling over cellular, uncounted.)
+- **Failover needs two unanswered probes.** One lost packet should not cost an
+  LTE attach. Any HTTP status, including 401 and 429, is "reachable".
+- **The data budget is a required setting, not a default.** Counted from the
+  modem interface's own sysfs counters, so it includes handshakes and
+  keepalives. Over the cap, the link is released until the next month. The
+  month rolls forward only, so a clock behind at boot cannot hand out a second
+  budget.
+- **A refresh tap may bring a read forward, never past a refusal.** It is
+  limited by the minimum gap between cellular reads and by any wait that
+  follows a read that failed or was refused.
+- **Cellular reads only while the panel is lit.** The GUI writes a heartbeat
+  the worker reads; the worker has no other way to know anyone is looking.
+- **The helper refuses rather than repairs.** It never creates or edits the
+  NetworkManager profile. It checks every isolation property before bringing
+  the link up, re-checks the live system after (default routes, resolver,
+  bound device, subnet collisions), and proves with `ip route get … uid` that
+  the worker is selected and nobody else is.
+- **The firewall exists from boot.** A oneshot unit loads it before
+  `network-pre.target`; the worker loads it again at start. It is re-checked
+  against a stateless kernel listing every `route`, so a table someone trimmed
+  is reloaded rather than trusted.
+- **RNDIS stays for the pilot.** It is the mode the unit was qualified in.
+  ECM (`usbnetmode`,1) is documented by the vendor but was not tried.
+- **Install-only, precisely.** The units, the wrapper and the sudoers rule are
+  never auto-redeployed (a test pins it); the helper's logic is Python in the
+  package and updates with everything else. The settings file and the
+  NetworkManager profile are written by hand because they carry secrets.
+
+### Acceptance status
+
+| Item | Status |
+| --- | --- |
+| Routing and filtering rehearsed on simulated links | **Done, on a real kernel** — `tests/test_cellular_link_kernel.py` (root; veth as the modem, the carrier in its own network namespace, real `nft` and `ip`, real packets). Only the worker UID reaches the pinned address on 443: not another port, not another address, not by ICMP, not with two addresses pinned, not over IPv6; root and an ordinary user cannot, even forcing the interface; nothing comes in or is forwarded; a refused `route` leaves no rule, no route and no link; a trimmed table is reloaded. Only `nmcli` is faked |
+| "Pin the address, verify TLS against the hostname" | **Done, over a real handshake** — `tests/test_cellular_tls.py` |
+| NetworkManager output shapes | **Checked against the real 1.52.1** on the unit; four corrections, pinned by tests |
+| Worker decisions (hotspot with and without internet, recovery, sleep and wake, bad token, cellular loss, modem absent, refused route, refresh limits, wrong clock) | **Unit-tested against fakes** — `tests/test_cellular_worker.py`, `test_cellular_gui.py` |
+| Modem identity, USB mode, defaults, clock at boot | **Read off the unit** (table above) |
+| Provisioning the modem (APN, auto-dial) and the module dialling by itself | **Not done** — the modem was only queried |
+| Anything needing a live SIM: registration, signal, HTTPS from the Pi's clock over LTE, per-interface counters against a carrier meter | **Needs the bench** — the unit read no signal, which usually means no antennas fitted |
+| Boot ordering of the firewall unit, the udev rename, the ModemManager path | **Needs the bench** |
+| Disabling the opt-in restores Wi-Fi-only | By construction (separate user and units; steps in `deploy/pi/README.md` §8); **confirm on the bench** |
+
+### Independent review
+
+An adversarial review of the code (a separate pass, read-only) found two
+high-severity defects and several smaller ones. Each was checked against the
+code before being acted on:
+
+- a refused `route` left the worker's routing rule installed, and the worker's
+  next normal-route probe then went over cellular, uncounted, and was reported
+  as a recovery — fixed by unwinding in the helper, `down` after every failed
+  `route`, `ExecStopPost`, and the helper's own deadline;
+- the firewall existed only after the worker's first `route` since boot —
+  fixed by the boot-time unit and the `firewall` verb;
+- a refresh tap bypassed the failure back-off and the "401/429 is not retried"
+  rule — fixed;
+- the month's ledger reset when the clock was behind at boot — fixed;
+- the firewall check for two pinned addresses depended on nftables' listing
+  order, which differs from text order — confirmed on a real kernel and fixed;
+- the firewall's own check trusted a stamp rather than the kernel — now
+  compared with a stateless listing;
+- with IPv6 enabled, neighbour-discovery advertisements were dropped on the
+  way in (found by the extended kernel rehearsal, not the review) — fixed.
+
+### Still needed before the first work-site test
+
+1. Provision the modem on the unit — APN, `AT+DIALMODE=0` — and fit antennas;
+   confirm registration and signal.
+2. Create the isolated NetworkManager profile and remove the one NetworkManager
+   generated for the modem; confirm `usage-dashboard-cellular-link check`
+   passes on the unit.
+3. Confirm that the public ingress address is stable enough to pin, and use it
+   for `CELLULAR_DEST`.
+4. A `display-api-key` in the server Secret and a rollout restart (the drift
+   guard reports both until then).
+5. The bench items above, with local rollback access.
+
 ## References
 
 - [Raspberry Pi OS NetworkManager guidance](https://www.raspberrypi.com/documentation/configuration/audio/)

@@ -1,0 +1,50 @@
+[Unit]
+Description=AI Usage Dashboard cellular readings worker (Plan 010)
+# Reads the dashboard over the metered cellular fallback when the normal link
+# cannot reach it. Opted in per unit by deploy/pi/cellular-install.sh; every
+# other unit never gets this unit's user, sudoers rule or settings file.
+After=network-online.target
+Wants=network-online.target
+# Inert until the unit is provisioned. The settings file is written by hand
+# because it carries the display credential, so on a unit that merely has the
+# worker installed this start is skipped — not failed.
+ConditionPathExists=/etc/usage-dashboard-cellular.env
+
+[Service]
+Type=simple
+# @WORKER_USER@ and @VENV@ are filled in by deploy/pi/cellular-install.sh.
+# Do not `cp` this raw.
+#
+# Its own system user, on purpose. The firewall around the modem is written as
+# "this one UID, to this one address, on TCP 443", which is only meaningful if
+# the GUI and the updater — which must never use the metered link — are
+# different users.
+User=@WORKER_USER@
+Group=@WORKER_USER@
+# SERVER_URL and the CELLULAR_* settings. systemd reads this as root and hands
+# the values down; the file is 600 root:root and the worker never reads it.
+EnvironmentFile=/etc/usage-dashboard-cellular.env
+ExecStart=@VENV@/bin/usage-dashboard-cellular
+# Whenever the worker stops — cleanly, on failure, or killed — the link is
+# taken down as root, whatever state it was left in. A worker killed on its
+# way to a refused `route` is exactly the case it cannot handle itself.
+# `+` runs it with full privileges despite User= above; `-` keeps a failure
+# here from marking a clean stop as failed.
+ExecStopPost=+-/usr/local/bin/usage-dashboard-cellular-link down
+Restart=on-failure
+RestartSec=30
+# 78 is sysexits EX_CONFIG: a missing or contradictory setting is fixed by an
+# operator, and restarting cannot fix it. The reason is in the journal.
+RestartPreventExitStatus=78
+# The readings cache this worker publishes has to be readable by the GUI user.
+UMask=0022
+# The worker calls the root-owned link helper through sudo (`firewall`,
+# `route`, `unroute`, `down` — four argument-free verbs), so NoNewPrivileges
+# cannot be set here (it would block sudo). The sudoers rule is what bounds it.
+# These narrow what is left:
+RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6
+PrivateTmp=yes
+ProtectHome=read-only
+
+[Install]
+WantedBy=multi-user.target

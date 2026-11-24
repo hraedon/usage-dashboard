@@ -465,15 +465,26 @@ class _JobInputRequest(BaseModel):
 
 def _make_auth_dependency(
     api_key: str,
+    display_api_key: str | None = None,
 ) -> Callable[..., Any]:
+    """Bearer check for one route.
+
+    Without *display_api_key* only the operator key is accepted. With it, the
+    read-only display credential (Plan 010) is accepted **on this route only** —
+    the caller decides the scope by which router the dependency guards, so
+    passing it to anything but the readings route would widen that credential.
+    """
+
     async def verify_bearer(
         credentials: HTTPAuthorizationCredentials | None = Depends(_bearer_scheme),
     ) -> str:
         if credentials is None:
             raise HTTPException(status_code=401)
-        if not _same_api_key(credentials.credentials, api_key):
-            raise HTTPException(status_code=401)
-        return credentials.credentials
+        if _same_api_key(credentials.credentials, api_key):
+            return credentials.credentials
+        if display_api_key and _same_api_key(credentials.credentials, display_api_key):
+            return credentials.credentials
+        raise HTTPException(status_code=401)
 
     return verify_bearer
 
@@ -486,15 +497,34 @@ def create_app(
     scheduler: FetchScheduler | None = None,
     enrolment: EnrolmentService | None = None,
     agent_api_key: str | None = None,
+    display_api_key: str | None = None,
 ) -> FastAPI:
     if agent_api_key and _same_api_key(agent_api_key, api_key):
         raise ValueError("AGENT_API_KEY must differ from API_KEY to remain read-only")
+    if display_api_key and _same_api_key(display_api_key, api_key):
+        raise ValueError("DISPLAY_API_KEY must differ from API_KEY to remain read-only")
+    if (
+        display_api_key
+        and agent_api_key
+        and _same_api_key(display_api_key, agent_api_key)
+    ):
+        # Sharing would widen whichever credential outlives the other: the
+        # agent token could then read /readings, or the display token could
+        # reach /api/v1/agent/capacity.
+        raise ValueError("DISPLAY_API_KEY must differ from AGENT_API_KEY")
     app = FastAPI()
     auth = _make_auth_dependency(api_key)
     # Authenticated routes live on this router so they can be mounted at both
     # /api/v1 and the legacy root paths from a single definition.
     api = APIRouter()
     agent_api = APIRouter()
+    # Plan 010: the readings route is the one surface the Pi's cellular
+    # readings worker may cross the metered link for. It gets its own router
+    # (mounted on both path sets like `api`) because it is the only route that
+    # also accepts the read-only display credential. Keeping it off `api` is
+    # what scopes that credential: nothing else ever depends on it.
+    readings = APIRouter()
+    readings_auth = _make_auth_dependency(api_key, display_api_key)
 
     async def agent_auth(
         credentials: HTTPAuthorizationCredentials | None = Depends(_bearer_scheme),
@@ -552,9 +582,9 @@ def create_app(
             ],
         )
 
-    @api.get("/readings", **EXTERNAL)
+    @readings.get("/readings", **EXTERNAL)
     async def get_readings(
-        _user: str = Depends(auth),
+        _user: str = Depends(readings_auth),
     ) -> list[dict[str, Any]]:
         return [reading.to_dict() for reading in _reported_readings()]
 
@@ -740,6 +770,8 @@ def create_app(
     # object, so a route can never exist on one set and not the other.
     app.include_router(api, prefix=API_V1_PREFIX)
     app.include_router(api, prefix=LEGACY_ALIAS_PREFIX)
+    app.include_router(readings, prefix=API_V1_PREFIX)
+    app.include_router(readings, prefix=LEGACY_ALIAS_PREFIX)
     app.include_router(internal, prefix=INTERNAL_V1_PREFIX)
     # New agent routes have no pre-versioning clients and need no root alias.
     app.include_router(agent_api, prefix=API_V1_PREFIX)

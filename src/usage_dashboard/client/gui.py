@@ -31,6 +31,12 @@ from usage_dashboard.client.brightness import (
     save_level,
     step_for_level,
 )
+from usage_dashboard.client.cache_view import (
+    DEFERRED,
+    REFRESHED,
+    SOURCE_LABEL,
+    CacheView,
+)
 from usage_dashboard.client.fetcher import ClientFetcher
 from usage_dashboard.client.layout import (
     BarSpec,
@@ -168,6 +174,7 @@ class DashboardGui:
         brightness_state_file: Path | None = None,
         server_url: str = "",
         status_dir: Path | None = None,
+        cache_view: CacheView | None = None,
     ) -> None:
         self._fetcher = fetcher
         screen = pygame.display.get_surface()
@@ -213,6 +220,15 @@ class DashboardGui:
         self._server_url = server_url
         self._status_dir = status_dir
         self._diag: diag.Diagnostics | None = None
+        # Cellular fallback (Plan 010). None unless CELLULAR_CACHE is set, and
+        # then nothing below changes for this unit. With one, the panel draws
+        # the newer of its own readings and the worker's cache, tells the
+        # worker when the panel is lit, and — while it is showing cellular
+        # data — turns the refresh button into a re-read of the stored
+        # snapshot instead of a request for a fresh collection.
+        self._cellular = cache_view
+        self._on_cellular = False
+        self._shown_success_at: datetime | None = None
         # On-demand refresh (WI-012): a tap on the status-bar refresh button
         # POSTs /refresh in a background thread; the button stays highlighted
         # while it's in flight so the tap reads as acknowledged.
@@ -318,10 +334,35 @@ class DashboardGui:
         """
         if self._refresh_pending:
             return  # a refresh is already in flight
+        cellular = self._cellular is not None and self._on_cellular
         self._refresh_pending = True
         self._set_refresh_feedback("refreshing\u2026", hold_ms=_REFRESH_FEEDBACK_MS)
-        self._refresh_thread = threading.Thread(target=self._run_refresh, daemon=True)
+        target = self._run_cellular_reread if cellular else self._run_refresh
+        self._refresh_thread = threading.Thread(target=target, daemon=True)
         self._refresh_thread.start()
+
+    def _run_cellular_reread(self) -> None:
+        """The refresh button while the panel is on cellular (Plan 010).
+
+        The metered link permits one GET, so a tap cannot ask the server for a
+        fresh collection. It asks the readings worker to read the stored
+        snapshot again — at most once per minimum gap, which is the worker's
+        rule to apply — and waits for a newer payload to land in the cache.
+        """
+        view = self._cellular
+        assert view is not None
+        try:
+            outcome = view.await_reread(view.request_reread(), self._shown_success_at)
+            text = {
+                REFRESHED: "refreshed",
+                DEFERRED: "refresh deferred",
+            }.get(outcome, "refresh failed")
+        except Exception as exc:  # never let a refresh crash the thread
+            logger.warning("Cellular re-read failed: %s", exc)
+            text = "refresh failed"
+        finally:
+            self._refresh_pending = False
+        self._set_refresh_feedback(text, hold_ms=_REFRESH_FEEDBACK_MS)
 
     def _set_refresh_feedback(self, text: str, hold_ms: int) -> None:
         self._refresh_feedback = text
@@ -430,7 +471,13 @@ class DashboardGui:
                     # controllable backlight (the +/- side then just no-ops).
                     # Gather diagnostics now; reset the double-tap pair so the
                     # opening tap can't later combine with a tap in the overlay.
-                    self._diag = diag.gather(self._status_dir, self._server_url)
+                    self._diag = diag.gather(
+                        self._status_dir,
+                        self._server_url,
+                        cellular_dir=(
+                            self._cellular.state_dir if self._cellular is not None else None
+                        ),
+                    )
                     self._double_tap.reset()
                     self._state = ViewState(overlay=True)
                     continue
@@ -460,17 +507,20 @@ class DashboardGui:
                 self._wake_until = None
             dark = self._is_dark(now)
             self._dark = dark
-            readings = self._fetcher.get_latest_readings()
+            readings, age, source_label, interval = self._displayed()
             layout = build_main_layout(
                 readings, (self._width, self._height),
-                refresh_interval=self._fetcher.current_interval,
+                refresh_interval=interval,
                 tile_overhead=self._tile_overhead,
                 refresh_pending=self._refresh_pending,
+                age_seconds=age,
+                source_label=source_label,
             )
             # While dark, a tap wakes (sets _wake_until) instead of navigating.
             self._handle_events(layout, swallow_wake=dark, now=now)
             dark = self._is_dark(now)  # a wake tap may have just cleared it
             self._backlight.set_power(on=not dark)
+            self._report_wake_state(dark)
             if not dark:
                 self._screen.fill(fmt.BG)
                 if self._state.overlay:
@@ -483,6 +533,44 @@ class DashboardGui:
                     self._draw_detail(readings)
                 pygame.display.flip()
             self._clock.tick(self._fps if not dark else self._sleep_fps)
+
+    def _displayed(self) -> tuple[list[Reading], float | None, str, int | None]:
+        """The readings to draw this frame, how old they are, which route
+        carried them if it was not the normal one, and the refresh interval
+        the status line should print."""
+        own = self._fetcher.get_latest_readings()
+        # The fetcher's own "last read" time; older stand-ins in tests have none.
+        own_at: datetime | None = getattr(self._fetcher, "last_success_at", None)
+        interval: int | None = None
+        if self._cellular is None:
+            shown, success_at, on_cellular = own, own_at, False
+        else:
+            selection = self._cellular.select(own, own_at)
+            shown, success_at, on_cellular = (
+                selection.readings, selection.last_success_at, selection.cellular
+            )
+            interval = selection.poll_interval
+        self._on_cellular = on_cellular
+        self._shown_success_at = success_at
+        if interval is None:
+            interval = self._fetcher.current_interval
+        age: float | None = None
+        if success_at is not None:
+            # Both naive UTC, so no timezone arithmetic: the loop's `now` is
+            # local time and is only for the sleep schedule.
+            utc_now = datetime.now(timezone.utc).replace(tzinfo=None)
+            age = max(0.0, (utc_now - success_at).total_seconds())
+        return shown, age, (SOURCE_LABEL if on_cellular else ""), interval
+
+    def _report_wake_state(self, dark: bool) -> None:
+        """Tell the readings worker whether the panel is lit, so it spends
+        metered data only while someone can see the result."""
+        if self._cellular is None:
+            return
+        if dark:
+            self._cellular.mark_dark()
+        else:
+            self._cellular.mark_awake()
 
     # -- rendering ----------------------------------------------------------
 
@@ -1365,6 +1453,11 @@ def main() -> None:
         brightness_state_file: Path | None = _default_brightness_state_file()
     else:
         brightness_state_file = Path(state_env) if state_env.strip() else None
+    # Cellular fallback (Plan 010): with CELLULAR_CACHE set to the readings
+    # worker's state dir, the panel also draws that worker's cache. Set by
+    # deploy/pi/cellular-install.sh on units that opt in.
+    cache_env = os.environ.get("CELLULAR_CACHE", "").strip()
+    cache_view: CacheView | None = CacheView(Path(cache_env)) if cache_env else None
     gui = DashboardGui(
         fetcher,
         size,
@@ -1375,6 +1468,7 @@ def main() -> None:
         brightness_state_file=brightness_state_file,
         server_url=server_url,
         status_dir=diag.default_state_dir(),
+        cache_view=cache_view,
     )
 
     def _handle_sigterm(signum: int, frame: Any) -> None:
